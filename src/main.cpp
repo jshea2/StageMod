@@ -19,7 +19,7 @@
 // Config (edit these)
 // =========================
 // Defaults (editable via web UI)
-const char* DEFAULT_HOSTNAME = "esp32-osc";
+const char* DEFAULT_HOSTNAME = "stagemod";
 const IPAddress DEFAULT_CLIENT_IP(192, 168, 0, 100);
 const uint16_t DEFAULT_CLIENT_PORT = 8000;
 const bool DEFAULT_USE_STATIC = false;
@@ -30,6 +30,7 @@ const IPAddress DEFAULT_DNS1(192, 168, 0, 1);
 const IPAddress DEFAULT_DNS2(8, 8, 8, 8);
 const char* DEFAULT_WIFI_SSID = "";
 const char* DEFAULT_WIFI_PASS = "";
+const char* DEFAULT_USERNAME = "admin";
 
 const int MAX_SENSORS = 6;
 
@@ -42,7 +43,8 @@ enum SensorType {
   SENSOR_ANALOG = 0,
   SENSOR_BUTTON = 1,
   SENSOR_TOGGLE = 2,
-  SENSOR_DIGITAL = 3
+  SENSOR_DIGITAL = 3,
+  SENSOR_ENCODER = 4
 };
 
 enum OutputMode {
@@ -52,7 +54,7 @@ enum OutputMode {
 };
 
 const int DEFAULT_ANALOG_PIN = 32;
-const int DEFAULT_DIGITAL_PIN = 4;
+const int DEFAULT_DIGITAL_PIN = 5;
 const bool DEFAULT_INVERT = false;
 const float DEFAULT_OUT_MIN = 0.0f;
 const float DEFAULT_OUT_MAX = 100.0f;
@@ -83,10 +85,14 @@ struct SensorConfig {
   bool enabled;
   SensorType type;
   int pin;
+  int encClkPin;
+  int encDtPin;
+  int encSwPin;
   bool invert;
   bool activeHigh;
   bool pullup;
   String oscAddress;
+  String buttonAddress;
   float outMin;
   float outMax;
   OutputMode outMode;
@@ -107,6 +113,9 @@ struct Config {
   IPAddress dns2;
   String wifiSsid;
   String wifiPass;
+  String username;
+  bool passwordEnabled;
+  String password;
   SensorConfig sensors[MAX_SENSORS];
 };
 
@@ -118,6 +127,8 @@ float lastFloat[MAX_SENSORS]; // last sent float value per sensor
 int8_t lastBool[MAX_SENSORS]; // last sent on/off state per sensor
 int8_t lastLevel[MAX_SENSORS]; // last raw level per sensor
 bool toggleState[MAX_SENSORS]; // toggle state per sensor
+int8_t lastEncA[MAX_SENSORS];
+int8_t lastEncB[MAX_SENSORS];
 WiFiUDP udp;
 WebServer server(80);
 Preferences prefs;
@@ -243,7 +254,7 @@ static String buildApSsid() {
   uint8_t mac[6];
   esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
   char buf[32];
-  snprintf(buf, sizeof(buf), "ESP32osc-Setup-%02X%02X", mac[4], mac[5]);
+  snprintf(buf, sizeof(buf), "StageMod-Setup-%02X%02X", mac[4], mac[5]);
   return String(buf);
 }
 
@@ -282,13 +293,13 @@ static int defaultSensorPin(int index) {
     case 1: return 33;
     case 2: return 35;
     case 3: return 36;
-    case 4: return 39;
-    default: return 25;
+    case 4: return 13;
+    default: return 16;
   }
 }
 
 static SensorType sanitizeSensorType(int value) {
-  if (value < SENSOR_ANALOG || value > SENSOR_DIGITAL) return SENSOR_ANALOG;
+  if (value < SENSOR_ANALOG || value > SENSOR_ENCODER) return SENSOR_ANALOG;
   return static_cast<SensorType>(value);
 }
 
@@ -303,18 +314,37 @@ static NetMode sanitizeNetworkMode(int value) {
 }
 
 static bool isReservedPin(int pin) {
-  return pin == RESET_BUTTON_PIN || pin == 0 || pin == 1 || pin == 2 || pin == 3 || pin == 12 || pin == 15;
+  return pin == RESET_BUTTON_PIN || pin == 0 || pin == 1 || pin == 2 || pin == 3 || pin == 4 || pin == 12 || pin == 14 || pin == 15;
+}
+
+static bool isAllowedAnalogPin(int pin) {
+  return pin == 32 || pin == 35 || pin == 36;
+}
+
+static bool isPasswordRequired() {
+  return config.passwordEnabled && config.password.length() > 0;
+}
+
+static bool ensureAuthenticated() {
+  if (!isPasswordRequired()) return true;
+  if (server.authenticate(config.username.c_str(), config.password.c_str())) return true;
+  server.requestAuthentication();
+  return false;
 }
 
 static SensorConfig defaultSensorConfig(int index) {
   SensorConfig s;
   s.enabled = (index == 0);
-  s.type = SENSOR_ANALOG;
+  s.type = (index == 0) ? SENSOR_ANALOG : SENSOR_BUTTON;
   s.pin = defaultSensorPin(index);
+  s.encClkPin = 13;
+  s.encDtPin = 16;
+  s.encSwPin = 5;
   s.invert = DEFAULT_INVERT;
   s.activeHigh = DEFAULT_DIGITAL_ACTIVE_HIGH;
   s.pullup = DEFAULT_DIGITAL_PULLUP;
   s.oscAddress = defaultOscAddress(index);
+  s.buttonAddress = "/button";
   s.outMin = DEFAULT_OUT_MIN;
   s.outMax = DEFAULT_OUT_MAX;
   s.outMode = DEFAULT_OUT_MODE;
@@ -335,6 +365,8 @@ static void resetRuntimeState() {
     lastBool[i] = -1;
     lastLevel[i] = -1;
     toggleState[i] = false;
+    lastEncA[i] = -1;
+    lastEncB[i] = -1;
   }
 }
 
@@ -342,7 +374,11 @@ static void applySensorPinModes() {
   for (int i = 0; i < MAX_SENSORS; i++) {
     const SensorConfig& sensor = config.sensors[i];
     if (!sensor.enabled) continue;
-    if (sensor.type != SENSOR_ANALOG) {
+    if (sensor.type == SENSOR_ENCODER) {
+      pinMode(sensor.encClkPin, INPUT_PULLUP);
+      pinMode(sensor.encDtPin, INPUT_PULLUP);
+      pinMode(sensor.encSwPin, INPUT_PULLUP);
+    } else if (sensor.type != SENSOR_ANALOG) {
       pinMode(sensor.pin, sensor.pullup ? INPUT_PULLUP : INPUT);
     }
   }
@@ -350,11 +386,32 @@ static void applySensorPinModes() {
 
 static bool hasPinConflict(int index) {
   if (!config.sensors[index].enabled) return false;
-  int pin = config.sensors[index].pin;
+  int pinsA[3];
+  int countA = 0;
+  const SensorConfig& a = config.sensors[index];
+  if (a.type == SENSOR_ENCODER) {
+    pinsA[countA++] = a.encClkPin;
+    pinsA[countA++] = a.encDtPin;
+    pinsA[countA++] = a.encSwPin;
+  } else {
+    pinsA[countA++] = a.pin;
+  }
   for (int i = 0; i < MAX_SENSORS; i++) {
-    if (i == index) continue;
-    if (config.sensors[i].enabled && config.sensors[i].pin == pin) {
-      return true;
+    if (i == index || !config.sensors[i].enabled) continue;
+    int pinsB[3];
+    int countB = 0;
+    const SensorConfig& b = config.sensors[i];
+    if (b.type == SENSOR_ENCODER) {
+      pinsB[countB++] = b.encClkPin;
+      pinsB[countB++] = b.encDtPin;
+      pinsB[countB++] = b.encSwPin;
+    } else {
+      pinsB[countB++] = b.pin;
+    }
+    for (int ia = 0; ia < countA; ia++) {
+      for (int ib = 0; ib < countB; ib++) {
+        if (pinsA[ia] == pinsB[ib]) return true;
+      }
     }
   }
   return false;
@@ -377,6 +434,14 @@ static void loadConfig() {
   config.dns2 = parseOrDefault(prefs.getString("dns2", ipToString(DEFAULT_DNS2)), DEFAULT_DNS2);
   config.wifiSsid = prefs.getString("wifi_ssid", DEFAULT_WIFI_SSID);
   config.wifiPass = prefs.getString("wifi_pass", DEFAULT_WIFI_PASS);
+  config.username = prefs.getString("username", DEFAULT_USERNAME);
+  if (config.username.length() == 0) config.username = DEFAULT_USERNAME;
+  config.passwordEnabled = prefs.getBool("pwd_en", false);
+  config.password = prefs.getString("pwd", "");
+  if (!config.passwordEnabled || config.password.length() == 0) {
+    config.passwordEnabled = false;
+    config.password = "";
+  }
 
   bool hasNew = prefs.isKey(sensorKey(0, "addr").c_str());
   for (int i = 0; i < MAX_SENSORS; i++) {
@@ -389,10 +454,14 @@ static void loadConfig() {
       s.enabled = prefs.getBool(sensorKey(i, "en").c_str(), s.enabled);
       s.type = sanitizeSensorType(prefs.getInt(sensorKey(i, "type").c_str(), s.type));
       s.pin = prefs.getInt(sensorKey(i, "pin").c_str(), s.pin);
+      s.encClkPin = prefs.getInt(sensorKey(i, "clk").c_str(), s.encClkPin);
+      s.encDtPin = prefs.getInt(sensorKey(i, "dt").c_str(), s.encDtPin);
+      s.encSwPin = prefs.getInt(sensorKey(i, "sw").c_str(), s.encSwPin);
       s.invert = prefs.getBool(sensorKey(i, "inv").c_str(), s.invert);
       s.activeHigh = prefs.getBool(sensorKey(i, "ah").c_str(), s.activeHigh);
       s.pullup = prefs.getBool(sensorKey(i, "pu").c_str(), s.pullup);
       s.oscAddress = prefs.getString(sensorKey(i, "addr").c_str(), s.oscAddress);
+      s.buttonAddress = prefs.getString(sensorKey(i, "baddr").c_str(), s.buttonAddress);
       s.outMin = prefs.getFloat(sensorKey(i, "omin").c_str(), s.outMin);
       s.outMax = prefs.getFloat(sensorKey(i, "omax").c_str(), s.outMax);
       s.outMode = sanitizeOutputMode(prefs.getInt(sensorKey(i, "omode").c_str(), s.outMode));
@@ -400,6 +469,7 @@ static void loadConfig() {
       s.offString = prefs.getString(sensorKey(i, "off").c_str(), s.offString);
 
       if (s.oscAddress.length() == 0) s.oscAddress = defaultOscAddress(i);
+      if (s.buttonAddress.length() == 0) s.buttonAddress = "/button";
       if (s.type == SENSOR_ANALOG && s.outMode == OUT_STRING) s.outMode = OUT_FLOAT;
       config.sensors[i] = s;
     }
@@ -438,16 +508,23 @@ static void saveConfig() {
   prefs.putString("dns2", ipToString(config.dns2));
   prefs.putString("wifi_ssid", config.wifiSsid);
   prefs.putString("wifi_pass", config.wifiPass);
+  prefs.putString("username", config.username);
+  prefs.putBool("pwd_en", config.passwordEnabled);
+  prefs.putString("pwd", config.password);
 
   for (int i = 0; i < MAX_SENSORS; i++) {
     const SensorConfig& s = config.sensors[i];
     prefs.putBool(sensorKey(i, "en").c_str(), s.enabled);
     prefs.putInt(sensorKey(i, "type").c_str(), s.type);
     prefs.putInt(sensorKey(i, "pin").c_str(), s.pin);
+    prefs.putInt(sensorKey(i, "clk").c_str(), s.encClkPin);
+    prefs.putInt(sensorKey(i, "dt").c_str(), s.encDtPin);
+    prefs.putInt(sensorKey(i, "sw").c_str(), s.encSwPin);
     prefs.putBool(sensorKey(i, "inv").c_str(), s.invert);
     prefs.putBool(sensorKey(i, "ah").c_str(), s.activeHigh);
     prefs.putBool(sensorKey(i, "pu").c_str(), s.pullup);
     prefs.putString(sensorKey(i, "addr").c_str(), s.oscAddress);
+    prefs.putString(sensorKey(i, "baddr").c_str(), s.buttonAddress);
     prefs.putFloat(sensorKey(i, "omin").c_str(), s.outMin);
     prefs.putFloat(sensorKey(i, "omax").c_str(), s.outMax);
     prefs.putInt(sensorKey(i, "omode").c_str(), s.outMode);
@@ -614,10 +691,11 @@ static bool parseIpString(const String& s, IPAddress& out) {
 }
 
 static void handleRoot() {
+  if (!ensureAuthenticated()) return;
   String html;
   html.reserve(12000);
   html += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>";
-  html += "<title>ESP32-POE OSC</title>";
+  html += "<title>StageMod Settings</title>";
   html += "<style>";
   html += ":root{--bg:#f4f1ea;--ink:#1a1a1a;--muted:#6c6c6c;--card:#ffffff;--accent:#0b6b6f;--danger:#a02a2a;}";
   html += "body{margin:0;font-family:'Avenir Next','Trebuchet MS','Segoe UI',sans-serif;background:linear-gradient(135deg,#f4f1ea 0%,#e7f0ef 100%);color:var(--ink);}";
@@ -641,7 +719,7 @@ static void handleRoot() {
   html += "</style></head><body>";
   html += "<div class='page'>";
   html += "<div class='header'>";
-  html += "<div class='title'>ESP32-POE OSC</div>";
+  html += "<div class='title'>StageMod</div>";
   html += "<div class='actions'>";
   html += "<button type='button' id='pin_help_btn'>Board Pin Help</button>";
   html += "<span class='tag'>Olimex ESP32-PoE</span>";
@@ -719,10 +797,15 @@ static void handleRoot() {
     html += "<option value='1' " + String(s.type == SENSOR_BUTTON ? "selected" : "") + ">Button (momentary)</option>";
     html += "<option value='2' " + String(s.type == SENSOR_TOGGLE ? "selected" : "") + ">Button (toggle)</option>";
     html += "<option value='3' " + String(s.type == SENSOR_DIGITAL ? "selected" : "") + ">Digital (touch/motion)</option>";
+    html += "<option value='4' " + String(s.type == SENSOR_ENCODER ? "selected" : "") + ">Encoder</option>";
     html += "</select><br>";
+    html += "<div id='s" + idx + "_pin_block'>";
+    html += "GPIO Pin: <input name='s" + idx + "_pin' type='number' value='" + String(s.pin) + "'><br>";
+    html += "<small>Analog pins allowed: 32,35,36. Reserved pins: 0,1,2,3,4,12,14,15,34</small><br>";
+    html += "</div>";
+    html += "<div id='s" + idx + "_addr_block'>";
     html += "OSC address: <input name='s" + idx + "_addr' type='text' value='" + s.oscAddress + "'><br>";
-    html += "Pin: <input name='s" + idx + "_pin' type='number' value='" + String(s.pin) + "'><br>";
-    html += "<small>Reserved pins: 0,1,2,3,12,15,34</small><br>";
+    html += "</div>";
 
     html += "<div id='s" + idx + "_analog'>";
     html += "Invert: <input name='s" + idx + "_inv' type='checkbox' " + String(s.invert ? "checked" : "") + "><br>";
@@ -733,25 +816,43 @@ static void handleRoot() {
     html += "Use pullup: <input name='s" + idx + "_pu' type='checkbox' " + String(s.pullup ? "checked" : "") + "><br>";
     html += "</div>";
 
-  html += "<div id='s" + idx + "_range'>";
-  html += "Output min: <input name='s" + idx + "_omin' type='number' step='0.001' value='" + String(s.outMin, 3) + "'><br>";
-  html += "Output max: <input name='s" + idx + "_omax' type='number' step='0.001' value='" + String(s.outMax, 3) + "'><br>";
-  html += "</div>";
-  html += "Output type: <select name='s" + idx + "_omode' id='s" + idx + "_omode'>";
-  html += "<option value='0' " + String(s.outMode == OUT_INT ? "selected" : "") + ">Int</option>";
-  html += "<option value='1' " + String(s.outMode == OUT_FLOAT ? "selected" : "") + ">Float</option>";
-  html += "<option value='2' id='s" + idx + "_opt_string' " + String(s.outMode == OUT_STRING ? "selected" : "") + ">String</option>";
-  html += "</select><br>";
+    html += "<div id='s" + idx + "_encoder'>";
+    html += "<b>Encoder</b><br>";
+    html += "Encoder address: <input id='s" + idx + "_enc_addr' name='s" + idx + "_enc_addr' type='text' value='" + s.oscAddress + "'><br>";
+    html += "CLK pin: <input name='s" + idx + "_clk' type='number' value='" + String(s.encClkPin) + "'><br>";
+    html += "DT pin: <input name='s" + idx + "_dt' type='number' value='" + String(s.encDtPin) + "'><br>";
+    html += "SW pin: <input name='s" + idx + "_sw' type='number' value='" + String(s.encSwPin) + "'><br>";
+    html += "<small>Encoder sends -1/+1 on each step.</small><br>";
+    html += "</div>";
+    html += "<div id='s" + idx + "_button_addr'>";
+    html += "<b>Button</b><br>";
+    html += "Button address: <input id='s" + idx + "_btn_addr' name='s" + idx + "_btn_addr' type='text' value='" + s.buttonAddress + "'><br>";
+    html += "</div>";
+    html += "Output type: <select name='s" + idx + "_omode' id='s" + idx + "_omode'>";
+    html += "<option value='0' " + String(s.outMode == OUT_INT ? "selected" : "") + ">Int</option>";
+    html += "<option value='1' " + String(s.outMode == OUT_FLOAT ? "selected" : "") + ">Float</option>";
+    html += "<option value='2' id='s" + idx + "_opt_string' " + String(s.outMode == OUT_STRING ? "selected" : "") + ">String</option>";
+    html += "</select><br>";
+    html += "<div id='s" + idx + "_range'>";
+    html += "Output min: <input name='s" + idx + "_omin' type='number' step='0.001' value='" + String(s.outMin, 3) + "'><br>";
+    html += "Output max: <input name='s" + idx + "_omax' type='number' step='0.001' value='" + String(s.outMax, 3) + "'><br>";
+    html += "</div>";
 
     html += "<div id='s" + idx + "_string'>";
     html += "On string: <input name='s" + idx + "_on' type='text' value='" + s.onString + "'><br>";
     html += "Off string: <input name='s" + idx + "_off' type='text' value='" + s.offString + "'><br>";
     html += "</div>";
-
     html += "</fieldset>";
   }
 
   html += "<button type='submit' class='primary'>Save</button>";
+  html += "<div class='card'>";
+  html += "<b>Security</b><br>";
+  html += "Username: <input name='username' type='text' value='" + config.username + "'><br>";
+  html += "Enable password: <input name='pwd_enabled' type='checkbox' " + String(config.passwordEnabled ? "checked" : "") + "><br>";
+  html += "New password: <input name='pwd_new' type='password' value=''><br>";
+  html += "<small>Leave new password blank to keep current.</small><br>";
+  html += "</div>";
   html += "<hr>";
   html += "<form method='POST' action='/reset' style='margin-top:8px;'>";
   html += "<button type='submit' id='factory_reset_btn' class='danger'>Factory Reset</button>";
@@ -766,8 +867,15 @@ static void handleRoot() {
   html += "const s=document.getElementById('s'+i+'_string');";
   html += "const r=document.getElementById('s'+i+'_range');";
   html += "const opt=document.getElementById('s'+i+'_opt_string');";
+  html += "const addr=document.getElementById('s'+i+'_addr_block');";
+  html += "const pin=document.getElementById('s'+i+'_pin_block');";
+  html += "const enc=document.getElementById('s'+i+'_encoder');";
+  html += "const btnAddrBlock=document.getElementById('s'+i+'_button_addr');";
+  html += "const encAddr=document.getElementById('s'+i+'_enc_addr');";
+  html += "const btnAddr=document.getElementById('s'+i+'_btn_addr');";
+  html += "const isEnc=(t==='4');";
   html += "a.style.display=(t==='0')?'block':'none';";
-  html += "d.style.display=(t!=='0')?'block':'none';";
+  html += "d.style.display=(t!=='0'&&!isEnc)?'block':'none';";
   html += "if(t==='0'){";
   html += "opt.disabled=true;";
   html += "if(om.value==='2'){om.value='1';}";
@@ -776,6 +884,14 @@ static void handleRoot() {
   html += "}";
   html += "s.style.display=(om.value==='2')?'block':'none';";
   html += "r.style.display=(om.value==='2')?'none':'block';";
+  html += "addr.style.display=isEnc?'none':'block';";
+  html += "pin.style.display=isEnc?'none':'block';";
+  html += "enc.style.display=isEnc?'block':'none';";
+  html += "btnAddrBlock.style.display=isEnc?'block':'none';";
+  html += "if(isEnc){";
+  html += "if(encAddr&&encAddr.value.trim()===''){encAddr.value='/encoder';}";
+  html += "if(btnAddr&&btnAddr.value.trim()===''){btnAddr.value='/button';}";
+  html += "}";
   html += "}";
   html += "const dh=document.getElementById('dhcp_enabled');";
   html += "const sf=document.getElementById('static_fields');";
@@ -785,6 +901,30 @@ static void handleRoot() {
   html += "const helpModal=document.getElementById('pin_help_modal');";
   html += "const helpClose=document.getElementById('pin_help_close');";
   html += "const resetBtn=document.getElementById('factory_reset_btn');";
+  html += "const form=document.querySelector('form[action=\"/\"]');";
+  html += "const reservedPins=new Set([0,1,2,3,4,12,14,15,34]);";
+  html += "const analogPins=new Set([32,35,36]);";
+  html += "function pinInputError(){";
+  html += "for(let i=0;i<" + String(MAX_SENSORS) + ";i++){";
+  html += "const el=document.querySelector('input[name=\"s'+i+'_pin\"]');";
+  html += "const typeEl=document.getElementById('s'+i+'_type');";
+  html += "if(!el){continue;}";
+  html += "const v=parseInt(el.value,10);";
+  html += "if(!isNaN(v)&&reservedPins.has(v)){return v;}";
+  html += "if(typeEl&&typeEl.value==='0'&&!isNaN(v)&&!analogPins.has(v)){return v;}";
+  html += "if(typeEl&&typeEl.value==='4'){";
+  html += "const clk=document.querySelector('input[name=\"s'+i+'_clk\"]');";
+  html += "const dt=document.querySelector('input[name=\"s'+i+'_dt\"]');";
+  html += "const sw=document.querySelector('input[name=\"s'+i+'_sw\"]');";
+  html += "const pins=[clk,dt,sw];";
+  html += "for(let p=0;p<pins.length;p++){";
+  html += "const val=parseInt(pins[p].value,10);";
+  html += "if(!isNaN(val)&&reservedPins.has(val)){return val;}";
+  html += "}";
+  html += "}";
+  html += "}";
+  html += "return null;";
+  html += "}";
   html += "function toggleDhcp(){sf.style.display=dh.checked?'none':'block';}";
   html += "function toggleNet(){";
   html += "if(!nm){wf.style.display='block';return;}";
@@ -795,6 +935,9 @@ static void handleRoot() {
   html += "helpModal.addEventListener('click',(e)=>{if(e.target===helpModal){helpModal.style.display='none';}});";
   html += "resetBtn.addEventListener('click',(e)=>{";
   html += "if(!confirm('Factory reset will erase all settings. Continue?')){e.preventDefault();}});";
+  html += "if(form){form.addEventListener('submit',(e)=>{";
+  html += "const bad=pinInputError();";
+  html += "if(bad!==null){alert('GPIO '+bad+' is not allowed for this selection.');e.preventDefault();}});}";
   html += "dh.addEventListener('change',toggleDhcp);";
   html += "if(nm){nm.addEventListener('change',toggleNet);}";
   html += "toggleDhcp();";
@@ -810,10 +953,19 @@ static void handleRoot() {
 }
 
 static void handleSave() {
+  if (!ensureAuthenticated()) return;
   String oldHostname = config.hostname;
+  bool wantPassword = server.hasArg("pwd_enabled");
+  String newPassword = server.arg("pwd_new");
 
   if (server.hasArg("hostname")) {
     config.hostname = sanitizeHostname(server.arg("hostname"));
+  }
+  if (server.hasArg("username")) {
+    String user = server.arg("username");
+    user.trim();
+    if (user.length() == 0) user = DEFAULT_USERNAME;
+    config.username = user;
   }
 
   if (server.hasArg("net_mode")) {
@@ -892,13 +1044,18 @@ static void handleSave() {
       s.type = sanitizeSensorType(server.arg("s" + idx + "_type").toInt());
     }
 
-    if (server.hasArg("s" + idx + "_pin")) {
-      int pin = server.arg("s" + idx + "_pin").toInt();
-      if (pin >= 0 && pin <= 39 && !isReservedPin(pin)) s.pin = pin;
-    }
-
     if (server.hasArg("s" + idx + "_addr")) {
       s.oscAddress = normalizeOscAddress(server.arg("s" + idx + "_addr"));
+    }
+    if (server.hasArg("s" + idx + "_enc_addr")) {
+      s.oscAddress = normalizeOscAddress(server.arg("s" + idx + "_enc_addr"));
+    }
+    if (server.hasArg("s" + idx + "_btn_addr")) {
+      s.buttonAddress = normalizeOscAddress(server.arg("s" + idx + "_btn_addr"));
+    }
+    if (s.type == SENSOR_ENCODER) {
+      if (s.oscAddress.length() == 0) s.oscAddress = "/encoder";
+      if (s.buttonAddress.length() == 0) s.buttonAddress = "/button";
     }
 
     s.invert = server.hasArg("s" + idx + "_inv");
@@ -927,11 +1084,40 @@ static void handleSave() {
       if (s.offString.length() == 0) s.offString = DEFAULT_OFF_STRING;
     }
 
+    if (server.hasArg("s" + idx + "_pin")) {
+      int pin = server.arg("s" + idx + "_pin").toInt();
+      if (pin >= 0 && pin <= 39 && !isReservedPin(pin)) {
+        if (s.type != SENSOR_ANALOG || isAllowedAnalogPin(pin)) {
+          s.pin = pin;
+        }
+      }
+    }
+    if (s.type == SENSOR_ENCODER) {
+      int clk = server.arg("s" + idx + "_clk").toInt();
+      int dt = server.arg("s" + idx + "_dt").toInt();
+      int sw = server.arg("s" + idx + "_sw").toInt();
+      if (clk >= 0 && clk <= 39 && !isReservedPin(clk)) s.encClkPin = clk;
+      if (dt >= 0 && dt <= 39 && !isReservedPin(dt)) s.encDtPin = dt;
+      if (sw >= 0 && sw <= 39 && !isReservedPin(sw)) s.encSwPin = sw;
+    }
+
     if (s.type == SENSOR_ANALOG && s.outMode == OUT_STRING) {
       s.outMode = OUT_FLOAT;
     }
 
     config.sensors[i] = s;
+  }
+
+  if (!wantPassword) {
+    config.passwordEnabled = false;
+    config.password = "";
+  } else if (newPassword.length() > 0) {
+    config.passwordEnabled = true;
+    config.password = newPassword;
+  } else if (config.password.length() > 0) {
+    config.passwordEnabled = true;
+  } else {
+    config.passwordEnabled = false;
   }
 
   saveConfig();
@@ -958,6 +1144,7 @@ static void doFactoryReset(bool respond) {
 }
 
 static void handleReset() {
+  if (!ensureAuthenticated()) return;
   doFactoryReset(true);
 }
 
@@ -1028,15 +1215,36 @@ void loop() {
   for (int i = 0; i < MAX_SENSORS; i++) {
     SensorConfig& s = config.sensors[i];
     if (!s.enabled) continue;
-    if (s.oscAddress.length() == 0) continue;
     if (hasPinConflict(i)) continue;
 
     float norm = 0.0f;
     bool active = false;
+    bool isEncoder = (s.type == SENSOR_ENCODER);
+    const String& outAddress = isEncoder ? s.buttonAddress : s.oscAddress;
+
+    if (isEncoder) {
+      int a = digitalRead(s.encClkPin);
+      int b = digitalRead(s.encDtPin);
+      if (lastEncA[i] < 0) {
+        lastEncA[i] = a;
+        lastEncB[i] = b;
+      }
+      if (a != lastEncA[i] && s.oscAddress.length() > 0) {
+        int delta = (a == b) ? -1 : 1;
+        sendOscInt(s.oscAddress.c_str(), delta);
+      }
+      lastEncA[i] = a;
+      lastEncB[i] = b;
+
+      bool pressed = (digitalRead(s.encSwPin) == LOW);
+      norm = pressed ? 1.0f : 0.0f;
+    }
+
+    if (outAddress.length() == 0) continue;
 
     if (s.type == SENSOR_ANALOG) {
       norm = readAnalogNormalized(i, s);
-    } else {
+    } else if (!isEncoder) {
       active = readDigitalActive(s);
       if (s.type == SENSOR_TOGGLE) {
         if (lastLevel[i] == -1) lastLevel[i] = active ? 1 : 0;
@@ -1059,7 +1267,7 @@ void loop() {
       if (changed) {
         const char* value = (state == 1) ? s.onString.c_str() : s.offString.c_str();
         if (value[0] != '\0') {
-          sendOscString(s.oscAddress.c_str(), value);
+          sendOscString(outAddress.c_str(), value);
           lastBool[i] = state;
         } else {
           changed = false;
@@ -1070,7 +1278,7 @@ void loop() {
       outputValue = snapOutput(s, outputValue);
       changed = isnan(lastFloat[i]) || fabsf(outputValue - lastFloat[i]) > 0.0005f;
       if (changed) {
-        sendOscFloat(s.oscAddress.c_str(), outputValue);
+        sendOscFloat(outAddress.c_str(), outputValue);
         lastFloat[i] = outputValue;
       }
     } else {
@@ -1082,14 +1290,14 @@ void loop() {
       }
       changed = (intValue != lastInt[i]);
       if (changed) {
-        sendOscInt(s.oscAddress.c_str(), intValue);
+        sendOscInt(outAddress.c_str(), intValue);
         lastInt[i] = intValue;
       }
     }
 
     if (changed) {
       Serial.print("Sent ");
-      Serial.print(s.oscAddress);
+      Serial.print(outAddress);
       Serial.print(" = ");
       if (s.outMode == OUT_STRING) {
         Serial.println((norm >= 0.5f) ? s.onString : s.offString);
