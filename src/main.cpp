@@ -129,6 +129,8 @@ int8_t lastLevel[MAX_SENSORS]; // last raw level per sensor
 bool toggleState[MAX_SENSORS]; // toggle state per sensor
 int8_t lastEncA[MAX_SENSORS];
 int8_t lastEncB[MAX_SENSORS];
+int8_t lastEncState[MAX_SENSORS];
+int8_t encAccum[MAX_SENSORS];
 WiFiUDP udp;
 WebServer server(80);
 Preferences prefs;
@@ -339,7 +341,7 @@ static SensorConfig defaultSensorConfig(int index) {
   s.pin = defaultSensorPin(index);
   s.encClkPin = 13;
   s.encDtPin = 16;
-  s.encSwPin = 5;
+  s.encSwPin = 33;
   s.invert = DEFAULT_INVERT;
   s.activeHigh = DEFAULT_DIGITAL_ACTIVE_HIGH;
   s.pullup = DEFAULT_DIGITAL_PULLUP;
@@ -367,6 +369,8 @@ static void resetRuntimeState() {
     toggleState[i] = false;
     lastEncA[i] = -1;
     lastEncB[i] = -1;
+    lastEncState[i] = -1;
+    encAccum[i] = 0;
   }
 }
 
@@ -693,7 +697,7 @@ static bool parseIpString(const String& s, IPAddress& out) {
 static void handleRoot() {
   if (!ensureAuthenticated()) return;
   String html;
-  html.reserve(12000);
+  html.reserve(13000);
   html += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>";
   html += "<title>StageMod Settings</title>";
   html += "<style>";
@@ -758,6 +762,7 @@ static void handleRoot() {
 
   html += "<form method='POST' action='/'>";
   html += "<div class='card'>";
+  html += "<b>Network</b><br>";
   html += "Hostname: <input name='hostname' type='text' value='" + config.hostname + "'><br>";
   html += "Client IP: <input name='client_ip' type='text' value='" + ipToString(config.clientIp) + "'><br>";
   html += "Client port: <input name='client_port' type='number' value='" + String(config.clientPort) + "'><br>";
@@ -784,13 +789,24 @@ static void handleRoot() {
   html += "</div>";
   html += "<small>Static IP changes may require reboot.</small><br>";
   html += "</div>";
+  html += "<div class='card'>";
+  html += "<b>Test OSC</b><br>";
+  html += "Address: <input id='test_addr' name='test_addr' type='text' value='/test'><br>";
+  html += "Output type: <select id='test_type' name='test_type'>";
+  html += "<option value='int'>Int</option>";
+  html += "<option value='float'>Float</option>";
+  html += "<option value='string'>String</option>";
+  html += "</select><br>";
+  html += "Output: <input id='test_value' name='test_value' type='text' value='1'><br>";
+  html += "<button type='button' id='test_send_btn'>Send</button>";
+  html += "</div>";
   html += "<hr>";
 
   for (int i = 0; i < MAX_SENSORS; i++) {
     const SensorConfig& s = config.sensors[i];
     String idx = String(i);
     html += "<fieldset>";
-    html += "<legend>Sensor " + String(i + 1) + "</legend>";
+    html += "<legend><b>Sensor " + String(i + 1) + "</b></legend>";
     html += "Enable: <input name='s" + idx + "_en' type='checkbox' " + String(s.enabled ? "checked" : "") + "><br>";
     html += "Type: <select name='s" + idx + "_type' id='s" + idx + "_type'>";
     html += "<option value='0' " + String(s.type == SENSOR_ANALOG ? "selected" : "") + ">Analog (pot/slider)</option>";
@@ -902,6 +918,10 @@ static void handleRoot() {
   html += "const helpClose=document.getElementById('pin_help_close');";
   html += "const resetBtn=document.getElementById('factory_reset_btn');";
   html += "const form=document.querySelector('form[action=\"/\"]');";
+  html += "const testBtn=document.getElementById('test_send_btn');";
+  html += "const testAddr=document.getElementById('test_addr');";
+  html += "const testType=document.getElementById('test_type');";
+  html += "const testValue=document.getElementById('test_value');";
   html += "const reservedPins=new Set([0,1,2,3,4,12,14,15,34]);";
   html += "const analogPins=new Set([32,35,36]);";
   html += "function pinInputError(){";
@@ -935,6 +955,13 @@ static void handleRoot() {
   html += "helpModal.addEventListener('click',(e)=>{if(e.target===helpModal){helpModal.style.display='none';}});";
   html += "resetBtn.addEventListener('click',(e)=>{";
   html += "if(!confirm('Factory reset will erase all settings. Continue?')){e.preventDefault();}});";
+  html += "if(testBtn&&testAddr){testBtn.addEventListener('click',()=>{";
+  html += "const data=new URLSearchParams();";
+  html += "data.set('test_addr',testAddr.value||'/test');";
+  html += "if(testType){data.set('test_type',testType.value);}";
+  html += "if(testValue){data.set('test_value',testValue.value);}";
+  html += "fetch('/send_test',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data.toString()});";
+  html += "});}";
   html += "if(form){form.addEventListener('submit',(e)=>{";
   html += "const bad=pinInputError();";
   html += "if(bad!==null){alert('GPIO '+bad+' is not allowed for this selection.');e.preventDefault();}});}";
@@ -1132,6 +1159,31 @@ static void handleSave() {
   server.send(303, "text/plain", "Saved.");
 }
 
+static void handleSendTestOsc() {
+  if (!ensureAuthenticated()) return;
+  String addr = "/test";
+  String type = "int";
+  String value = "1";
+  if (server.hasArg("test_addr")) {
+    addr = normalizeOscAddress(server.arg("test_addr"));
+  }
+  if (server.hasArg("test_type")) {
+    type = server.arg("test_type");
+  }
+  if (server.hasArg("test_value")) {
+    value = server.arg("test_value");
+  }
+  if (type == "string") {
+    sendOscString(addr.c_str(), value.c_str());
+  } else if (type == "float") {
+    sendOscFloat(addr.c_str(), value.toFloat());
+  } else {
+    sendOscInt(addr.c_str(), value.toInt());
+  }
+  server.sendHeader("Location", "/", true);
+  server.send(303, "text/plain", "Sent.");
+}
+
 static void doFactoryReset(bool respond) {
   prefs.begin("osc", false);
   prefs.clear();
@@ -1173,6 +1225,7 @@ void setup() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/", HTTP_POST, handleSave);
   server.on("/save", HTTP_POST, handleSave);
+  server.on("/send_test", HTTP_POST, handleSendTestOsc);
   server.on("/reset", HTTP_POST, handleReset);
 #if !USE_ETHERNET
   server.on("/generate_204", HTTP_GET, []() {
@@ -1225,14 +1278,31 @@ void loop() {
     if (isEncoder) {
       int a = digitalRead(s.encClkPin);
       int b = digitalRead(s.encDtPin);
-      if (lastEncA[i] < 0) {
-        lastEncA[i] = a;
-        lastEncB[i] = b;
+      int state = (a << 1) | b;
+      if (lastEncState[i] < 0) {
+        lastEncState[i] = state;
       }
-      if (a != lastEncA[i] && s.oscAddress.length() > 0) {
-        int delta = (a == b) ? -1 : 1;
-        sendOscInt(s.oscAddress.c_str(), delta);
+      if (s.oscAddress.length() > 0 && lastEncState[i] >= 0) {
+        static const int8_t kEncTable[16] = {
+          0, -1, 1, 0,
+          1, 0, 0, -1,
+          -1, 0, 0, 1,
+          0, 1, -1, 0
+        };
+        int idx = (lastEncState[i] << 2) | state;
+        int8_t delta = kEncTable[idx];
+        if (delta != 0) {
+          encAccum[i] += delta;
+          if (encAccum[i] >= 2) {
+            sendOscInt(s.oscAddress.c_str(), 1);
+            encAccum[i] = 0;
+          } else if (encAccum[i] <= -2) {
+            sendOscInt(s.oscAddress.c_str(), -1);
+            encAccum[i] = 0;
+          }
+        }
       }
+      lastEncState[i] = state;
       lastEncA[i] = a;
       lastEncB[i] = b;
 
