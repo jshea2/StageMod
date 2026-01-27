@@ -2,16 +2,16 @@
 
 StageMod turns an Olimex ESP32-PoE-ISO into a configurable OSC sensor hub with a built-in web UI.
 
-Quick links
-- Web flasher: https://jshea2.github.io/StageMod/web-flasher/
-- TouchDesigner project: `Touchdesigner/StageMod-TouchSensorOSC.toe`
-- 3D prints: `3D_Prints/StageMod-v1.stl` (print) and `3D_Prints/StageMod-v1.f3d` (edit)
+
+https://github.com/user-attachments/assets/1f41d19c-4316-445e-9120-f764ade31daa
+
+
+<img width="478" height="868" alt="Screenshot 2026-01-27 at 1 33 12 PM" src="https://github.com/user-attachments/assets/7543e0a2-bbac-4586-8501-da448972fe47" />
+
 
 ## Hardware
 - Olimex ESP32-PoE-ISO
-- PoE switch or injector (or USB for power + data)
 - Sensors (digital or analog; up to 6 total)
-- Jumper wires / breadboard as needed
 
 ## Flash firmware (no IDE)
 1) Open the web flasher: https://jshea2.github.io/StageMod/web-flasher/
