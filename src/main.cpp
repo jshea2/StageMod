@@ -13,8 +13,12 @@
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <WiFiUdp.h>
+#include <time.h>
+#include <sys/time.h>
+#ifndef WEBSERVER_MAX_POST_ARGS
+#define WEBSERVER_MAX_POST_ARGS 300
+#endif
 #include <WebServer.h>
-#include <LittleFS.h>
 #include <Update.h>
 
 // =========================
@@ -33,6 +37,10 @@ const IPAddress DEFAULT_DNS2(8, 8, 8, 8);
 const char* DEFAULT_WIFI_SSID = "";
 const char* DEFAULT_WIFI_PASS = "";
 const char* DEFAULT_USERNAME = "admin";
+const char* FIRMWARE_VERSION = "0.10.0";
+const char* DEFAULT_NTP_SERVER = "pool.ntp.org";
+const uint8_t DEFAULT_TIME_MODE = 0; // 0 = NTP, 1 = Manual
+const char* DEFAULT_TIMEZONE = "PST8PDT,M3.2.0/2,M11.1.0/2";
 
 const int MAX_TRIGGERS = 20;
 const int MAX_OSC_DEVICES = 8;
@@ -53,10 +61,27 @@ enum SensorType {
   SENSOR_BUTTON_LONG = 7
 };
 
+enum SensorSource {
+  SRC_SENSORS = 0,
+  SRC_TIME = 1
+};
+
+enum TimeTriggerType {
+  TIME_ONCE = 0,
+  TIME_DAILY = 1,
+  TIME_WEEKLY = 2,
+  TIME_INTERVAL = 3
+};
+
 enum OutputMode {
   OUT_INT = 0,
   OUT_FLOAT = 1,
   OUT_STRING = 2
+};
+
+enum TimeMode {
+  TIME_NTP = 0,
+  TIME_MANUAL = 1
 };
 
 enum OutputTarget {
@@ -82,6 +107,7 @@ const NetMode DEFAULT_NET_MODE = NET_WIFI;
 
 const int RESET_BUTTON_PIN = 34;
 const unsigned long RESET_HOLD_MS = 5000;
+const unsigned long RESET_ARM_MS = 500;
 
 // Behavior
 const int LOOP_DELAY_MS = 10;                  // read/send cycle
@@ -109,6 +135,7 @@ struct OscDevice {
 struct SensorConfig {
   bool enabled;
   String name;
+  SensorSource source;
   SensorType type;
   int pin;
   int encClkPin;
@@ -128,6 +155,15 @@ struct SensorConfig {
   uint8_t outDevice;
   String onString;
   String offString;
+  TimeTriggerType timeType;
+  uint16_t timeYear;
+  uint8_t timeMonth;
+  uint8_t timeDay;
+  uint8_t timeHour;
+  uint8_t timeMinute;
+  uint8_t timeSecond;
+  uint8_t weeklyMask; // bit0=Sun ... bit6=Sat
+  uint32_t intervalSeconds;
 };
 
 struct Config {
@@ -150,6 +186,10 @@ struct Config {
   uint32_t clickDebounceMs;
   uint32_t multiClickGapMs;
   uint32_t longPressMs;
+  uint8_t timeMode;
+  String ntpServer;
+  String timeZone;
+  uint32_t manualEpoch;
   uint8_t triggerCount;
   uint8_t triggerOrder[MAX_TRIGGERS];
   uint8_t oscDeviceCount;
@@ -179,18 +219,23 @@ unsigned long multiLastChangeMs[MAX_TRIGGERS];
 unsigned long multiPressStartMs[MAX_TRIGGERS];
 unsigned long multiLastReleaseMs[MAX_TRIGGERS];
 unsigned long lastAnalogPrintMs[MAX_TRIGGERS];
+time_t lastTimeFireEpoch[MAX_TRIGGERS];
+uint32_t lastTimeFireDay[MAX_TRIGGERS];
 WiFiUDP udp;
 WebServer server(80);
 Preferences prefs;
 bool pendingNetApply = false;
 bool pendingMdnsRestart = false;
 unsigned long pendingApplyAt = 0;
+unsigned long ntpLastAttemptMs = 0;
+bool ntpPending = false;
 bool wifiApMode = false;
 unsigned long wifiReconnectStarted = 0;
 DNSServer dnsServer;
 unsigned long resetPressStartMs = 0;
+bool resetButtonArmed = false;
+unsigned long resetHighStartMs = 0;
 unsigned long lastHeartbeatSentMs = 0;
-bool littleFsOk = false;
 const int LOG_LINES = 120;
 String logLines[LOG_LINES];
 int logHead = 0;
@@ -205,6 +250,20 @@ static void addLog(const String& msg);
 static bool parseOrderList(const String& s, uint8_t* order, uint8_t& count);
 static String buildOrderList(const uint8_t* order, uint8_t count);
 static int findUnusedTrigger();
+static String jsonEscape(const String& s);
+static void clearSensorKeys(int index);
+static void clearDeviceKeys(int index);
+static void removeIfExists(const String& key);
+static void applyTimeConfig();
+static String formatTimeLocal();
+static String formatDateLocal();
+static String formatTimeLocalInput();
+static bool parseDateTimeLocal(const String& dateStr, const String& timeStr, uint32_t& epochOut);
+static void pollNtpSync();
+static bool parseDateYMD(const String& dateStr, uint16_t& y, uint8_t& m, uint8_t& d);
+static bool parseTimeHMS(const String& timeStr, uint8_t& h, uint8_t& m, uint8_t& s);
+static void sendTriggerOutput(const SensorConfig& sensor, const String& addr);
+static bool handleTimeTrigger(int index, SensorConfig& s);
 
 static int readAveragedADC(int pin) {
   uint32_t acc = 0;
@@ -328,6 +387,27 @@ static String buildApSsid() {
   return String(buf);
 }
 
+static String jsonEscape(const String& s) {
+  String out;
+  out.reserve(s.length() + 8);
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '"' || c == '\\') {
+      out += '\\';
+      out += c;
+    } else if (c == '\n') {
+      out += "\\n";
+    } else if (c == '\r') {
+      out += "\\r";
+    } else if (c == '\t') {
+      out += "\\t";
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
 static void startWifiAp() {
   String apSsid = buildApSsid();
   WiFi.mode(WIFI_AP_STA);
@@ -417,6 +497,7 @@ static SensorConfig defaultSensorConfig(int index) {
   SensorConfig s;
   s.enabled = (index == 0);
   s.name = String("Trigger ") + String(index + 1);
+  s.source = SRC_SENSORS;
   s.type = (index == 0) ? SENSOR_ANALOG : SENSOR_BUTTON;
   s.pin = defaultSensorPin(index);
   s.encClkPin = 13;
@@ -436,11 +517,146 @@ static SensorConfig defaultSensorConfig(int index) {
   s.outDevice = 0;
   s.onString = DEFAULT_ON_STRING;
   s.offString = DEFAULT_OFF_STRING;
+  s.timeType = TIME_DAILY;
+  s.timeYear = 2025;
+  s.timeMonth = 1;
+  s.timeDay = 1;
+  s.timeHour = 12;
+  s.timeMinute = 0;
+  s.timeSecond = 0;
+  s.weeklyMask = 0x7F;
+  s.intervalSeconds = 3600;
   return s;
 }
 
 static String sensorKey(int index, const char* suffix) {
   return String("s") + String(index) + "_" + suffix;
+}
+
+static String formatTimeLocal() {
+  time_t now = time(nullptr);
+  if (now < 100000) return "Not set";
+  struct tm tmLocal;
+  localtime_r(&now, &tmLocal);
+  char buf[32];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tmLocal);
+  return String(buf);
+}
+
+static String formatDateLocal() {
+  time_t now = time(nullptr);
+  if (now < 100000) return "";
+  struct tm tmLocal;
+  localtime_r(&now, &tmLocal);
+  char buf[16];
+  strftime(buf, sizeof(buf), "%Y-%m-%d", &tmLocal);
+  return String(buf);
+}
+
+static String formatTimeLocalInput() {
+  time_t now = time(nullptr);
+  if (now < 100000) return "";
+  struct tm tmLocal;
+  localtime_r(&now, &tmLocal);
+  char buf[16];
+  strftime(buf, sizeof(buf), "%H:%M:%S", &tmLocal);
+  return String(buf);
+}
+
+static bool parseDateTimeLocal(const String& dateStr, const String& timeStr, uint32_t& epochOut) {
+  int year = 0, mon = 0, day = 0;
+  int hour = 0, min = 0, sec = 0;
+  if (sscanf(dateStr.c_str(), "%d-%d-%d", &year, &mon, &day) != 3) return false;
+  int timeParts = sscanf(timeStr.c_str(), "%d:%d:%d", &hour, &min, &sec);
+  if (timeParts < 2) return false;
+  if (year < 1970 || mon < 1 || mon > 12 || day < 1 || day > 31) return false;
+  if (hour < 0 || hour > 23 || min < 0 || min > 59 || sec < 0 || sec > 59) return false;
+  struct tm tmLocal = {};
+  tmLocal.tm_year = year - 1900;
+  tmLocal.tm_mon = mon - 1;
+  tmLocal.tm_mday = day;
+  tmLocal.tm_hour = hour;
+  tmLocal.tm_min = min;
+  tmLocal.tm_sec = sec;
+  tmLocal.tm_isdst = -1;
+  time_t t = mktime(&tmLocal);
+  if (t < 0) return false;
+  epochOut = static_cast<uint32_t>(t);
+  return true;
+}
+
+static bool parseDateYMD(const String& dateStr, uint16_t& y, uint8_t& m, uint8_t& d) {
+  int year = 0, mon = 0, day = 0;
+  if (sscanf(dateStr.c_str(), "%d-%d-%d", &year, &mon, &day) != 3) return false;
+  if (year < 1970 || mon < 1 || mon > 12 || day < 1 || day > 31) return false;
+  y = static_cast<uint16_t>(year);
+  m = static_cast<uint8_t>(mon);
+  d = static_cast<uint8_t>(day);
+  return true;
+}
+
+static bool parseTimeHMS(const String& timeStr, uint8_t& h, uint8_t& m, uint8_t& s) {
+  int hour = 0, min = 0, sec = 0;
+  int parts = sscanf(timeStr.c_str(), "%d:%d:%d", &hour, &min, &sec);
+  if (parts < 2) return false;
+  if (hour < 0 || hour > 23 || min < 0 || min > 59 || sec < 0 || sec > 59) return false;
+  h = static_cast<uint8_t>(hour);
+  m = static_cast<uint8_t>(min);
+  s = static_cast<uint8_t>(sec);
+  return true;
+}
+
+static bool handleTimeTrigger(int index, SensorConfig& s) {
+  time_t now = time(nullptr);
+  if (now < 100000) return true;
+  struct tm tmLocal;
+  localtime_r(&now, &tmLocal);
+  uint32_t todayKey = static_cast<uint32_t>((tmLocal.tm_year + 1900) * 10000 +
+                                            (tmLocal.tm_mon + 1) * 100 +
+                                            tmLocal.tm_mday);
+  auto fire = [&]() {
+    sendTriggerOutput(s, s.oscAddress);
+  };
+  if (s.timeType == TIME_ONCE) {
+    struct tm tmTarget = {};
+    tmTarget.tm_year = s.timeYear - 1900;
+    tmTarget.tm_mon = s.timeMonth - 1;
+    tmTarget.tm_mday = s.timeDay;
+    tmTarget.tm_hour = s.timeHour;
+    tmTarget.tm_min = s.timeMinute;
+    tmTarget.tm_sec = s.timeSecond;
+    tmTarget.tm_isdst = -1;
+    time_t target = mktime(&tmTarget);
+    if (target > 0 && now >= target && lastTimeFireEpoch[index] < target) {
+      fire();
+      lastTimeFireEpoch[index] = target;
+    }
+  } else if (s.timeType == TIME_DAILY) {
+    if (tmLocal.tm_hour == s.timeHour &&
+        tmLocal.tm_min == s.timeMinute &&
+        tmLocal.tm_sec == s.timeSecond &&
+        lastTimeFireDay[index] != todayKey) {
+      fire();
+      lastTimeFireDay[index] = todayKey;
+    }
+  } else if (s.timeType == TIME_WEEKLY) {
+    if ((s.weeklyMask & (1 << tmLocal.tm_wday)) &&
+        tmLocal.tm_hour == s.timeHour &&
+        tmLocal.tm_min == s.timeMinute &&
+        tmLocal.tm_sec == s.timeSecond &&
+        lastTimeFireDay[index] != todayKey) {
+      fire();
+      lastTimeFireDay[index] = todayKey;
+    }
+  } else if (s.timeType == TIME_INTERVAL) {
+    if (s.intervalSeconds > 0) {
+      if (lastTimeFireEpoch[index] == 0 || now - lastTimeFireEpoch[index] >= static_cast<time_t>(s.intervalSeconds)) {
+        fire();
+        lastTimeFireEpoch[index] = now;
+      }
+    }
+  }
+  return true;
 }
 
 static void resetRuntimeState() {
@@ -463,6 +679,8 @@ static void resetRuntimeState() {
     multiPressStartMs[i] = 0;
     multiLastReleaseMs[i] = 0;
     lastAnalogPrintMs[i] = 0;
+    lastTimeFireEpoch[i] = 0;
+    lastTimeFireDay[i] = 0;
   }
   for (int i = 0; i < MAX_OSC_DEVICES; i++) {
     hbLastSent[i] = 0;
@@ -470,10 +688,68 @@ static void resetRuntimeState() {
   lastHeartbeatSentMs = 0;
 }
 
+static void removeIfExists(const String& key) {
+  if (prefs.isKey(key.c_str())) {
+    prefs.remove(key.c_str());
+  }
+}
+
+static void clearSensorKeys(int index) {
+  removeIfExists(sensorKey(index, "en"));
+  removeIfExists(sensorKey(index, "name"));
+  removeIfExists(sensorKey(index, "src"));
+  removeIfExists(sensorKey(index, "type"));
+  removeIfExists(sensorKey(index, "pin"));
+  removeIfExists(sensorKey(index, "clk"));
+  removeIfExists(sensorKey(index, "dt"));
+  removeIfExists(sensorKey(index, "sw"));
+  removeIfExists(sensorKey(index, "inv"));
+  removeIfExists(sensorKey(index, "ah"));
+  removeIfExists(sensorKey(index, "pu"));
+  removeIfExists(sensorKey(index, "cd_en"));
+  removeIfExists(sensorKey(index, "cd_ms"));
+  removeIfExists(sensorKey(index, "addr"));
+  removeIfExists(sensorKey(index, "baddr"));
+  removeIfExists(sensorKey(index, "omin"));
+  removeIfExists(sensorKey(index, "omax"));
+  removeIfExists(sensorKey(index, "omode"));
+  removeIfExists(sensorKey(index, "ot"));
+  removeIfExists(sensorKey(index, "od"));
+  removeIfExists(sensorKey(index, "on"));
+  removeIfExists(sensorKey(index, "off"));
+  removeIfExists(sensorKey(index, "tt"));
+  removeIfExists(sensorKey(index, "ty"));
+  removeIfExists(sensorKey(index, "tm"));
+  removeIfExists(sensorKey(index, "td"));
+  removeIfExists(sensorKey(index, "th"));
+  removeIfExists(sensorKey(index, "tmin"));
+  removeIfExists(sensorKey(index, "tsec"));
+  removeIfExists(sensorKey(index, "twm"));
+  removeIfExists(sensorKey(index, "tint"));
+}
+
+static void clearDeviceKeys(int index) {
+  String keyEn = String("dev") + index + "_en";
+  String keyName = String("dev") + index + "_name";
+  String keyIp = String("dev") + index + "_ip";
+  String keyPort = String("dev") + index + "_port";
+  String keyHbEn = String("dev") + index + "_hb_en";
+  String keyHbAddr = String("dev") + index + "_hb_addr";
+  String keyHbMs = String("dev") + index + "_hb_ms";
+  removeIfExists(keyEn);
+  removeIfExists(keyName);
+  removeIfExists(keyIp);
+  removeIfExists(keyPort);
+  removeIfExists(keyHbEn);
+  removeIfExists(keyHbAddr);
+  removeIfExists(keyHbMs);
+}
+
 static void applySensorPinModes() {
   for (int i = 0; i < MAX_TRIGGERS; i++) {
     const SensorConfig& sensor = config.sensors[i];
     if (!sensor.enabled) continue;
+    if (sensor.source == SRC_TIME) continue;
     if (sensor.type == SENSOR_ENCODER) {
       pinMode(sensor.encClkPin, INPUT_PULLUP);
       pinMode(sensor.encDtPin, INPUT_PULLUP);
@@ -486,6 +762,7 @@ static void applySensorPinModes() {
 
 static bool hasPinConflict(int index) {
   if (!config.sensors[index].enabled) return false;
+  if (config.sensors[index].source == SRC_TIME) return false;
   int pinsA[3];
   int countA = 0;
   const SensorConfig& a = config.sensors[index];
@@ -555,6 +832,13 @@ static void loadConfig() {
   if (config.multiClickGapMs == 0) config.multiClickGapMs = DEFAULT_MULTI_CLICK_GAP_MS;
   config.longPressMs = prefs.getUInt("long_ms", DEFAULT_LONG_PRESS_MS);
   if (config.longPressMs == 0) config.longPressMs = DEFAULT_LONG_PRESS_MS;
+  config.timeMode = prefs.getUInt("time_mode", DEFAULT_TIME_MODE);
+  if (config.timeMode > TIME_MANUAL) config.timeMode = DEFAULT_TIME_MODE;
+  config.ntpServer = prefs.getString("ntp_srv", DEFAULT_NTP_SERVER);
+  if (config.ntpServer.length() == 0) config.ntpServer = DEFAULT_NTP_SERVER;
+  config.timeZone = prefs.getString("tz", DEFAULT_TIMEZONE);
+  if (config.timeZone.length() == 0) config.timeZone = DEFAULT_TIMEZONE;
+  config.manualEpoch = prefs.getUInt("time_manual", 0);
   config.passwordEnabled = prefs.getBool("pwd_en", false);
   config.password = prefs.getString("pwd", "");
   if (!config.passwordEnabled || config.password.length() == 0) {
@@ -642,44 +926,56 @@ static void loadConfig() {
   }
   config.triggerCount = orderCount;
 
-  bool hasNew = prefs.isKey(sensorKey(0, "addr").c_str());
   for (int i = 0; i < MAX_TRIGGERS; i++) {
     config.sensors[i] = defaultSensorConfig(i);
   }
 
-  if (hasNew) {
-    for (int i = 0; i < MAX_TRIGGERS; i++) {
-      SensorConfig s = config.sensors[i];
-      s.enabled = prefs.getBool(sensorKey(i, "en").c_str(), s.enabled);
-      s.name = prefs.getString(sensorKey(i, "name").c_str(), s.name);
-      s.type = sanitizeSensorType(prefs.getInt(sensorKey(i, "type").c_str(), s.type));
-      s.pin = prefs.getInt(sensorKey(i, "pin").c_str(), s.pin);
-      s.encClkPin = prefs.getInt(sensorKey(i, "clk").c_str(), s.encClkPin);
-      s.encDtPin = prefs.getInt(sensorKey(i, "dt").c_str(), s.encDtPin);
-      s.encSwPin = prefs.getInt(sensorKey(i, "sw").c_str(), s.encSwPin);
-      s.invert = prefs.getBool(sensorKey(i, "inv").c_str(), s.invert);
-      s.activeHigh = prefs.getBool(sensorKey(i, "ah").c_str(), s.activeHigh);
-      s.pullup = prefs.getBool(sensorKey(i, "pu").c_str(), s.pullup);
-      s.cooldownEnabled = prefs.getBool(sensorKey(i, "cd_en").c_str(), s.cooldownEnabled);
-      s.cooldownMs = prefs.getUInt(sensorKey(i, "cd_ms").c_str(), s.cooldownMs);
-      s.oscAddress = prefs.getString(sensorKey(i, "addr").c_str(), s.oscAddress);
-      s.buttonAddress = prefs.getString(sensorKey(i, "baddr").c_str(), s.buttonAddress);
-      s.outMin = prefs.getFloat(sensorKey(i, "omin").c_str(), s.outMin);
-      s.outMax = prefs.getFloat(sensorKey(i, "omax").c_str(), s.outMax);
-      s.outMode = sanitizeOutputMode(prefs.getInt(sensorKey(i, "omode").c_str(), s.outMode));
-      s.outTarget = sanitizeOutputTarget(prefs.getInt(sensorKey(i, "ot").c_str(), s.outTarget));
-      s.outDevice = prefs.getInt(sensorKey(i, "od").c_str(), s.outDevice);
-      if (s.outDevice >= MAX_OSC_DEVICES) s.outDevice = 0;
-      s.onString = prefs.getString(sensorKey(i, "on").c_str(), s.onString);
-      s.offString = prefs.getString(sensorKey(i, "off").c_str(), s.offString);
+  for (int i = 0; i < MAX_TRIGGERS; i++) {
+    SensorConfig s = config.sensors[i];
+    s.enabled = prefs.getBool(sensorKey(i, "en").c_str(), s.enabled);
+    s.name = prefs.getString(sensorKey(i, "name").c_str(), s.name);
+    s.source = static_cast<SensorSource>(prefs.getInt(sensorKey(i, "src").c_str(), s.source));
+    if (s.source != SRC_TIME) s.source = SRC_SENSORS;
+    s.type = sanitizeSensorType(prefs.getInt(sensorKey(i, "type").c_str(), s.type));
+    s.pin = prefs.getInt(sensorKey(i, "pin").c_str(), s.pin);
+    s.encClkPin = prefs.getInt(sensorKey(i, "clk").c_str(), s.encClkPin);
+    s.encDtPin = prefs.getInt(sensorKey(i, "dt").c_str(), s.encDtPin);
+    s.encSwPin = prefs.getInt(sensorKey(i, "sw").c_str(), s.encSwPin);
+    s.invert = prefs.getBool(sensorKey(i, "inv").c_str(), s.invert);
+    s.activeHigh = prefs.getBool(sensorKey(i, "ah").c_str(), s.activeHigh);
+    s.pullup = prefs.getBool(sensorKey(i, "pu").c_str(), s.pullup);
+    s.cooldownEnabled = prefs.getBool(sensorKey(i, "cd_en").c_str(), s.cooldownEnabled);
+    s.cooldownMs = prefs.getUInt(sensorKey(i, "cd_ms").c_str(), s.cooldownMs);
+    s.oscAddress = prefs.getString(sensorKey(i, "addr").c_str(), s.oscAddress);
+    s.buttonAddress = prefs.getString(sensorKey(i, "baddr").c_str(), s.buttonAddress);
+    s.outMin = prefs.getFloat(sensorKey(i, "omin").c_str(), s.outMin);
+    s.outMax = prefs.getFloat(sensorKey(i, "omax").c_str(), s.outMax);
+    s.outMode = sanitizeOutputMode(prefs.getInt(sensorKey(i, "omode").c_str(), s.outMode));
+    s.outTarget = sanitizeOutputTarget(prefs.getInt(sensorKey(i, "ot").c_str(), s.outTarget));
+    s.outDevice = prefs.getInt(sensorKey(i, "od").c_str(), s.outDevice);
+    if (s.outDevice >= MAX_OSC_DEVICES) s.outDevice = 0;
+    s.onString = prefs.getString(sensorKey(i, "on").c_str(), s.onString);
+    s.offString = prefs.getString(sensorKey(i, "off").c_str(), s.offString);
+    s.timeType = static_cast<TimeTriggerType>(prefs.getInt(sensorKey(i, "tt").c_str(), s.timeType));
+    if (s.timeType > TIME_INTERVAL) s.timeType = TIME_DAILY;
+    s.timeYear = prefs.getInt(sensorKey(i, "ty").c_str(), s.timeYear);
+    s.timeMonth = prefs.getInt(sensorKey(i, "tm").c_str(), s.timeMonth);
+    s.timeDay = prefs.getInt(sensorKey(i, "td").c_str(), s.timeDay);
+    s.timeHour = prefs.getInt(sensorKey(i, "th").c_str(), s.timeHour);
+    s.timeMinute = prefs.getInt(sensorKey(i, "tmin").c_str(), s.timeMinute);
+    s.timeSecond = prefs.getInt(sensorKey(i, "tsec").c_str(), s.timeSecond);
+    s.weeklyMask = prefs.getInt(sensorKey(i, "twm").c_str(), s.weeklyMask);
+    s.intervalSeconds = prefs.getUInt(sensorKey(i, "tint").c_str(), s.intervalSeconds);
 
-      if (s.oscAddress.length() == 0) s.oscAddress = defaultOscAddress(i);
-      if (s.buttonAddress.length() == 0) s.buttonAddress = "/button";
-      if (s.name.length() == 0) s.name = String("Trigger ") + String(i + 1);
-      if (s.type == SENSOR_ANALOG && s.outMode == OUT_STRING) s.outMode = OUT_FLOAT;
-      config.sensors[i] = s;
-    }
-  } else {
+    if (s.oscAddress.length() == 0) s.oscAddress = defaultOscAddress(i);
+    if (s.buttonAddress.length() == 0) s.buttonAddress = "/button";
+    if (s.name.length() == 0) s.name = String("Trigger ") + String(i + 1);
+    if (s.type == SENSOR_ANALOG && s.outMode == OUT_STRING) s.outMode = OUT_FLOAT;
+    config.sensors[i] = s;
+  }
+
+  bool hasLegacy = prefs.isKey("sensor_type");
+  if (hasLegacy && !prefs.isKey(sensorKey(0, "type").c_str())) {
     SensorConfig s0 = config.sensors[0];
     String legacyType = prefs.getString("sensor_type", "analog");
     s0.type = (legacyType == "digital") ? SENSOR_BUTTON : SENSOR_ANALOG;
@@ -719,6 +1015,10 @@ static void saveConfig() {
   prefs.putUInt("click_db", config.clickDebounceMs);
   prefs.putUInt("click_gap", config.multiClickGapMs);
   prefs.putUInt("long_ms", config.longPressMs);
+  prefs.putUInt("time_mode", config.timeMode);
+  prefs.putString("ntp_srv", config.ntpServer);
+  prefs.putString("tz", config.timeZone);
+  prefs.putUInt("time_manual", config.manualEpoch);
   prefs.putBool("pwd_en", config.passwordEnabled);
   prefs.putString("pwd", config.password);
   prefs.putUInt("tr_count", config.triggerCount);
@@ -726,7 +1026,18 @@ static void saveConfig() {
 
   prefs.putUInt("dev_count", config.oscDeviceCount);
   prefs.putString("dev_order", buildOrderList(config.oscDeviceOrder, config.oscDeviceCount));
+
+  bool saveDev[MAX_OSC_DEVICES];
+  for (int i = 0; i < MAX_OSC_DEVICES; i++) saveDev[i] = false;
+  for (int i = 0; i < config.oscDeviceCount; i++) {
+    int idx = config.oscDeviceOrder[i];
+    if (idx >= 0 && idx < MAX_OSC_DEVICES) saveDev[idx] = true;
+  }
   for (int i = 0; i < MAX_OSC_DEVICES; i++) {
+    if (!saveDev[i]) clearDeviceKeys(i);
+  }
+  for (int i = 0; i < MAX_OSC_DEVICES; i++) {
+    if (!saveDev[i]) continue;
     const OscDevice& d = config.oscDevices[i];
     String keyEn = String("dev") + i + "_en";
     String keyName = String("dev") + i + "_name";
@@ -744,10 +1055,21 @@ static void saveConfig() {
     prefs.putUInt(keyHbMs.c_str(), d.hbMs);
   }
 
+  bool saveTrigger[MAX_TRIGGERS];
+  for (int i = 0; i < MAX_TRIGGERS; i++) saveTrigger[i] = false;
+  for (int i = 0; i < config.triggerCount; i++) {
+    int idx = config.triggerOrder[i];
+    if (idx >= 0 && idx < MAX_TRIGGERS) saveTrigger[idx] = true;
+  }
   for (int i = 0; i < MAX_TRIGGERS; i++) {
+    if (!saveTrigger[i]) clearSensorKeys(i);
+  }
+  for (int i = 0; i < MAX_TRIGGERS; i++) {
+    if (!saveTrigger[i]) continue;
     const SensorConfig& s = config.sensors[i];
     prefs.putBool(sensorKey(i, "en").c_str(), s.enabled);
     prefs.putString(sensorKey(i, "name").c_str(), s.name);
+    prefs.putInt(sensorKey(i, "src").c_str(), s.source);
     prefs.putInt(sensorKey(i, "type").c_str(), s.type);
     prefs.putInt(sensorKey(i, "pin").c_str(), s.pin);
     prefs.putInt(sensorKey(i, "clk").c_str(), s.encClkPin);
@@ -767,6 +1089,15 @@ static void saveConfig() {
     prefs.putInt(sensorKey(i, "od").c_str(), s.outDevice);
     prefs.putString(sensorKey(i, "on").c_str(), s.onString);
     prefs.putString(sensorKey(i, "off").c_str(), s.offString);
+    prefs.putInt(sensorKey(i, "tt").c_str(), s.timeType);
+    prefs.putInt(sensorKey(i, "ty").c_str(), s.timeYear);
+    prefs.putInt(sensorKey(i, "tm").c_str(), s.timeMonth);
+    prefs.putInt(sensorKey(i, "td").c_str(), s.timeDay);
+    prefs.putInt(sensorKey(i, "th").c_str(), s.timeHour);
+    prefs.putInt(sensorKey(i, "tmin").c_str(), s.timeMinute);
+    prefs.putInt(sensorKey(i, "tsec").c_str(), s.timeSecond);
+    prefs.putInt(sensorKey(i, "twm").c_str(), s.weeklyMask);
+    prefs.putUInt(sensorKey(i, "tint").c_str(), s.intervalSeconds);
   }
 
   prefs.end();
@@ -792,6 +1123,8 @@ static void applyNetworkConfig() {
   WiFi.disconnect(true);
   delay(50);
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
   wifiApMode = false;
   if (config.useStatic) {
     WiFi.config(config.staticIp, config.gateway, config.subnet, config.dns1, config.dns2);
@@ -800,6 +1133,40 @@ static void applyNetworkConfig() {
   }
   if (config.wifiSsid.length() > 0) {
     WiFi.begin(config.wifiSsid.c_str(), config.wifiPass.c_str());
+  }
+}
+
+static void pollNtpSync() {
+  if (!ntpPending) return;
+  time_t now = time(nullptr);
+  if (now > 100000) {
+    ntpPending = false;
+    addLog("NTP time synchronized.");
+    return;
+  }
+  if (millis() - ntpLastAttemptMs > 15000) {
+    ntpLastAttemptMs = millis();
+    addLog("NTP sync still pending...");
+  }
+}
+
+static void applyTimeConfig() {
+  if (config.timeMode == TIME_NTP) {
+    setenv("TZ", config.timeZone.c_str(), 1);
+    tzset();
+    configTzTime(config.timeZone.c_str(), config.ntpServer.c_str());
+    addLog(String("Time sync via NTP: ") + config.ntpServer + " TZ " + config.timeZone);
+    ntpPending = true;
+    ntpLastAttemptMs = millis();
+  } else if (config.manualEpoch > 0) {
+    struct timeval tv;
+    tv.tv_sec = static_cast<time_t>(config.manualEpoch);
+    tv.tv_usec = 0;
+    settimeofday(&tv, nullptr);
+    setenv("TZ", config.timeZone.c_str(), 1);
+    tzset();
+    addLog("Time set manually.");
+    ntpPending = false;
   }
 }
 
@@ -813,15 +1180,23 @@ static void startMdns() {
   }
 }
 
-static void getOscTarget(uint8_t device, IPAddress& ip, uint16_t& port) {
+static bool getOscTarget(uint8_t device, IPAddress& ip, uint16_t& port) {
   if (device < MAX_OSC_DEVICES && config.oscDevices[device].enabled) {
     ip = config.oscDevices[device].ip;
     port = config.oscDevices[device].port;
     if (port == 0) port = config.clientPort;
-    return;
+    return true;
   }
-  ip = config.clientIp;
-  port = config.clientPort;
+  for (int i = 0; i < config.oscDeviceCount; i++) {
+    int idx = config.oscDeviceOrder[i];
+    if (idx < 0 || idx >= MAX_OSC_DEVICES) continue;
+    if (!config.oscDevices[idx].enabled) continue;
+    ip = config.oscDevices[idx].ip;
+    port = config.oscDevices[idx].port;
+    if (port == 0) port = config.clientPort;
+    return true;
+  }
+  return false;
 }
 
 static void sendOscIntTo(const IPAddress& ip, uint16_t port, const char* address, int32_t value) {
@@ -855,7 +1230,7 @@ static void sendOscIntTo(const IPAddress& ip, uint16_t port, const char* address
 static void sendOscInt(const char* address, int32_t value) {
   IPAddress ip;
   uint16_t port;
-  getOscTarget(0, ip, port);
+  if (!getOscTarget(0, ip, port)) return;
   sendOscIntTo(ip, port, address, value);
 }
 
@@ -895,7 +1270,7 @@ static void sendOscFloatTo(const IPAddress& ip, uint16_t port, const char* addre
 static void sendOscFloat(const char* address, float value) {
   IPAddress ip;
   uint16_t port;
-  getOscTarget(0, ip, port);
+  if (!getOscTarget(0, ip, port)) return;
   sendOscFloatTo(ip, port, address, value);
 }
 
@@ -926,7 +1301,7 @@ static void sendOscStringTo(const IPAddress& ip, uint16_t port, const char* addr
 static void sendOscString(const char* address, const char* value) {
   IPAddress ip;
   uint16_t port;
-  getOscTarget(0, ip, port);
+  if (!getOscTarget(0, ip, port)) return;
   sendOscStringTo(ip, port, address, value);
 }
 
@@ -1049,7 +1424,7 @@ static void sendTriggerOutput(const SensorConfig& sensor, const String& addr) {
   if (addr.length() == 0) return;
   IPAddress ip;
   uint16_t port;
-  getOscTarget(sensor.outDevice, ip, port);
+  if (!getOscTarget(sensor.outDevice, ip, port)) return;
   if (sensor.outMode == OUT_STRING) {
     const char* value = sensor.onString.c_str();
     if (value[0] == '\0') return;
@@ -1100,11 +1475,11 @@ static void processClickPattern(int index, const SensorConfig& sensor, bool pres
 }
 
 static void appendOscDeviceOptions(String& html, uint8_t selected) {
-  for (int i = 0; i < MAX_OSC_DEVICES; i++) {
-    const OscDevice& d = config.oscDevices[i];
+  for (int i = 0; i < config.oscDeviceCount; i++) {
+    int idx = config.oscDeviceOrder[i];
+    const OscDevice& d = config.oscDevices[idx];
     String label = d.name + " (" + ipToString(d.ip) + ":" + String(d.port) + ")";
-    if (!d.enabled) label += " [off]";
-    html += "<option value='" + String(i) + "' " + String(i == selected ? "selected" : "") + ">" + label + "</option>";
+    html += "<option value='" + String(idx) + "' " + String(idx == selected ? "selected" : "") + ">" + label + "</option>";
   }
 }
 
@@ -1120,19 +1495,46 @@ static void handleTriggers() {
   html += ".page{max-width:900px;margin:0 auto;padding:20px 16px 40px;}";
   html += ".header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;margin-bottom:8px;}";
   html += ".title{font-size:22px;font-weight:700;letter-spacing:0.5px;}";
-  html += ".actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}";
-  html += ".tag{font-size:12px;color:var(--muted);padding:4px 8px;border:1px solid #ddd;border-radius:999px;background:#fff;text-decoration:none;}";
+  html += ".actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;}";
+  html += ".nav-link{font-size:16px;color:#6b34d6;text-decoration:underline;font-weight:600;}";
+  html += ".nav-pill{font-size:14px;color:#666;padding:6px 12px;border:1px solid #ddd;border-radius:999px;background:#fff;text-decoration:none;}";
+  html += ".nav-primary{font-size:16px;color:#fff;padding:8px 14px;border-radius:999px;background:var(--accent);text-decoration:none;}";
+  html += "a.primary{background:var(--accent);color:#fff;border-color:var(--accent);padding:6px 10px;border-radius:8px;text-decoration:none;}";
+  html += "a.primary{background:var(--accent);color:#fff;border-color:var(--accent);padding:6px 10px;border-radius:8px;text-decoration:none;}";
   html += ".status{display:flex;flex-wrap:wrap;gap:10px;font-size:13px;color:var(--muted);margin:8px 0 14px;}";
   html += ".card{background:var(--card);border:1px solid #e2e2e2;border-radius:12px;padding:12px;margin:10px 0;}";
   html += "fieldset{border:1px solid #e2e2e2;border-radius:12px;padding:12px;margin:12px 0;background:#fff;}";
   html += "legend{padding:0 6px;color:var(--muted);}";
   html += "details{border:1px solid #e2e2e2;border-radius:12px;margin:12px 0;background:#fff;}";
   html += "summary{cursor:pointer;list-style:none;padding:10px 12px;display:flex;align-items:center;justify-content:space-between;}";
+  html += ".chev{display:inline-block;margin-right:8px;font-size:14px;transition:transform 0.2s ease;}";
+  html += "details[open] .chev{transform:rotate(90deg);}";
+  html += ".toggle{position:relative;width:36px;height:20px;display:inline-block;}";
+  html += ".toggle input{opacity:0;width:0;height:0;}";
+  html += ".toggle span{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#c9c9c9;border-radius:999px;transition:0.2s;}";
+  html += ".toggle span:before{content:'';position:absolute;height:16px;width:16px;left:2px;top:2px;background:#fff;border-radius:50%;transition:0.2s;}";
+  html += ".toggle input:checked + span{background:#0b6b6f;}";
+  html += ".toggle input:checked + span:before{transform:translateX(16px);}";
+  html += ".chev{display:inline-block;margin-right:8px;font-size:14px;transition:transform 0.2s ease;}";
+  html += "details[open] .chev{transform:rotate(90deg);}";
+  html += ".chev{display:inline-block;margin-right:8px;font-size:14px;transition:transform 0.2s ease;}";
+  html += "details[open] .chev{transform:rotate(90deg);}";
   html += "summary::-webkit-details-marker{display:none;}";
   html += ".trigger-title{font-weight:600;}";
+  html += ".toggle{position:relative;width:36px;height:20px;display:inline-block;}";
+  html += ".toggle input{opacity:0;width:0;height:0;}";
+  html += ".toggle span{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#c9c9c9;border-radius:999px;transition:0.2s;}";
+  html += ".toggle span:before{content:'';position:absolute;height:16px;width:16px;left:2px;top:2px;background:#fff;border-radius:50%;transition:0.2s;}";
+  html += ".toggle input:checked + span{background:#0b6b6f;}";
+  html += ".toggle input:checked + span:before{transform:translateX(16px);}";
   html += ".trigger-actions{display:flex;gap:6px;align-items:center;}";
   html += ".icon-btn{border:1px solid #b9b9b9;background:#fff;color:#222;padding:4px 8px;border-radius:6px;cursor:pointer;}";
   html += "input,select{width:100%;max-width:320px;padding:6px 8px;margin:2px 0 8px;border:1px solid #cfcfcf;border-radius:6px;background:#fff;}";
+  html += ".time-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:4px 0 8px;}";
+  html += ".time-row label{min-width:90px;color:#444;}";
+  html += ".time-row input,.time-row select{width:auto;min-width:170px;max-width:240px;}";
+  html += ".day-pills{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 4px;}";
+  html += ".day-pill{display:flex;align-items:center;gap:6px;border:1px solid #d6d6d6;border-radius:999px;padding:4px 10px;font-size:13px;background:#f9f9f9;}";
   html += "button{border:1px solid #b9b9b9;background:#fff;color:#222;padding:6px 10px;border-radius:8px;cursor:pointer;}";
   html += "button.primary{background:var(--accent);color:#fff;border-color:var(--accent);}";
   html += "button.danger{background:var(--danger);color:#fff;border-color:var(--danger);}";
@@ -1144,22 +1546,9 @@ static void handleTriggers() {
   html += "<div class='header'>";
   html += "<div class='title'>StageMod</div>";
   html += "<div class='actions'>";
-  html += "<button type='button' id='pin_help_btn'>Board Pin Help</button>";
-  html += "<a href='/logs' class='tag'>Serial Log</a>";
-  html += "<a href='/settings' class='tag'>Settings</a>";
-  html += "<span class='tag'>Olimex ESP32-PoE</span>";
-  html += "</div></div>";
-
-  html += "<div id='pin_help_modal'><div class='modal'>";
-  html += "<h3>Pin Help</h3>";
-  html += "<p><b>Analog (ADC1, safe with WiFi/AP):</b> GPIO32, GPIO33, GPIO34, GPIO35, GPIO36, GPIO39.</p>";
-  html += "<p><b>Avoid ADC2 for analog when WiFi/AP is on:</b> GPIO0, GPIO2, GPIO4, GPIO12-15, GPIO25-27.</p>";
-  html += "<p><b>Input-only pins:</b> GPIO34, GPIO35, GPIO36, GPIO39.</p>";
-  html += "<p><b>Boot-strap pins:</b> GPIO0, GPIO2, GPIO12, GPIO15 (avoid pulling these during boot).</p>";
-  html += "<p><b>USB serial:</b> GPIO1/GPIO3 used for programming.</p>";
-  html += "<p><b>Reserved:</b> GPIO34 used for factory reset button (BUT1).</p>";
-  html += "<img src='/pinout.png' alt='ESP32-POE pinout' style='width:100%;height:auto;margin-top:8px;border-radius:8px;border:1px solid #ddd;'>";
-  html += "<button type='button' id='pin_help_close'>Close</button>";
+  html += "<a href='https://github.com/OLIMEX/ESP32-POE/blob/master/DOCUMENTS/ESP32-POE-PINOUT.png' class='nav-pill'>Board Pin Help</a>";
+  html += "<a href='/logs' class='nav-pill'>Serial Log</a>";
+  html += "<a href='/settings' class='nav-primary'>Settings</a>";
   html += "</div></div>";
 
   html += "<div class='status'>";
@@ -1179,10 +1568,6 @@ static void handleTriggers() {
   }
 
   html += "<form method='POST' action='/triggers'>";
-  html += "<div class='card'>";
-  html += "<b>Triggers</b><br>";
-  html += "<button type='submit' name='action' value='add' class='primary'>Add Trigger</button>";
-  html += "</div>";
 
   for (int tIndex = 0; tIndex < config.triggerCount; tIndex++) {
     int i = config.triggerOrder[tIndex];
@@ -1191,7 +1576,13 @@ static void handleTriggers() {
 
     html += "<details " + String(tIndex == 0 ? "open" : "") + ">";
     html += "<summary>";
+    html += "<span style='display:flex;align-items:center;gap:10px;'>";
+    html += "<span class='chev'>&#9654;</span>";
+    html += "<label class='toggle' title='Enable trigger'>";
+    html += "<input name='s" + idx + "_en' type='checkbox' " + String(s.enabled ? "checked" : "") + ">";
+    html += "<span></span></label>";
     html += "<span class='trigger-title'>" + s.name + "</span>";
+    html += "</span>";
     html += "<span class='trigger-actions'>";
     html += "<button type='submit' name='action' value='up:" + idx + "' class='icon-btn'>&uarr;</button>";
     html += "<button type='submit' name='action' value='down:" + idx + "' class='icon-btn'>&darr;</button>";
@@ -1199,20 +1590,23 @@ static void handleTriggers() {
     html += "</span></summary>";
     html += "<div style='padding:0 12px 12px;'>";
     html += "<input type='hidden' name='s" + idx + "_present' value='1'>";
-    html += "Enable: <input name='s" + idx + "_en' type='checkbox' " + String(s.enabled ? "checked" : "") + "><br>";
+    html += "<!-- Enable toggle moved to header -->";
     html += "Name: <input name='s" + idx + "_name' type='text' value='" + s.name + "'><br>";
 
     html += "<div class='card'><b>Input</b><br>";
-    html += "Source: <select name='s" + idx + "_src'><option value='sensor' selected>Sensors</option></select><br>";
-    html += "Type: <select name='s" + idx + "_type' id='s" + idx + "_type'>";
-    html += "<option value='0' " + String(s.type == SENSOR_ANALOG ? "selected" : "") + ">Analog (pot/slider)</option>";
+    html += "Source: <select name='s" + idx + "_src' id='s" + idx + "_src'>";
+    html += "<option value='0' " + String(s.source == SRC_SENSORS ? "selected" : "") + ">Sensors</option>";
+    html += "<option value='1' " + String(s.source == SRC_TIME ? "selected" : "") + ">Time</option>";
+    html += "</select><br>";
+    html += "<div id='s" + idx + "_type_block'>Type: <select name='s" + idx + "_type' id='s" + idx + "_type'>";
     html += "<option value='1' " + String(s.type == SENSOR_BUTTON ? "selected" : "") + ">Button (momentary)</option>";
     html += "<option value='2' " + String(s.type == SENSOR_TOGGLE ? "selected" : "") + ">Button (toggle)</option>";
-    html += "<option value='4' " + String(s.type == SENSOR_ENCODER ? "selected" : "") + ">Encoder</option>";
     html += "<option value='5' " + String(s.type == SENSOR_BUTTON_DOUBLE ? "selected" : "") + ">Button (double click)</option>";
     html += "<option value='6' " + String(s.type == SENSOR_BUTTON_TRIPLE ? "selected" : "") + ">Button (triple click)</option>";
     html += "<option value='7' " + String(s.type == SENSOR_BUTTON_LONG ? "selected" : "") + ">Button (long press)</option>";
-    html += "</select><br>";
+    html += "<option value='0' " + String(s.type == SENSOR_ANALOG ? "selected" : "") + ">Analog (pot/slider)</option>";
+    html += "<option value='4' " + String(s.type == SENSOR_ENCODER ? "selected" : "") + ">Encoder</option>";
+    html += "</select><br></div>";
     html += "<div id='s" + idx + "_pin_block'>";
     html += "GPIO Pin: <input name='s" + idx + "_pin' type='number' value='" + String(s.pin) + "'><br>";
     html += "<small>Analog pins allowed: 32,35,36. Digital pins allowed: 5,13,16,17,18,19,21,22,23,25,26,27,32,33,35,36,39</small><br>";
@@ -1232,6 +1626,44 @@ static void handleTriggers() {
     html += "DT pin: <input name='s" + idx + "_dt' type='number' value='" + String(s.encDtPin) + "'><br>";
     html += "SW pin: <input name='s" + idx + "_sw' type='number' value='" + String(s.encSwPin) + "'><br>";
     html += "<small>Encoder sends -1/+1 on each step.</small><br>";
+    html += "</div>";
+
+    html += "<div id='s" + idx + "_time_block'>";
+    html += "<div class='time-row'><label>Time type</label><select name='s" + idx + "_tt' id='s" + idx + "_tt'>";
+    html += "<option value='0' " + String(s.timeType == TIME_ONCE ? "selected" : "") + ">Date and Time</option>";
+    html += "<option value='1' " + String(s.timeType == TIME_DAILY ? "selected" : "") + ">Daily</option>";
+    html += "<option value='2' " + String(s.timeType == TIME_WEEKLY ? "selected" : "") + ">Weekly</option>";
+    html += "<option value='3' " + String(s.timeType == TIME_INTERVAL ? "selected" : "") + ">Every X</option>";
+    html += "</select></div>";
+    html += "<div id='s" + idx + "_time_once'>";
+    html += "<div class='time-row'><label>Date</label><input name='s" + idx + "_date' type='date' value='" + String(s.timeYear) + "-" + (s.timeMonth < 10 ? "0" : "") + String(s.timeMonth) + "-" + (s.timeDay < 10 ? "0" : "") + String(s.timeDay) + "'></div>";
+    html += "<div class='time-row'><label>Time</label><input name='s" + idx + "_time' type='time' step='1' value='" + (s.timeHour < 10 ? "0" : "") + String(s.timeHour) + ":" + (s.timeMinute < 10 ? "0" : "") + String(s.timeMinute) + ":" + (s.timeSecond < 10 ? "0" : "") + String(s.timeSecond) + "'></div>";
+    html += "</div>";
+    html += "<div id='s" + idx + "_time_daily'>";
+    html += "<div class='time-row'><label>Time</label><input name='s" + idx + "_time_daily' type='time' step='1' value='" + (s.timeHour < 10 ? "0" : "") + String(s.timeHour) + ":" + (s.timeMinute < 10 ? "0" : "") + String(s.timeMinute) + ":" + (s.timeSecond < 10 ? "0" : "") + String(s.timeSecond) + "'></div>";
+    html += "</div>";
+    html += "<div id='s" + idx + "_time_weekly'>";
+    html += "<div class='time-row'><label>Days</label></div>";
+    html += "<div class='day-pills'>";
+    const char* days[7] = {"Su","Mo","Tu","We","Th","Fr","Sa"};
+    for (int d = 0; d < 7; d++) {
+      bool checked = (s.weeklyMask & (1 << d)) != 0;
+      html += "<label class='day-pill'><input type='checkbox' name='s" + idx + "_w" + String(d) + "' " + String(checked ? "checked" : "") + "> " + days[d] + "</label>";
+    }
+    html += "</div>";
+    html += "<div class='time-row'><label>Time</label><input name='s" + idx + "_time_weekly' type='time' step='1' value='" + (s.timeHour < 10 ? "0" : "") + String(s.timeHour) + ":" + (s.timeMinute < 10 ? "0" : "") + String(s.timeMinute) + ":" + (s.timeSecond < 10 ? "0" : "") + String(s.timeSecond) + "'></div>";
+    html += "</div>";
+    uint32_t intervalSec = s.intervalSeconds;
+    String intervalUnit = (intervalSec % 3600 == 0) ? "hours" : "minutes";
+    uint32_t intervalValue = (intervalUnit == "hours") ? (intervalSec / 3600) : (intervalSec / 60);
+    if (intervalValue == 0) intervalValue = 1;
+    html += "<div id='s" + idx + "_time_interval'>";
+    html += "<div class='time-row'><label>Every</label><input name='s" + idx + "_interval_val' type='number' min='1' value='" + String(intervalValue) + "' style='max-width:120px;'> ";
+    html += "<select name='s" + idx + "_interval_unit'>";
+    html += "<option value='minutes' " + String(intervalUnit == "minutes" ? "selected" : "") + ">minutes</option>";
+    html += "<option value='hours' " + String(intervalUnit == "hours" ? "selected" : "") + ">hours</option>";
+    html += "</select></div>";
+    html += "</div>";
     html += "</div>";
     html += "</div>";
 
@@ -1274,11 +1706,17 @@ static void handleTriggers() {
     html += "</div></details>";
   }
 
-  html += "<button type='submit' name='action' value='save' class='primary'>Save Triggers</button>";
+  html += "<button type='submit' name='action' value='add' style='padding:8px 12px;font-size:14px;border:1px solid #b9b9b9;background:#fff;color:#222;border-radius:8px;cursor:pointer;'>Add Trigger</button>";
+  html += "<div style='height:14px;'></div>";
+  html += "<button type='submit' name='action' value='save' class='primary'>Save</button>";
   html += "<script>";
   html += "function updateTrigger(i){";
+  html += "const srcSel=document.getElementById('s'+i+'_src');";
   html += "const tSel=document.getElementById('s'+i+'_type');";
-  html += "const t=tSel.value;";
+  html += "const typeBlock=document.getElementById('s'+i+'_type_block');";
+  html += "const ttSel=document.getElementById('s'+i+'_tt');";
+  html += "const src=srcSel?srcSel.value:'0';";
+  html += "const t=tSel? tSel.value : '0';";
   html += "const om=document.getElementById('s'+i+'_omode');";
   html += "const a=document.getElementById('s'+i+'_analog');";
   html += "const d=document.getElementById('s'+i+'_digital');";
@@ -1295,10 +1733,25 @@ static void handleTriggers() {
   html += "const btnAddr=document.getElementById('s'+i+'_btn_addr');";
   html += "const ot=document.getElementById('s'+i+'_ot');";
   html += "const oscOut=document.getElementById('s'+i+'_osc_out');";
+  html += "const timeBlock=document.getElementById('s'+i+'_time_block');";
+  html += "const timeOnce=document.getElementById('s'+i+'_time_once');";
+  html += "const timeDaily=document.getElementById('s'+i+'_time_daily');";
+  html += "const timeWeekly=document.getElementById('s'+i+'_time_weekly');";
+  html += "const timeInterval=document.getElementById('s'+i+'_time_interval');";
+  html += "const isTime=(src==='1');";
   html += "const isEnc=(t==='4');";
-  html += "a.style.display=(t==='0')?'block':'none';";
-  html += "d.style.display=(t!=='0'&&!isEnc)?'block':'none';";
-  html += "if(t==='0'){";
+  html += "if(typeBlock){typeBlock.style.display=isTime?'none':'block';}";
+  html += "if(timeBlock){timeBlock.style.display=isTime?'block':'none';}";
+  html += "if(ttSel){";
+  html += "const tt=ttSel.value;";
+  html += "if(timeOnce) timeOnce.style.display=(tt==='0')?'block':'none';";
+  html += "if(timeDaily) timeDaily.style.display=(tt==='1')?'block':'none';";
+  html += "if(timeWeekly) timeWeekly.style.display=(tt==='2')?'block':'none';";
+  html += "if(timeInterval) timeInterval.style.display=(tt==='3')?'block':'none';";
+  html += "}";
+  html += "a.style.display=(!isTime && t==='0')?'block':'none';";
+  html += "d.style.display=(!isTime && t!=='0'&&!isEnc)?'block':'none';";
+  html += "if(t==='0'&&!isTime){";
   html += "opt.disabled=true;";
   html += "if(om.value==='2'){om.value='1';}";
   html += "}else{";
@@ -1307,25 +1760,24 @@ static void handleTriggers() {
   html += "s.style.display=(om.value==='2')?'block':'none';";
   html += "r.style.display=(om.value==='2')?'none':'block';";
   html += "addr.style.display=isEnc?'none':'block';";
-  html += "pin.style.display=isEnc?'none':'block';";
+  html += "pin.style.display=(isEnc||isTime)?'none':'block';";
   html += "enc.style.display=isEnc?'block':'none';";
   html += "btnAddrBlock.style.display=isEnc?'block':'none';";
   html += "if(addrInput){addrInput.disabled=isEnc;}";
   html += "if(encAddr){encAddr.disabled=!isEnc;}";
   html += "if(btnAddr){btnAddr.disabled=!isEnc;}";
-  html += "cd.style.display=(t==='1')?'block':'none';";
+  html += "cd.style.display=(!isTime && t==='1')?'block':'none';";
   html += "if(ot){oscOut.style.display=(ot.value==='0')?'block':'none';}";
   html += "}";
-  html += "const helpBtn=document.getElementById('pin_help_btn');";
-  html += "const helpModal=document.getElementById('pin_help_modal');";
-  html += "const helpClose=document.getElementById('pin_help_close');";
-  html += "helpBtn.addEventListener('click',()=>{helpModal.style.display='block';});";
-  html += "helpClose.addEventListener('click',()=>{helpModal.style.display='none';});";
-  html += "helpModal.addEventListener('click',(e)=>{if(e.target===helpModal){helpModal.style.display='none';}});";
+  html += "";
+  html += "";
   html += "for(let i=0;i<" + String(MAX_TRIGGERS) + ";i++){";
   html += "const tSel=document.getElementById('s'+i+'_type');";
-  html += "if(!tSel){continue;}";
-  html += "tSel.addEventListener('change',()=>updateTrigger(i));";
+  html += "const srcSel=document.getElementById('s'+i+'_src');";
+  html += "const ttSel=document.getElementById('s'+i+'_tt');";
+  html += "if(tSel){tSel.addEventListener('change',()=>updateTrigger(i));}";
+  html += "if(srcSel){srcSel.addEventListener('change',()=>updateTrigger(i));}";
+  html += "if(ttSel){ttSel.addEventListener('change',()=>updateTrigger(i));}";
   html += "const om=document.getElementById('s'+i+'_omode');";
   html += "if(om){om.addEventListener('change',()=>updateTrigger(i));}";
   html += "const ot=document.getElementById('s'+i+'_ot');";
@@ -1351,8 +1803,62 @@ static void handleSaveTriggers() {
       s.name.trim();
       if (s.name.length() == 0) s.name = String("Trigger ") + String(i + 1);
     }
+    if (server.hasArg("s" + idx + "_src")) {
+      int src = server.arg("s" + idx + "_src").toInt();
+      s.source = (src == 1) ? SRC_TIME : SRC_SENSORS;
+    }
     if (server.hasArg("s" + idx + "_type")) {
       s.type = sanitizeSensorType(server.arg("s" + idx + "_type").toInt());
+    }
+    if (server.hasArg("s" + idx + "_tt")) {
+      int tt = server.arg("s" + idx + "_tt").toInt();
+      if (tt >= 0 && tt <= TIME_INTERVAL) s.timeType = static_cast<TimeTriggerType>(tt);
+    }
+    if (server.hasArg("s" + idx + "_date") && server.hasArg("s" + idx + "_time")) {
+      uint16_t y; uint8_t mo; uint8_t da;
+      uint8_t h; uint8_t mi; uint8_t se = 0;
+      if (parseDateYMD(server.arg("s" + idx + "_date"), y, mo, da) &&
+          parseTimeHMS(server.arg("s" + idx + "_time"), h, mi, se)) {
+        s.timeYear = y;
+        s.timeMonth = mo;
+        s.timeDay = da;
+        s.timeHour = h;
+        s.timeMinute = mi;
+        s.timeSecond = se;
+      }
+    }
+    if (server.hasArg("s" + idx + "_time_daily")) {
+      uint8_t h; uint8_t mi; uint8_t se = 0;
+      if (parseTimeHMS(server.arg("s" + idx + "_time_daily"), h, mi, se)) {
+        s.timeHour = h;
+        s.timeMinute = mi;
+        s.timeSecond = se;
+      }
+    }
+    if (server.hasArg("s" + idx + "_time_weekly")) {
+      uint8_t h; uint8_t mi; uint8_t se = 0;
+      if (parseTimeHMS(server.arg("s" + idx + "_time_weekly"), h, mi, se)) {
+        s.timeHour = h;
+        s.timeMinute = mi;
+        s.timeSecond = se;
+      }
+    }
+    uint8_t mask = 0;
+    for (int d = 0; d < 7; d++) {
+      if (server.hasArg("s" + idx + "_w" + String(d))) {
+        mask |= (1 << d);
+      }
+    }
+    if (mask != 0) s.weeklyMask = mask;
+    if (server.hasArg("s" + idx + "_interval_val")) {
+      uint32_t val = static_cast<uint32_t>(server.arg("s" + idx + "_interval_val").toInt());
+      if (val == 0) val = 1;
+      String unit = server.arg("s" + idx + "_interval_unit");
+      if (unit == "hours") {
+        s.intervalSeconds = val * 3600;
+      } else {
+        s.intervalSeconds = val * 60;
+      }
     }
     if (server.hasArg("s" + idx + "_addr")) {
       s.oscAddress = normalizeOscAddress(server.arg("s" + idx + "_addr"));
@@ -1402,21 +1908,23 @@ static void handleSaveTriggers() {
       if (s.offString.length() == 0) s.offString = DEFAULT_OFF_STRING;
     }
 
-    if (server.hasArg("s" + idx + "_pin")) {
-      int pin = server.arg("s" + idx + "_pin").toInt();
-      if (pin >= 0 && pin <= 39 && !isReservedPin(pin)) {
-        if (s.type != SENSOR_ANALOG || isAllowedAnalogPin(pin)) {
-          s.pin = pin;
+    if (s.source != SRC_TIME) {
+      if (server.hasArg("s" + idx + "_pin")) {
+        int pin = server.arg("s" + idx + "_pin").toInt();
+        if (pin >= 0 && pin <= 39 && !isReservedPin(pin)) {
+          if (s.type != SENSOR_ANALOG || isAllowedAnalogPin(pin)) {
+            s.pin = pin;
+          }
         }
       }
-    }
-    if (s.type == SENSOR_ENCODER) {
-      int clk = server.arg("s" + idx + "_clk").toInt();
-      int dt = server.arg("s" + idx + "_dt").toInt();
-      int sw = server.arg("s" + idx + "_sw").toInt();
-      if (clk >= 0 && clk <= 39 && !isReservedPin(clk)) s.encClkPin = clk;
-      if (dt >= 0 && dt <= 39 && !isReservedPin(dt)) s.encDtPin = dt;
-      if (sw >= 0 && sw <= 39 && !isReservedPin(sw)) s.encSwPin = sw;
+      if (s.type == SENSOR_ENCODER) {
+        int clk = server.arg("s" + idx + "_clk").toInt();
+        int dt = server.arg("s" + idx + "_dt").toInt();
+        int sw = server.arg("s" + idx + "_sw").toInt();
+        if (clk >= 0 && clk <= 39 && !isReservedPin(clk)) s.encClkPin = clk;
+        if (dt >= 0 && dt <= 39 && !isReservedPin(dt)) s.encDtPin = dt;
+        if (sw >= 0 && sw <= 39 && !isReservedPin(sw)) s.encSwPin = sw;
+      }
     }
 
     if (s.type == SENSOR_ANALOG && s.outMode == OUT_STRING) {
@@ -1491,15 +1999,26 @@ static void handleSettings() {
   html += ".page{max-width:900px;margin:0 auto;padding:20px 16px 40px;}";
   html += ".header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;margin-bottom:8px;}";
   html += ".title{font-size:22px;font-weight:700;letter-spacing:0.5px;}";
-  html += ".actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}";
-  html += ".tag{font-size:12px;color:var(--muted);padding:4px 8px;border:1px solid #ddd;border-radius:999px;background:#fff;text-decoration:none;}";
+  html += ".actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;}";
+  html += ".nav-link{font-size:16px;color:#6b34d6;text-decoration:underline;font-weight:600;}";
+  html += ".nav-pill{font-size:14px;color:#666;padding:6px 12px;border:1px solid #ddd;border-radius:999px;background:#fff;text-decoration:none;}";
+  html += ".nav-primary{font-size:16px;color:#fff;padding:8px 14px;border-radius:999px;background:var(--accent);text-decoration:none;}";
   html += ".card{background:var(--card);border:1px solid #e2e2e2;border-radius:12px;padding:12px;margin:10px 0;}";
   html += "fieldset{border:1px solid #e2e2e2;border-radius:12px;padding:12px;margin:10px 0;background:#fff;}";
   html += "legend{padding:0 6px;color:var(--muted);}";
   html += "details{border:1px solid #e2e2e2;border-radius:12px;margin:10px 0;background:#fff;}";
   html += "summary{cursor:pointer;list-style:none;padding:10px 12px;display:flex;align-items:center;justify-content:space-between;}";
   html += "summary::-webkit-details-marker{display:none;}";
+  html += ".chev{display:inline-block;margin-right:8px;font-size:14px;transition:transform 0.2s ease;}";
+  html += "details[open] .chev{transform:rotate(90deg);}";
   html += ".trigger-title{font-weight:600;}";
+  html += ".toggle{position:relative;width:36px;height:20px;display:inline-block;}";
+  html += ".toggle input{opacity:0;width:0;height:0;}";
+  html += ".toggle span{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#c9c9c9;border-radius:999px;transition:0.2s;}";
+  html += ".toggle span:before{content:'';position:absolute;height:16px;width:16px;left:2px;top:2px;background:#fff;border-radius:50%;transition:0.2s;}";
+  html += ".toggle input:checked + span{background:#0b6b6f;}";
+  html += ".toggle input:checked + span:before{transform:translateX(16px);}";
+  html += ".toggle input:disabled + span{background:#b9b9b9;cursor:default;}";
   html += ".trigger-actions{display:flex;gap:6px;align-items:center;}";
   html += ".icon-btn{border:1px solid #b9b9b9;background:#fff;color:#222;padding:4px 8px;border-radius:6px;cursor:pointer;}";
   html += "input,select{width:100%;max-width:320px;padding:6px 8px;margin:2px 0 8px;border:1px solid #cfcfcf;border-radius:6px;background:#fff;}";
@@ -1512,8 +2031,9 @@ static void handleSettings() {
   html += "<div class='header'>";
   html += "<div class='title'>StageMod Settings</div>";
   html += "<div class='actions'>";
-  html += "<a href='/' class='tag'>Triggers</a>";
-  html += "<a href='/logs' class='tag'>Serial Log</a>";
+  html += "<a href='https://github.com/OLIMEX/ESP32-POE/blob/master/DOCUMENTS/ESP32-POE-PINOUT.png' class='nav-pill'>Board Pin Help</a>";
+  html += "<a href='/logs' class='nav-pill'>Serial Log</a>";
+  html += "<a href='/' class='nav-primary'>Triggers</a>";
   html += "</div></div>";
 
   html += "<form method='POST' action='/settings'>";
@@ -1524,7 +2044,10 @@ static void handleSettings() {
   html += "<option value='1' " + String(config.netMode == NET_WIFI ? "selected" : "") + ">WiFi</option>";
   html += "</select><br>";
   html += "<div id='wifi_fields'>";
-  html += "WiFi SSID: <input name='wifi_ssid' type='text' value='" + config.wifiSsid + "'><br>";
+  html += "WiFi SSID: ";
+  html += "<select id='wifi_ssid_select' name='wifi_ssid_select'><option value=''>Scan to list networks...</option></select> ";
+  html += "<button type='button' id='scan_wifi'>Scan WiFi</button><br>";
+  html += "<input id='wifi_ssid' name='wifi_ssid' type='text' value='" + config.wifiSsid + "' placeholder='Or type SSID manually'><br>";
   html += "WiFi pass: <input name='wifi_pass' type='password' value=''><br>";
   html += "</div>";
   html += "<hr>";
@@ -1541,15 +2064,20 @@ static void handleSettings() {
 
   html += "<div class='card'><b>OSC</b><br>";
   html += "<small>Device 1 is the default target.</small><br>";
-  html += "<b>OSC Client Devices</b><br>";
-  html += "<button type='submit' name='action' value='dev_add' class='primary'>Add OSC Device</button><br><br>";
+  html += "<div style='margin-top:10px;'><b>OSC Client Devices</b><br>";
 
   for (int dIndex = 0; dIndex < config.oscDeviceCount; dIndex++) {
     int i = config.oscDeviceOrder[dIndex];
     OscDevice& d = config.oscDevices[i];
     html += "<details " + String(dIndex == 0 ? "open" : "") + ">";
     html += "<summary>";
+    html += "<span style='display:flex;align-items:center;gap:10px;'>";
+    html += "<span class='chev'>&#9654;</span>";
+    html += "<label class='toggle' title='Enable device'>";
+    html += "<input name='dev" + String(i) + "_en' type='checkbox' " + String(d.enabled ? "checked" : "") + ">";
+    html += "<span></span></label>";
     html += "<span class='trigger-title'>" + d.name + "</span>";
+    html += "</span>";
     html += "<span class='trigger-actions'>";
     html += "<button type='submit' name='action' value='dev_up:" + String(i) + "' class='icon-btn'>&uarr;</button>";
     html += "<button type='submit' name='action' value='dev_down:" + String(i) + "' class='icon-btn'>&darr;</button>";
@@ -1559,7 +2087,6 @@ static void handleSettings() {
     html += "</span></summary>";
     html += "<div style='padding:0 12px 12px;'>";
     html += "<input type='hidden' name='d" + String(i) + "_present' value='1'>";
-    html += "Enable: <input name='dev" + String(i) + "_en' type='checkbox' " + String(d.enabled ? "checked" : "") + "><br>";
     html += "Name: <input name='dev" + String(i) + "_name' type='text' value='" + d.name + "'><br>";
     html += "IP: <input name='dev" + String(i) + "_ip' type='text' value='" + ipToString(d.ip) + "'><br>";
     html += "Port: <input name='dev" + String(i) + "_port' type='number' value='" + String(d.port) + "'><br>";
@@ -1569,6 +2096,8 @@ static void handleSettings() {
     html += "Interval ms: <input name='dev" + String(i) + "_hb_ms' type='number' value='" + String(d.hbMs) + "'><br>";
     html += "</div></details>";
   }
+  html += "<button type='submit' name='action' value='dev_add'>Add OSC Device</button><br><br>";
+  html += "</div>";
 
   html += "<div style='margin-top:10px;'><b>Test OSC</b><br>";
   html += "Device: <select id='test_dev' name='test_dev'>";
@@ -1591,6 +2120,32 @@ static void handleSettings() {
   html += "Long press ms: <input name='long_ms' type='number' value='" + String(config.longPressMs) + "'><br>";
   html += "</div>";
 
+  html += "<div class='card'><b>Time</b><br>";
+  html += "<div>Current time: " + formatTimeLocal() + "</div>";
+  html += "Mode: <select name='time_mode' id='time_mode'>";
+  html += "<option value='0' " + String(config.timeMode == TIME_NTP ? "selected" : "") + ">NTP</option>";
+  html += "<option value='1' " + String(config.timeMode == TIME_MANUAL ? "selected" : "") + ">Manual</option>";
+  html += "</select><br>";
+  html += "<div id='ntp_fields'>";
+  html += "NTP server: <input name='ntp_srv' type='text' value='" + config.ntpServer + "'><br>";
+  html += "</div>";
+  html += "Time zone: <select name='tz'>";
+  html += "<option value='PST8PDT,M3.2.0/2,M11.1.0/2' " + String(config.timeZone == "PST8PDT,M3.2.0/2,M11.1.0/2" ? "selected" : "") + ">Pacific (PST/PDT)</option>";
+  html += "<option value='MST7MDT,M3.2.0/2,M11.1.0/2' " + String(config.timeZone == "MST7MDT,M3.2.0/2,M11.1.0/2" ? "selected" : "") + ">Mountain (MST/MDT)</option>";
+  html += "<option value='CST6CDT,M3.2.0/2,M11.1.0/2' " + String(config.timeZone == "CST6CDT,M3.2.0/2,M11.1.0/2" ? "selected" : "") + ">Central (CST/CDT)</option>";
+  html += "<option value='EST5EDT,M3.2.0/2,M11.1.0/2' " + String(config.timeZone == "EST5EDT,M3.2.0/2,M11.1.0/2" ? "selected" : "") + ">Eastern (EST/EDT)</option>";
+  html += "<option value='AKST9AKDT,M3.2.0/2,M11.1.0/2' " + String(config.timeZone == "AKST9AKDT,M3.2.0/2,M11.1.0/2" ? "selected" : "") + ">Alaska (AKST/AKDT)</option>";
+  html += "<option value='HST10' " + String(config.timeZone == "HST10" ? "selected" : "") + ">Hawaii (HST)</option>";
+  html += "<option value='UTC0' " + String(config.timeZone == "UTC0" ? "selected" : "") + ">UTC</option>";
+  html += "<option value='GMT0' " + String(config.timeZone == "GMT0" ? "selected" : "") + ">GMT</option>";
+  html += "</select><br>";
+  html += "<div id='manual_fields'>";
+  html += "Date: <input name='manual_date' type='date' value='" + formatDateLocal() + "'><br>";
+  html += "Time: <input name='manual_time' type='time' step='1' value='" + formatTimeLocalInput() + "'><br>";
+  html += "<button type='submit' name='action' value='time_set'>Set Time</button><br>";
+  html += "</div>";
+  html += "</div>";
+
   html += "<div class='card'><b>Security</b><br>";
   html += "Username: <input name='username' type='text' value='" + config.username + "'><br>";
   html += "Enable password: <input name='pwd_enabled' type='checkbox' " + String(config.passwordEnabled ? "checked" : "") + "><br>";
@@ -1599,6 +2154,7 @@ static void handleSettings() {
   html += "</div>";
 
   html += "<div class='card'><b>Updates</b><br>";
+  html += "<div>Firmware version: <b>" + String(FIRMWARE_VERSION) + "</b></div>";
   html += "<a href='/update'>Open firmware updater</a><br><br>";
   html += "<button type='button' id='reboot_btn'>Reboot Device</button> ";
   html += "<button type='button' id='factory_reset_btn' class='danger'>Factory Reset</button>";
@@ -1612,11 +2168,33 @@ static void handleSettings() {
   html += "const sf=document.getElementById('static_fields');";
   html += "const nm=document.getElementById('net_mode');";
   html += "const wf=document.getElementById('wifi_fields');";
+  html += "const tm=document.getElementById('time_mode');";
+  html += "const ntp=document.getElementById('ntp_fields');";
+  html += "const man=document.getElementById('manual_fields');";
   html += "function toggleDhcp(){sf.style.display=dh.checked?'none':'block';}";
   html += "function toggleNet(){wf.style.display=(nm.value==='1')?'block':'none';}";
+  html += "function toggleTime(){if(!tm){return;}ntp.style.display=(tm.value==='0')?'block':'none';man.style.display=(tm.value==='1')?'block':'none';}";
   html += "dh.addEventListener('change',toggleDhcp);";
   html += "nm.addEventListener('change',toggleNet);";
-  html += "toggleDhcp();toggleNet();";
+  html += "if(tm){tm.addEventListener('change',toggleTime);}";
+  html += "toggleDhcp();toggleNet();toggleTime();";
+  html += "const scanBtn=document.getElementById('scan_wifi');";
+  html += "const wifiSelect=document.getElementById('wifi_ssid_select');";
+  html += "const wifiInput=document.getElementById('wifi_ssid');";
+  html += "if(wifiSelect&&wifiInput){wifiSelect.addEventListener('change',()=>{";
+  html += "const v=wifiSelect.value; if(v==='__custom__'){wifiInput.focus();return;} wifiInput.value=v;});}";
+  html += "if(scanBtn&&wifiSelect&&wifiInput){";
+  html += "scanBtn.addEventListener('click',()=>{";
+  html += "wifiSelect.innerHTML='';";
+  html += "const opt=document.createElement('option');opt.textContent='Scanning...';opt.value='';wifiSelect.appendChild(opt);";
+  html += "fetch('/scan_wifi').then(r=>r.json()).then(list=>{";
+  html += "wifiSelect.innerHTML='';";
+  html += "if(!list.length){const o=document.createElement('option');o.textContent='No networks found';o.value='';wifiSelect.appendChild(o);return;}";
+  html += "list.forEach(item=>{const o=document.createElement('option');o.value=item.ssid;o.textContent=item.ssid+' ('+item.rssi+'dBm)';wifiSelect.appendChild(o);});";
+  html += "const o=document.createElement('option');o.value='__custom__';o.textContent='Custom...';wifiSelect.appendChild(o);";
+  html += "const current=wifiInput.value; if(current){for(const opt of wifiSelect.options){if(opt.value===current){wifiSelect.value=current;break;}}}";
+  html += "}).catch(()=>{wifiSelect.innerHTML='';const o=document.createElement('option');o.textContent='Scan failed';o.value='';wifiSelect.appendChild(o);});";
+  html += "});}";
   html += "const testBtn=document.getElementById('test_send_btn');";
   html += "const testAddr=document.getElementById('test_addr');";
   html += "const testType=document.getElementById('test_type');";
@@ -1663,7 +2241,6 @@ static void handleSaveSettings() {
   config.netMode = NET_WIFI;
 #endif
 
-#if !USE_ETHERNET
   if (server.hasArg("wifi_ssid")) {
     config.wifiSsid = server.arg("wifi_ssid");
   }
@@ -1671,7 +2248,6 @@ static void handleSaveSettings() {
     String pass = server.arg("wifi_pass");
     if (pass.length() > 0) config.wifiPass = pass;
   }
-#endif
 
   config.useStatic = !server.hasArg("dhcp_enabled");
 
@@ -1713,7 +2289,7 @@ static void handleSaveSettings() {
   for (int i = 0; i < MAX_OSC_DEVICES; i++) {
     if (!server.hasArg("d" + String(i) + "_present")) continue;
     OscDevice d = config.oscDevices[i];
-    d.enabled = server.hasArg("dev" + String(i) + "_en") || (i == 0);
+    d.enabled = server.hasArg("dev" + String(i) + "_en");
     if (server.hasArg("dev" + String(i) + "_name")) {
       d.name = server.arg("dev" + String(i) + "_name");
     }
@@ -1808,6 +2384,30 @@ static void handleSaveSettings() {
     uint32_t ms = static_cast<uint32_t>(server.arg("long_ms").toInt());
     if (ms > 0) config.longPressMs = ms;
   }
+  if (server.hasArg("time_mode")) {
+    uint8_t mode = static_cast<uint8_t>(server.arg("time_mode").toInt());
+    if (mode <= TIME_MANUAL) config.timeMode = mode;
+  }
+  if (server.hasArg("ntp_srv")) {
+    String srv = server.arg("ntp_srv");
+    srv.trim();
+    if (srv.length() == 0) srv = DEFAULT_NTP_SERVER;
+    config.ntpServer = srv;
+  }
+  if (server.hasArg("tz")) {
+    String tz = server.arg("tz");
+    tz.trim();
+    if (tz.length() == 0) tz = DEFAULT_TIMEZONE;
+    config.timeZone = tz;
+  }
+  if (server.hasArg("manual_date") && server.hasArg("manual_time")) {
+    uint32_t epoch = 0;
+    setenv("TZ", config.timeZone.c_str(), 1);
+    tzset();
+    if (parseDateTimeLocal(server.arg("manual_date"), server.arg("manual_time"), epoch)) {
+      config.manualEpoch = epoch;
+    }
+  }
 
   if (!wantPassword) {
     config.passwordEnabled = false;
@@ -1822,7 +2422,10 @@ static void handleSaveSettings() {
   }
 
   saveConfig();
+  addLog(String("WiFi saved SSID=") + (config.wifiSsid.length() ? config.wifiSsid : "<blank>") +
+         " DHCP=" + String(config.useStatic ? "off" : "on"));
   addLog("Settings saved.");
+  applyTimeConfig();
   pendingNetApply = true;
   pendingApplyAt = millis();
   pendingMdnsRestart = (config.hostname != oldHostname);
@@ -1852,7 +2455,10 @@ static void handleSendTestOsc() {
   }
   IPAddress ip;
   uint16_t port;
-  getOscTarget(dev, ip, port);
+  if (!getOscTarget(dev, ip, port)) {
+    server.send(400, "text/plain", "No OSC device enabled.");
+    return;
+  }
   if (type == "string") {
     sendOscStringTo(ip, port, addr.c_str(), value.c_str());
   } else if (type == "float") {
@@ -1866,6 +2472,7 @@ static void handleSendTestOsc() {
 }
 
 static void doFactoryReset(bool respond) {
+  addLog("Factory reset requested. Clearing settings.");
   prefs.begin("osc", false);
   prefs.clear();
   prefs.end();
@@ -1887,6 +2494,23 @@ static void handleReboot() {
   addLog("Reboot requested.");
   delay(200);
   ESP.restart();
+}
+
+static void handleScanNetworks() {
+  if (!ensureAuthenticated()) return;
+  int n = WiFi.scanNetworks(false, true);
+  String json = "[";
+  bool first = true;
+  for (int i = 0; i < n; i++) {
+    String ssid = WiFi.SSID(i);
+    if (ssid.length() == 0) continue;
+    if (!first) json += ",";
+    first = false;
+    json += "{\"ssid\":\"" + jsonEscape(ssid) + "\",\"rssi\":" + String(WiFi.RSSI(i)) + ",\"enc\":" + String(WiFi.encryptionType(i)) + "}";
+  }
+  json += "]";
+  WiFi.scanDelete();
+  server.send(200, "application/json", json);
 }
 
 static void handleLogsPage() {
@@ -1941,7 +2565,21 @@ static void handleUpdateFinished() {
   if (!ensureAuthenticated()) return;
   bool ok = !Update.hasError();
   server.sendHeader("Connection", "close");
-  server.send(200, "text/plain", ok ? "Update successful. Rebooting..." : "Update failed.");
+  if (ok) {
+    String html;
+    html.reserve(600);
+    html += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>";
+    html += "<title>Update Successful</title>";
+    html += "<style>body{font-family:'Avenir Next','Trebuchet MS','Segoe UI',sans-serif;background:#111;color:#f2f2f2;padding:20px;}</style>";
+    html += "</head><body>";
+    html += "Update successful. Rebooting...<br>Returning to Settings...";
+    html += "<script>setTimeout(()=>{window.location='/settings';},8000);</script>";
+    html += "</body></html>";
+    server.send(200, "text/html", html);
+  } else {
+    String msg = String("Update failed. ") + Update.errorString();
+    server.send(200, "text/plain", msg);
+  }
   addLog(ok ? "Firmware update OK. Rebooting." : "Firmware update failed.");
   delay(200);
   if (ok) {
@@ -1952,42 +2590,46 @@ static void handleUpdateFinished() {
 static void handleUpdateUpload() {
   HTTPUpload& upload = server.upload();
   if (upload.status == UPLOAD_FILE_START) {
-    Update.begin(UPDATE_SIZE_UNKNOWN);
-    addLog("Firmware update upload started.");
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+      addLog(String("Firmware update begin failed: ") + Update.errorString());
+    } else {
+      addLog("Firmware update upload started.");
+    }
   } else if (upload.status == UPLOAD_FILE_WRITE) {
     Update.write(upload.buf, upload.currentSize);
   } else if (upload.status == UPLOAD_FILE_END) {
-    Update.end(true);
+    if (!Update.end(true)) {
+      addLog(String("Firmware update end failed: ") + Update.errorString());
+    }
   }
 }
 
 void setup() {
   Serial.begin(115200);
   delay(300);
+  Serial.print("StageMod firmware v");
+  Serial.println(FIRMWARE_VERSION);
   loadConfig();
   resetRuntimeState();
   pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+  resetButtonArmed = false;
 
   Serial.println("Starting network...");
 #if USE_ETHERNET
   ETH.begin();
 #endif
   applyNetworkConfig();
-  if (waitForNetwork(15000)) {
+  if (waitForNetwork(30000)) {
     Serial.print("Network OK. ESP32 IP: ");
     Serial.println(getLocalIp());
     addLog(String("Network OK. IP ") + getLocalIp().toString());
     udp.begin(LOCAL_PORT);
     startMdns();
+    applyTimeConfig();
   } else {
     Serial.println("Network failed to connect.");
     addLog("Network failed. Starting AP.");
     startWifiAp();
-  }
-
-  littleFsOk = LittleFS.begin();
-  if (!littleFsOk) {
-    Serial.println("LittleFS mount failed.");
   }
 
   server.on("/", HTTP_GET, handleTriggers);
@@ -1995,45 +2637,31 @@ void setup() {
   server.on("/settings", HTTP_GET, handleSettings);
   server.on("/settings", HTTP_POST, handleSaveSettings);
   server.on("/send_test", HTTP_POST, handleSendTestOsc);
+  server.on("/scan_wifi", HTTP_GET, handleScanNetworks);
   server.on("/reset", HTTP_POST, handleReset);
   server.on("/reboot", HTTP_POST, handleReboot);
   server.on("/logs", HTTP_GET, handleLogsPage);
   server.on("/logs.txt", HTTP_GET, handleLogsText);
   server.on("/update", HTTP_GET, handleUpdatePage);
   server.on("/update", HTTP_POST, handleUpdateFinished, handleUpdateUpload);
-  server.on("/pinout.png", HTTP_GET, []() {
-    if (!littleFsOk) {
-      server.send(404, "text/plain", "Not found");
-      return;
-    }
-    File file = LittleFS.open("/pinout.png", "r");
-    if (!file) {
-      server.send(404, "text/plain", "Not found");
-      return;
-    }
-    server.streamFile(file, "image/png");
-    file.close();
-  });
-#if !USE_ETHERNET
   server.on("/generate_204", HTTP_GET, []() {
-    server.sendHeader("Location", "/", true);
+    server.sendHeader("Location", "/settings", true);
     server.send(302, "text/plain", "");
   });
   server.on("/hotspot-detect.html", HTTP_GET, []() {
-    server.sendHeader("Location", "/", true);
+    server.sendHeader("Location", "/settings", true);
     server.send(302, "text/plain", "");
   });
   server.on("/fwlink", HTTP_GET, []() {
-    server.sendHeader("Location", "/", true);
+    server.sendHeader("Location", "/settings", true);
     server.send(302, "text/plain", "");
   });
   server.on("/ncsi.txt", HTTP_GET, []() {
-    server.sendHeader("Location", "/", true);
-    server.send(200, "text/plain", "OK");
+    server.sendHeader("Location", "/settings", true);
+    server.send(302, "text/plain", "");
   });
-#endif
   server.onNotFound([]() {
-    server.sendHeader("Location", "/", true);
+    server.sendHeader("Location", "/settings", true);
     server.send(302, "text/plain", "");
   });
   server.begin();
@@ -2043,18 +2671,36 @@ void setup() {
 }
 
 void loop() {
-  if (digitalRead(RESET_BUTTON_PIN) == LOW) {
-    if (resetPressStartMs == 0) resetPressStartMs = millis();
-    if (millis() - resetPressStartMs >= RESET_HOLD_MS) {
-      doFactoryReset(false);
+  int resetState = digitalRead(RESET_BUTTON_PIN);
+  if (!resetButtonArmed) {
+    if (resetState == HIGH) {
+      if (resetHighStartMs == 0) resetHighStartMs = millis();
+      if (millis() - resetHighStartMs >= RESET_ARM_MS) {
+        resetButtonArmed = true;
+      }
+    } else {
+      resetHighStartMs = 0;
     }
-  } else {
     resetPressStartMs = 0;
+  } else {
+    if (resetState == LOW) {
+      if (resetPressStartMs == 0) resetPressStartMs = millis();
+      if (millis() - resetPressStartMs >= RESET_HOLD_MS) {
+        addLog("Factory reset via BUT1 hold.");
+        doFactoryReset(false);
+      }
+    } else {
+      resetPressStartMs = 0;
+    }
   }
 
   for (int i = 0; i < MAX_TRIGGERS; i++) {
     SensorConfig& s = config.sensors[i];
     if (!s.enabled) continue;
+    if (s.source == SRC_TIME) {
+      handleTimeTrigger(i, s);
+      continue;
+    }
     if (hasPinConflict(i)) continue;
 
     float norm = 0.0f;
@@ -2170,9 +2816,11 @@ void loop() {
       continue;
     }
 
-    IPAddress outIp;
-    uint16_t outPort;
-    getOscTarget(s.outDevice, outIp, outPort);
+      IPAddress outIp;
+      uint16_t outPort;
+      if (!getOscTarget(s.outDevice, outIp, outPort)) {
+        continue;
+      }
 
     if (s.outMode == OUT_STRING) {
       int8_t state = (norm >= 0.5f) ? 1 : 0;
@@ -2247,7 +2895,7 @@ void loop() {
       startMdns();
       Serial.print("WiFi connected. IP: ");
       Serial.println(getLocalIp());
-    } else if (!wifiApMode && millis() - wifiReconnectStarted > 10000) {
+    } else if (!wifiApMode && millis() - wifiReconnectStarted > 20000) {
       wifiReconnectStarted = 0;
       startWifiAp();
     }
@@ -2275,6 +2923,10 @@ void loop() {
       wifiApMode = false;
       dnsServer.stop();
     }
+  }
+
+  if (config.timeMode == TIME_NTP) {
+    pollNtpSync();
   }
 
   if (wifiApMode) {
