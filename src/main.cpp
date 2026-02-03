@@ -101,10 +101,14 @@ struct OscDevice {
   String name;
   IPAddress ip;
   uint16_t port;
+  bool hbEnabled;
+  String hbAddress;
+  uint32_t hbMs;
 };
 
 struct SensorConfig {
   bool enabled;
+  String name;
   SensorType type;
   int pin;
   int encClkPin;
@@ -142,16 +146,14 @@ struct Config {
   String username;
   bool passwordEnabled;
   String password;
-  bool heartbeatEnabled;
-  String heartbeatAddress;
-  uint32_t heartbeatMs;
-  uint8_t heartbeatDevice;
   uint8_t testDevice;
   uint32_t clickDebounceMs;
   uint32_t multiClickGapMs;
   uint32_t longPressMs;
   uint8_t triggerCount;
   uint8_t triggerOrder[MAX_TRIGGERS];
+  uint8_t oscDeviceCount;
+  uint8_t oscDeviceOrder[MAX_OSC_DEVICES];
   OscDevice oscDevices[MAX_OSC_DEVICES];
   SensorConfig sensors[MAX_TRIGGERS];
 };
@@ -169,6 +171,7 @@ int8_t lastEncB[MAX_TRIGGERS];
 int8_t lastEncState[MAX_TRIGGERS];
 int8_t encAccum[MAX_TRIGGERS];
 uint32_t lastButtonTriggerMs[MAX_TRIGGERS];
+uint32_t hbLastSent[MAX_OSC_DEVICES];
 uint8_t clickCount[MAX_TRIGGERS];
 bool multiPrevPressed[MAX_TRIGGERS];
 bool multiLongFired[MAX_TRIGGERS];
@@ -413,6 +416,7 @@ static bool ensureAuthenticated() {
 static SensorConfig defaultSensorConfig(int index) {
   SensorConfig s;
   s.enabled = (index == 0);
+  s.name = String("Trigger ") + String(index + 1);
   s.type = (index == 0) ? SENSOR_ANALOG : SENSOR_BUTTON;
   s.pin = defaultSensorPin(index);
   s.encClkPin = 13;
@@ -459,6 +463,9 @@ static void resetRuntimeState() {
     multiPressStartMs[i] = 0;
     multiLastReleaseMs[i] = 0;
     lastAnalogPrintMs[i] = 0;
+  }
+  for (int i = 0; i < MAX_OSC_DEVICES; i++) {
+    hbLastSent[i] = 0;
   }
   lastHeartbeatSentMs = 0;
 }
@@ -535,13 +542,11 @@ static void loadConfig() {
   config.wifiPass = prefs.getString("wifi_pass", DEFAULT_WIFI_PASS);
   config.username = prefs.getString("username", DEFAULT_USERNAME);
   if (config.username.length() == 0) config.username = DEFAULT_USERNAME;
-  config.heartbeatEnabled = prefs.getBool("hb_en", false);
-  config.heartbeatAddress = prefs.getString("hb_addr", "/heartbeat");
-  if (config.heartbeatAddress.length() == 0) config.heartbeatAddress = "/heartbeat";
-  config.heartbeatMs = prefs.getUInt("hb_ms", 5000);
-  if (config.heartbeatMs == 0) config.heartbeatMs = 5000;
-  config.heartbeatDevice = prefs.getUInt("hb_dev", 0);
-  if (config.heartbeatDevice >= MAX_OSC_DEVICES) config.heartbeatDevice = 0;
+  bool legacyHbEnabled = prefs.getBool("hb_en", false);
+  String legacyHbAddr = prefs.getString("hb_addr", "/heartbeat");
+  if (legacyHbAddr.length() == 0) legacyHbAddr = "/heartbeat";
+  uint32_t legacyHbMs = prefs.getUInt("hb_ms", 5000);
+  if (legacyHbMs == 0) legacyHbMs = 5000;
   config.testDevice = prefs.getUInt("test_dev", 0);
   if (config.testDevice >= MAX_OSC_DEVICES) config.testDevice = 0;
   config.clickDebounceMs = prefs.getUInt("click_db", DEFAULT_CLICK_DEBOUNCE_MS);
@@ -557,28 +562,76 @@ static void loadConfig() {
     config.password = "";
   }
 
+  config.oscDeviceCount = prefs.getUInt("dev_count", 1);
+  if (config.oscDeviceCount == 0 || config.oscDeviceCount > MAX_OSC_DEVICES) config.oscDeviceCount = 1;
+  String devOrderStr = prefs.getString("dev_order", "");
+  uint8_t devOrderCount = 0;
+  if (!parseOrderList(devOrderStr, config.oscDeviceOrder, devOrderCount) || devOrderCount == 0) {
+    devOrderCount = config.oscDeviceCount;
+    for (int i = 0; i < devOrderCount; i++) {
+      config.oscDeviceOrder[i] = i;
+    }
+  }
+  bool hasZero = false;
+  for (int i = 0; i < devOrderCount; i++) {
+    if (config.oscDeviceOrder[i] == 0) {
+      hasZero = true;
+      break;
+    }
+  }
+  if (!hasZero) {
+    if (devOrderCount < MAX_OSC_DEVICES) {
+      for (int i = devOrderCount; i > 0; i--) {
+        config.oscDeviceOrder[i] = config.oscDeviceOrder[i - 1];
+      }
+      config.oscDeviceOrder[0] = 0;
+      devOrderCount++;
+    } else {
+      config.oscDeviceOrder[0] = 0;
+    }
+  }
+  config.oscDeviceCount = devOrderCount;
+
   for (int i = 0; i < MAX_OSC_DEVICES; i++) {
     OscDevice d;
     d.enabled = (i == 0);
     d.name = (i == 0) ? "Default" : String("Device ") + String(i + 1);
     d.ip = config.clientIp;
     d.port = config.clientPort;
+    d.hbEnabled = false;
+    d.hbAddress = "/heartbeat";
+    d.hbMs = 5000;
     String keyEn = String("dev") + i + "_en";
     String keyName = String("dev") + i + "_name";
     String keyIp = String("dev") + i + "_ip";
     String keyPort = String("dev") + i + "_port";
+    String keyHbEn = String("dev") + i + "_hb_en";
+    String keyHbAddr = String("dev") + i + "_hb_addr";
+    String keyHbMs = String("dev") + i + "_hb_ms";
     d.enabled = prefs.getBool(keyEn.c_str(), d.enabled);
     d.name = prefs.getString(keyName.c_str(), d.name);
     d.ip = parseOrDefault(prefs.getString(keyIp.c_str(), ipToString(d.ip)), d.ip);
     d.port = prefs.getInt(keyPort.c_str(), d.port);
+    bool hasHb = prefs.isKey(keyHbEn.c_str());
+    if (hasHb) {
+      d.hbEnabled = prefs.getBool(keyHbEn.c_str(), d.hbEnabled);
+      d.hbAddress = prefs.getString(keyHbAddr.c_str(), d.hbAddress);
+      d.hbMs = prefs.getUInt(keyHbMs.c_str(), d.hbMs);
+      if (d.hbAddress.length() == 0) d.hbAddress = "/heartbeat";
+      if (d.hbMs == 0) d.hbMs = 5000;
+    } else if (i == 0 && legacyHbEnabled) {
+      d.hbEnabled = legacyHbEnabled;
+      d.hbAddress = legacyHbAddr;
+      d.hbMs = legacyHbMs;
+    }
     if (d.port == 0) d.port = config.clientPort;
     config.oscDevices[i] = d;
   }
   config.clientIp = config.oscDevices[0].ip;
   config.clientPort = config.oscDevices[0].port;
 
-  config.triggerCount = prefs.getUInt("tr_count", 6);
-  if (config.triggerCount == 0 || config.triggerCount > MAX_TRIGGERS) config.triggerCount = 6;
+  config.triggerCount = prefs.getUInt("tr_count", 1);
+  if (config.triggerCount == 0 || config.triggerCount > MAX_TRIGGERS) config.triggerCount = 1;
   String orderStr = prefs.getString("tr_order", "");
   uint8_t orderCount = 0;
   if (!parseOrderList(orderStr, config.triggerOrder, orderCount) || orderCount == 0) {
@@ -598,6 +651,7 @@ static void loadConfig() {
     for (int i = 0; i < MAX_TRIGGERS; i++) {
       SensorConfig s = config.sensors[i];
       s.enabled = prefs.getBool(sensorKey(i, "en").c_str(), s.enabled);
+      s.name = prefs.getString(sensorKey(i, "name").c_str(), s.name);
       s.type = sanitizeSensorType(prefs.getInt(sensorKey(i, "type").c_str(), s.type));
       s.pin = prefs.getInt(sensorKey(i, "pin").c_str(), s.pin);
       s.encClkPin = prefs.getInt(sensorKey(i, "clk").c_str(), s.encClkPin);
@@ -621,6 +675,7 @@ static void loadConfig() {
 
       if (s.oscAddress.length() == 0) s.oscAddress = defaultOscAddress(i);
       if (s.buttonAddress.length() == 0) s.buttonAddress = "/button";
+      if (s.name.length() == 0) s.name = String("Trigger ") + String(i + 1);
       if (s.type == SENSOR_ANALOG && s.outMode == OUT_STRING) s.outMode = OUT_FLOAT;
       config.sensors[i] = s;
     }
@@ -660,10 +715,6 @@ static void saveConfig() {
   prefs.putString("wifi_ssid", config.wifiSsid);
   prefs.putString("wifi_pass", config.wifiPass);
   prefs.putString("username", config.username);
-  prefs.putBool("hb_en", config.heartbeatEnabled);
-  prefs.putString("hb_addr", config.heartbeatAddress);
-  prefs.putUInt("hb_ms", config.heartbeatMs);
-  prefs.putUInt("hb_dev", config.heartbeatDevice);
   prefs.putUInt("test_dev", config.testDevice);
   prefs.putUInt("click_db", config.clickDebounceMs);
   prefs.putUInt("click_gap", config.multiClickGapMs);
@@ -673,21 +724,30 @@ static void saveConfig() {
   prefs.putUInt("tr_count", config.triggerCount);
   prefs.putString("tr_order", buildOrderList(config.triggerOrder, config.triggerCount));
 
+  prefs.putUInt("dev_count", config.oscDeviceCount);
+  prefs.putString("dev_order", buildOrderList(config.oscDeviceOrder, config.oscDeviceCount));
   for (int i = 0; i < MAX_OSC_DEVICES; i++) {
     const OscDevice& d = config.oscDevices[i];
     String keyEn = String("dev") + i + "_en";
     String keyName = String("dev") + i + "_name";
     String keyIp = String("dev") + i + "_ip";
     String keyPort = String("dev") + i + "_port";
+    String keyHbEn = String("dev") + i + "_hb_en";
+    String keyHbAddr = String("dev") + i + "_hb_addr";
+    String keyHbMs = String("dev") + i + "_hb_ms";
     prefs.putBool(keyEn.c_str(), d.enabled);
     prefs.putString(keyName.c_str(), d.name);
     prefs.putString(keyIp.c_str(), ipToString(d.ip));
     prefs.putInt(keyPort.c_str(), d.port);
+    prefs.putBool(keyHbEn.c_str(), d.hbEnabled);
+    prefs.putString(keyHbAddr.c_str(), d.hbAddress);
+    prefs.putUInt(keyHbMs.c_str(), d.hbMs);
   }
 
   for (int i = 0; i < MAX_TRIGGERS; i++) {
     const SensorConfig& s = config.sensors[i];
     prefs.putBool(sensorKey(i, "en").c_str(), s.enabled);
+    prefs.putString(sensorKey(i, "name").c_str(), s.name);
     prefs.putInt(sensorKey(i, "type").c_str(), s.type);
     prefs.putInt(sensorKey(i, "pin").c_str(), s.pin);
     prefs.putInt(sensorKey(i, "clk").c_str(), s.encClkPin);
@@ -965,6 +1025,20 @@ static int findUnusedTrigger() {
   return -1;
 }
 
+static int findUnusedOscDevice() {
+  for (int i = 0; i < MAX_OSC_DEVICES; i++) {
+    bool used = false;
+    for (int j = 0; j < config.oscDeviceCount; j++) {
+      if (config.oscDeviceOrder[j] == i) {
+        used = true;
+        break;
+      }
+    }
+    if (!used) return i;
+  }
+  return -1;
+}
+
 static void sendTriggerOutput(const SensorConfig& sensor, const String& addr) {
   if (sensor.outTarget == OUT_TARGET_REBOOT) {
     addLog("Reboot triggered by output action.");
@@ -1052,6 +1126,12 @@ static void handleTriggers() {
   html += ".card{background:var(--card);border:1px solid #e2e2e2;border-radius:12px;padding:12px;margin:10px 0;}";
   html += "fieldset{border:1px solid #e2e2e2;border-radius:12px;padding:12px;margin:12px 0;background:#fff;}";
   html += "legend{padding:0 6px;color:var(--muted);}";
+  html += "details{border:1px solid #e2e2e2;border-radius:12px;margin:12px 0;background:#fff;}";
+  html += "summary{cursor:pointer;list-style:none;padding:10px 12px;display:flex;align-items:center;justify-content:space-between;}";
+  html += "summary::-webkit-details-marker{display:none;}";
+  html += ".trigger-title{font-weight:600;}";
+  html += ".trigger-actions{display:flex;gap:6px;align-items:center;}";
+  html += ".icon-btn{border:1px solid #b9b9b9;background:#fff;color:#222;padding:4px 8px;border-radius:6px;cursor:pointer;}";
   html += "input,select{width:100%;max-width:320px;padding:6px 8px;margin:2px 0 8px;border:1px solid #cfcfcf;border-radius:6px;background:#fff;}";
   html += "button{border:1px solid #b9b9b9;background:#fff;color:#222;padding:6px 10px;border-radius:8px;cursor:pointer;}";
   html += "button.primary{background:var(--accent);color:#fff;border-color:var(--accent);}";
@@ -1109,13 +1189,18 @@ static void handleTriggers() {
     SensorConfig& s = config.sensors[i];
     String idx = String(i);
 
-    html += "<fieldset>";
-    html += "<legend><b>Trigger " + String(tIndex + 1) + "</b></legend>";
+    html += "<details " + String(tIndex == 0 ? "open" : "") + ">";
+    html += "<summary>";
+    html += "<span class='trigger-title'>" + s.name + "</span>";
+    html += "<span class='trigger-actions'>";
+    html += "<button type='submit' name='action' value='up:" + idx + "' class='icon-btn'>&uarr;</button>";
+    html += "<button type='submit' name='action' value='down:" + idx + "' class='icon-btn'>&darr;</button>";
+    html += "<button type='submit' name='action' value='remove:" + idx + "' class='icon-btn'>×</button>";
+    html += "</span></summary>";
+    html += "<div style='padding:0 12px 12px;'>";
     html += "<input type='hidden' name='s" + idx + "_present' value='1'>";
     html += "Enable: <input name='s" + idx + "_en' type='checkbox' " + String(s.enabled ? "checked" : "") + "><br>";
-    html += "<button type='submit' name='action' value='up:" + idx + "'>Up</button> ";
-    html += "<button type='submit' name='action' value='down:" + idx + "'>Down</button> ";
-    html += "<button type='submit' name='action' value='remove:" + idx + "' class='danger'>Remove</button>";
+    html += "Name: <input name='s" + idx + "_name' type='text' value='" + s.name + "'><br>";
 
     html += "<div class='card'><b>Input</b><br>";
     html += "Source: <select name='s" + idx + "_src'><option value='sensor' selected>Sensors</option></select><br>";
@@ -1186,7 +1271,7 @@ static void handleTriggers() {
     html += "</div>";
     html += "</div>";
 
-    html += "</fieldset>";
+    html += "</div></details>";
   }
 
   html += "<button type='submit' name='action' value='save' class='primary'>Save Triggers</button>";
@@ -1261,6 +1346,11 @@ static void handleSaveTriggers() {
     if (!server.hasArg("s" + idx + "_present")) continue;
     SensorConfig s = config.sensors[i];
     s.enabled = server.hasArg("s" + idx + "_en");
+    if (server.hasArg("s" + idx + "_name")) {
+      s.name = server.arg("s" + idx + "_name");
+      s.name.trim();
+      if (s.name.length() == 0) s.name = String("Trigger ") + String(i + 1);
+    }
     if (server.hasArg("s" + idx + "_type")) {
       s.type = sanitizeSensorType(server.arg("s" + idx + "_type").toInt());
     }
@@ -1385,7 +1475,7 @@ static void handleSaveTriggers() {
   applySensorPinModes();
   resetRuntimeState();
 
-  server.sendHeader("Location", "/settings", true);
+  server.sendHeader("Location", "/", true);
   server.send(303, "text/plain", "Saved.");
 }
 
@@ -1406,6 +1496,12 @@ static void handleSettings() {
   html += ".card{background:var(--card);border:1px solid #e2e2e2;border-radius:12px;padding:12px;margin:10px 0;}";
   html += "fieldset{border:1px solid #e2e2e2;border-radius:12px;padding:12px;margin:10px 0;background:#fff;}";
   html += "legend{padding:0 6px;color:var(--muted);}";
+  html += "details{border:1px solid #e2e2e2;border-radius:12px;margin:10px 0;background:#fff;}";
+  html += "summary{cursor:pointer;list-style:none;padding:10px 12px;display:flex;align-items:center;justify-content:space-between;}";
+  html += "summary::-webkit-details-marker{display:none;}";
+  html += ".trigger-title{font-weight:600;}";
+  html += ".trigger-actions{display:flex;gap:6px;align-items:center;}";
+  html += ".icon-btn{border:1px solid #b9b9b9;background:#fff;color:#222;padding:4px 8px;border-radius:6px;cursor:pointer;}";
   html += "input,select{width:100%;max-width:320px;padding:6px 8px;margin:2px 0 8px;border:1px solid #cfcfcf;border-radius:6px;background:#fff;}";
   html += "button{border:1px solid #b9b9b9;background:#fff;color:#222;padding:6px 10px;border-radius:8px;cursor:pointer;}";
   html += "button.primary{background:var(--accent);color:#fff;border-color:var(--accent);}";
@@ -1443,20 +1539,38 @@ static void handleSettings() {
   html += "<small>Static IP changes may require reboot.</small><br>";
   html += "</div>";
 
-  html += "<div class='card'><b>OSC Devices</b><br>";
+  html += "<div class='card'><b>OSC</b><br>";
   html += "<small>Device 1 is the default target.</small><br>";
-  for (int i = 0; i < MAX_OSC_DEVICES; i++) {
+  html += "<b>OSC Client Devices</b><br>";
+  html += "<button type='submit' name='action' value='dev_add' class='primary'>Add OSC Device</button><br><br>";
+
+  for (int dIndex = 0; dIndex < config.oscDeviceCount; dIndex++) {
+    int i = config.oscDeviceOrder[dIndex];
     OscDevice& d = config.oscDevices[i];
-    html += "<fieldset><legend>Device " + String(i + 1) + "</legend>";
+    html += "<details " + String(dIndex == 0 ? "open" : "") + ">";
+    html += "<summary>";
+    html += "<span class='trigger-title'>" + d.name + "</span>";
+    html += "<span class='trigger-actions'>";
+    html += "<button type='submit' name='action' value='dev_up:" + String(i) + "' class='icon-btn'>&uarr;</button>";
+    html += "<button type='submit' name='action' value='dev_down:" + String(i) + "' class='icon-btn'>&darr;</button>";
+    if (i != 0) {
+      html += "<button type='submit' name='action' value='dev_remove:" + String(i) + "' class='icon-btn'>×</button>";
+    }
+    html += "</span></summary>";
+    html += "<div style='padding:0 12px 12px;'>";
+    html += "<input type='hidden' name='d" + String(i) + "_present' value='1'>";
     html += "Enable: <input name='dev" + String(i) + "_en' type='checkbox' " + String(d.enabled ? "checked" : "") + "><br>";
     html += "Name: <input name='dev" + String(i) + "_name' type='text' value='" + d.name + "'><br>";
     html += "IP: <input name='dev" + String(i) + "_ip' type='text' value='" + ipToString(d.ip) + "'><br>";
     html += "Port: <input name='dev" + String(i) + "_port' type='number' value='" + String(d.port) + "'><br>";
-    html += "</fieldset>";
+    html += "<b>Heartbeat</b><br>";
+    html += "Enable: <input name='dev" + String(i) + "_hb_en' type='checkbox' " + String(d.hbEnabled ? "checked" : "") + "><br>";
+    html += "Address: <input name='dev" + String(i) + "_hb_addr' type='text' value='" + d.hbAddress + "'><br>";
+    html += "Interval ms: <input name='dev" + String(i) + "_hb_ms' type='number' value='" + String(d.hbMs) + "'><br>";
+    html += "</div></details>";
   }
-  html += "</div>";
 
-  html += "<div class='card'><b>Test OSC</b><br>";
+  html += "<div style='margin-top:10px;'><b>Test OSC</b><br>";
   html += "Device: <select id='test_dev' name='test_dev'>";
   appendOscDeviceOptions(html, config.testDevice);
   html += "</select><br>";
@@ -1469,17 +1583,9 @@ static void handleSettings() {
   html += "Output: <input id='test_value' name='test_value' type='text' value='1'><br>";
   html += "<button type='button' id='test_send_btn'>Send</button>";
   html += "</div>";
-
-  html += "<div class='card'><b>Heartbeat</b><br>";
-  html += "Enable: <input name='hb_en' type='checkbox' " + String(config.heartbeatEnabled ? "checked" : "") + "><br>";
-  html += "Address: <input name='hb_addr' type='text' value='" + config.heartbeatAddress + "'><br>";
-  html += "Interval ms: <input name='hb_ms' type='number' value='" + String(config.heartbeatMs) + "'><br>";
-  html += "Device: <select name='hb_dev'>";
-  appendOscDeviceOptions(html, config.heartbeatDevice);
-  html += "</select><br>";
   html += "</div>";
 
-  html += "<div class='card'><b>Trigger Timing</b><br>";
+  html += "<div class='card'><b>Sensors</b><br>";
   html += "Debounce ms: <input name='click_db' type='number' value='" + String(config.clickDebounceMs) + "'><br>";
   html += "Multi-click gap ms: <input name='click_gap' type='number' value='" + String(config.multiClickGapMs) + "'><br>";
   html += "Long press ms: <input name='long_ms' type='number' value='" + String(config.longPressMs) + "'><br>";
@@ -1535,6 +1641,7 @@ static void handleSettings() {
 
 static void handleSaveSettings() {
   if (!ensureAuthenticated()) return;
+  String action = server.hasArg("action") ? server.arg("action") : "save";
   String oldHostname = config.hostname;
   bool wantPassword = server.hasArg("pwd_enabled");
   String newPassword = server.arg("pwd_new");
@@ -1604,6 +1711,7 @@ static void handleSaveSettings() {
   }
 
   for (int i = 0; i < MAX_OSC_DEVICES; i++) {
+    if (!server.hasArg("d" + String(i) + "_present")) continue;
     OscDevice d = config.oscDevices[i];
     d.enabled = server.hasArg("dev" + String(i) + "_en") || (i == 0);
     if (server.hasArg("dev" + String(i) + "_name")) {
@@ -1616,24 +1724,73 @@ static void handleSaveSettings() {
       int port = server.arg("dev" + String(i) + "_port").toInt();
       if (port > 0 && port <= 65535) d.port = static_cast<uint16_t>(port);
     }
+    d.hbEnabled = server.hasArg("dev" + String(i) + "_hb_en");
+    if (server.hasArg("dev" + String(i) + "_hb_addr")) {
+      d.hbAddress = normalizeOscAddress(server.arg("dev" + String(i) + "_hb_addr"));
+    }
+    if (server.hasArg("dev" + String(i) + "_hb_ms")) {
+      uint32_t ms = static_cast<uint32_t>(server.arg("dev" + String(i) + "_hb_ms").toInt());
+      if (ms > 0) d.hbMs = ms;
+    }
     if (d.name.length() == 0) d.name = String("Device ") + String(i + 1);
+    if (d.hbAddress.length() == 0) d.hbAddress = "/heartbeat";
+    if (d.hbMs == 0) d.hbMs = 5000;
     config.oscDevices[i] = d;
+  }
+  if (action == "dev_add") {
+    if (config.oscDeviceCount < MAX_OSC_DEVICES) {
+      int idx = findUnusedOscDevice();
+      if (idx >= 0) {
+        OscDevice d;
+        d.enabled = true;
+        d.name = String("Device ") + String(idx + 1);
+        d.ip = config.clientIp;
+        d.port = config.clientPort;
+        d.hbEnabled = false;
+        d.hbAddress = "/heartbeat";
+        d.hbMs = 5000;
+        config.oscDevices[idx] = d;
+        config.oscDeviceOrder[config.oscDeviceCount++] = static_cast<uint8_t>(idx);
+      }
+    }
+  } else if (action.startsWith("dev_remove:")) {
+    int idx = action.substring(11).toInt();
+    if (idx != 0) {
+      for (int i = 0; i < config.oscDeviceCount; i++) {
+        if (config.oscDeviceOrder[i] == idx) {
+          for (int j = i; j < config.oscDeviceCount - 1; j++) {
+            config.oscDeviceOrder[j] = config.oscDeviceOrder[j + 1];
+          }
+          config.oscDeviceCount--;
+          break;
+        }
+      }
+      config.oscDevices[idx].enabled = false;
+    }
+  } else if (action.startsWith("dev_up:")) {
+    int idx = action.substring(7).toInt();
+    for (int i = 1; i < config.oscDeviceCount; i++) {
+      if (config.oscDeviceOrder[i] == idx) {
+        uint8_t tmp = config.oscDeviceOrder[i - 1];
+        config.oscDeviceOrder[i - 1] = config.oscDeviceOrder[i];
+        config.oscDeviceOrder[i] = tmp;
+        break;
+      }
+    }
+  } else if (action.startsWith("dev_down:")) {
+    int idx = action.substring(9).toInt();
+    for (int i = 0; i < config.oscDeviceCount - 1; i++) {
+      if (config.oscDeviceOrder[i] == idx) {
+        uint8_t tmp = config.oscDeviceOrder[i + 1];
+        config.oscDeviceOrder[i + 1] = config.oscDeviceOrder[i];
+        config.oscDeviceOrder[i] = tmp;
+        break;
+      }
+    }
   }
   config.clientIp = config.oscDevices[0].ip;
   config.clientPort = config.oscDevices[0].port;
 
-  config.heartbeatEnabled = server.hasArg("hb_en");
-  if (server.hasArg("hb_addr")) {
-    config.heartbeatAddress = normalizeOscAddress(server.arg("hb_addr"));
-  }
-  if (server.hasArg("hb_ms")) {
-    uint32_t ms = static_cast<uint32_t>(server.arg("hb_ms").toInt());
-    if (ms > 0) config.heartbeatMs = ms;
-  }
-  if (server.hasArg("hb_dev")) {
-    int v = server.arg("hb_dev").toInt();
-    if (v >= 0 && v < MAX_OSC_DEVICES) config.heartbeatDevice = static_cast<uint8_t>(v);
-  }
   if (server.hasArg("test_dev")) {
     int v = server.arg("test_dev").toInt();
     if (v >= 0 && v < MAX_OSC_DEVICES) config.testDevice = static_cast<uint8_t>(v);
@@ -1671,541 +1828,6 @@ static void handleSaveSettings() {
   pendingMdnsRestart = (config.hostname != oldHostname);
 
   server.sendHeader("Location", "/settings", true);
-  server.send(303, "text/plain", "Saved.");
-}
-
-static void handleRoot() {
-  if (!ensureAuthenticated()) return;
-  String html;
-  html.reserve(13000);
-  html += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>";
-  html += "<title>StageMod Settings</title>";
-  html += "<style>";
-  html += ":root{--bg:#f4f1ea;--ink:#1a1a1a;--muted:#6c6c6c;--card:#ffffff;--accent:#0b6b6f;--danger:#a02a2a;}";
-  html += "body{margin:0;font-family:'Avenir Next','Trebuchet MS','Segoe UI',sans-serif;background:linear-gradient(135deg,#f4f1ea 0%,#e7f0ef 100%);color:var(--ink);}";
-  html += ".page{max-width:760px;margin:0 auto;padding:20px 16px 40px;}";
-  html += ".header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;margin-bottom:8px;}";
-  html += ".title{font-size:22px;font-weight:700;letter-spacing:0.5px;}";
-  html += ".actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}";
-  html += ".tag{font-size:12px;color:var(--muted);padding:4px 8px;border:1px solid #ddd;border-radius:999px;background:#fff;}";
-  html += ".status{display:flex;flex-wrap:wrap;gap:10px;font-size:13px;color:var(--muted);margin:8px 0 14px;}";
-  html += ".alert{background:#fff3d6;border:1px solid #f0d39b;padding:8px 10px;border-radius:8px;margin:8px 0;font-size:13px;}";
-  html += ".card{background:var(--card);border:1px solid #e2e2e2;border-radius:12px;padding:12px 12px 6px;margin:10px 0;}";
-  html += "fieldset{border:1px solid #e2e2e2;border-radius:12px;padding:12px;margin:10px 0;background:#fff;}";
-  html += "legend{padding:0 6px;color:var(--muted);}";
-  html += "input,select{width:100%;max-width:320px;padding:6px 8px;margin:2px 0 8px;border:1px solid #cfcfcf;border-radius:6px;background:#fff;}";
-  html += "button{border:1px solid #b9b9b9;background:#fff;color:#222;padding:6px 10px;border-radius:8px;cursor:pointer;}";
-  html += "button.primary{background:var(--accent);color:#fff;border-color:var(--accent);}";
-  html += "button.danger{background:var(--danger);color:#fff;border-color:var(--danger);}";
-  html += "small{color:var(--muted);}";
-  html += "#pin_help_modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);}";
-  html += "#pin_help_modal .modal{background:#fff;color:#000;max-width:520px;margin:10% auto;padding:16px;border-radius:12px;box-shadow:0 12px 30px rgba(0,0,0,0.2);}";
-  html += "</style></head><body>";
-  html += "<div class='page'>";
-  html += "<div class='header'>";
-  html += "<div class='title'>StageMod</div>";
-  html += "<div class='actions'>";
-  html += "<button type='button' id='pin_help_btn'>Board Pin Help</button>";
-  html += "<a href='/logs' class='tag' style='text-decoration:none;'>Serial Log</a>";
-  html += "<span class='tag'>Olimex ESP32-PoE</span>";
-  html += "</div></div>";
-  html += "<div id='pin_help_modal' style='display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);'>";
-  html += "<div class='modal'>";
-  html += "<h3>Pin Help</h3>";
-  html += "<p><b>Analog (ADC1, safe with WiFi/AP):</b> GPIO32, GPIO33, GPIO34, GPIO35, GPIO36, GPIO39.</p>";
-  html += "<p><b>Avoid ADC2 for analog when WiFi/AP is on:</b> GPIO0, GPIO2, GPIO4, GPIO12-15, GPIO25-27.</p>";
-  html += "<p><b>Input-only pins:</b> GPIO34, GPIO35, GPIO36, GPIO39.</p>";
-  html += "<p><b>Boot-strap pins:</b> GPIO0, GPIO2, GPIO12, GPIO15 (avoid pulling these during boot).</p>";
-  html += "<p><b>USB serial:</b> GPIO1/GPIO3 used for programming.</p>";
-  html += "<p><b>Reserved:</b> GPIO34 used for factory reset button (BUT1).</p>";
-  html += "<img src='/pinout.png' alt='ESP32-POE pinout' style='width:100%;height:auto;margin-top:8px;border-radius:8px;border:1px solid #ddd;'>";
-  html += "<button type='button' id='pin_help_close'>Close</button>";
-  html += "</div></div>";
-  if (wifiApMode) {
-    html += "<div class='alert'>AP mode: connect to SSID ";
-    html += buildApSsid();
-    html += " then open http://" + getLocalIp().toString() + "/</div>";
-  }
-  html += "<div class='status'>";
-  html += "<div>IP: " + getLocalIp().toString() + "</div>";
-  html += "<div>mDNS: http://" + config.hostname + ".local/</div>";
-  html += "</div>";
-  html += "<small>Multiple devices on the same network will connect as http://stagemod-x.local</small>";
-
-  bool anyConflict = false;
-  for (int i = 0; i < MAX_TRIGGERS; i++) {
-    if (hasPinConflict(i)) {
-      anyConflict = true;
-      break;
-    }
-  }
-  if (anyConflict) {
-    html += "<p style='color:#b00;'>Pin conflict detected: two triggers share the same GPIO.</p>";
-  }
-
-  html += "<form method='POST' action='/'>";
-  html += "<div class='card'>";
-  html += "<b>Network</b><br>";
-  html += "Hostname: <input name='hostname' type='text' value='" + config.hostname + "'><br>";
-  html += "Client IP: <input name='client_ip' type='text' value='" + ipToString(config.clientIp) + "'><br>";
-  html += "Client port: <input name='client_port' type='number' value='" + String(config.clientPort) + "'><br>";
-#if USE_ETHERNET
-  html += "Network: <select name='net_mode' id='net_mode'>";
-  html += "<option value='0' " + String(config.netMode == NET_ETHERNET ? "selected" : "") + ">Ethernet</option>";
-  html += "<option value='1' " + String(config.netMode == NET_WIFI ? "selected" : "") + ">WiFi</option>";
-  html += "</select><br>";
-#else
-  html += "<input type='hidden' name='net_mode' id='net_mode' value='1'>";
-#endif
-  html += "<div id='wifi_fields'>";
-  html += "WiFi SSID: <input name='wifi_ssid' type='text' value='" + config.wifiSsid + "'><br>";
-  html += "WiFi pass: <input name='wifi_pass' type='password' value=''><br>";
-  html += "</div>";
-  html += "<hr>";
-  html += "DHCP: <input name='dhcp_enabled' id='dhcp_enabled' type='checkbox' " + String(config.useStatic ? "" : "checked") + "><br>";
-  html += "<div id='static_fields'>";
-  html += "Static IP addr: <input name='static_ip' type='text' value='" + ipToString(config.staticIp) + "'><br>";
-  html += "Gateway: <input name='gateway' type='text' value='" + ipToString(config.gateway) + "'><br>";
-  html += "Subnet: <input name='subnet' type='text' value='" + ipToString(config.subnet) + "'><br>";
-  html += "DNS1: <input name='dns1' type='text' value='" + ipToString(config.dns1) + "'><br>";
-  html += "DNS2: <input name='dns2' type='text' value='" + ipToString(config.dns2) + "'><br>";
-  html += "</div>";
-  html += "<small>Static IP changes may require reboot.</small><br>";
-  html += "</div>";
-  html += "<div class='card'>";
-  html += "<b>Test OSC</b><br>";
-  html += "Address: <input id='test_addr' name='test_addr' type='text' value='/test'><br>";
-  html += "Output type: <select id='test_type' name='test_type'>";
-  html += "<option value='int'>Int</option>";
-  html += "<option value='float'>Float</option>";
-  html += "<option value='string'>String</option>";
-  html += "</select><br>";
-  html += "Output: <input id='test_value' name='test_value' type='text' value='1'><br>";
-  html += "<button type='button' id='test_send_btn'>Send</button>";
-  html += "</div>";
-  html += "<div class='card'>";
-  html += "<b>Heartbeat</b><br>";
-  html += "Enable: <input name='hb_en' type='checkbox' " + String(config.heartbeatEnabled ? "checked" : "") + "><br>";
-  html += "Address: <input name='hb_addr' type='text' value='" + config.heartbeatAddress + "'><br>";
-  html += "Interval ms: <input name='hb_ms' type='number' value='" + String(config.heartbeatMs) + "'><br>";
-  html += "</div>";
-  html += "<div class='card'>";
-  html += "<b>Trigger timing</b><br>";
-  html += "Debounce ms: <input name='click_db' type='number' value='" + String(config.clickDebounceMs) + "'><br>";
-  html += "Multi-click gap ms: <input name='click_gap' type='number' value='" + String(config.multiClickGapMs) + "'><br>";
-  html += "Long press ms: <input name='long_ms' type='number' value='" + String(config.longPressMs) + "'><br>";
-  html += "</div>";
-  html += "<hr>";
-
-  for (int i = 0; i < MAX_TRIGGERS; i++) {
-    const SensorConfig& s = config.sensors[i];
-    String idx = String(i);
-    html += "<fieldset>";
-    html += "<legend><b>Trigger " + String(i + 1) + "</b></legend>";
-    html += "Enable: <input name='s" + idx + "_en' type='checkbox' " + String(s.enabled ? "checked" : "") + "><br>";
-    html += "Type: <select name='s" + idx + "_type' id='s" + idx + "_type'>";
-    html += "<option value='0' " + String(s.type == SENSOR_ANALOG ? "selected" : "") + ">Analog (pot/slider)</option>";
-    html += "<option value='1' " + String(s.type == SENSOR_BUTTON ? "selected" : "") + ">Button (momentary)</option>";
-    html += "<option value='2' " + String(s.type == SENSOR_TOGGLE ? "selected" : "") + ">Button (toggle)</option>";
-    html += "<option value='4' " + String(s.type == SENSOR_ENCODER ? "selected" : "") + ">Encoder</option>";
-    html += "<option value='5' " + String(s.type == SENSOR_BUTTON_DOUBLE ? "selected" : "") + ">Button (double click)</option>";
-    html += "<option value='6' " + String(s.type == SENSOR_BUTTON_TRIPLE ? "selected" : "") + ">Button (triple click)</option>";
-    html += "<option value='7' " + String(s.type == SENSOR_BUTTON_LONG ? "selected" : "") + ">Button (long press)</option>";
-    html += "</select><br>";
-    html += "<div id='s" + idx + "_pin_block'>";
-    html += "GPIO Pin: <input name='s" + idx + "_pin' type='number' value='" + String(s.pin) + "'><br>";
-    html += "<small>Analog pins allowed: 32,35,36. Digital pins allowed: 5,13,16,17,18,19,21,22,23,25,26,27,32,33,35,36,39</small><br>";
-    html += "</div>";
-    html += "<div id='s" + idx + "_addr_block'>";
-    html += "OSC address: <input id='s" + idx + "_addr' name='s" + idx + "_addr' type='text' value='" + s.oscAddress + "'><br>";
-    html += "</div>";
-
-    html += "<div id='s" + idx + "_analog'>";
-    html += "Invert: <input name='s" + idx + "_inv' type='checkbox' " + String(s.invert ? "checked" : "") + "><br>";
-    html += "</div>";
-
-    html += "<div id='s" + idx + "_digital'>";
-    html += "Active high: <input id='s" + idx + "_ah' name='s" + idx + "_ah' type='checkbox' " + String(s.activeHigh ? "checked" : "") + "><br>";
-    html += "Use pullup: <input name='s" + idx + "_pu' type='checkbox' " + String(s.pullup ? "checked" : "") + "><br>";
-    html += "<small>Button to GND: pullup ON, active high OFF. Button to 3.3V: pullup OFF, active high ON.</small><br>";
-    html += "</div>";
-
-    html += "<div id='s" + idx + "_encoder'>";
-    html += "<b>Encoder</b><br>";
-    html += "Encoder address: <input id='s" + idx + "_enc_addr' name='s" + idx + "_enc_addr' type='text' value='" + s.oscAddress + "'><br>";
-    html += "CLK pin: <input name='s" + idx + "_clk' type='number' value='" + String(s.encClkPin) + "'><br>";
-    html += "DT pin: <input name='s" + idx + "_dt' type='number' value='" + String(s.encDtPin) + "'><br>";
-    html += "SW pin: <input name='s" + idx + "_sw' type='number' value='" + String(s.encSwPin) + "'><br>";
-    html += "<small>Encoder sends -1/+1 on each step.</small><br>";
-    html += "</div>";
-    html += "<div id='s" + idx + "_button_addr'>";
-    html += "<b>Button</b><br>";
-    html += "Button address: <input id='s" + idx + "_btn_addr' name='s" + idx + "_btn_addr' type='text' value='" + s.buttonAddress + "'><br>";
-    html += "</div>";
-    html += "Output type: <select name='s" + idx + "_omode' id='s" + idx + "_omode'>";
-    html += "<option value='0' " + String(s.outMode == OUT_INT ? "selected" : "") + ">Int</option>";
-    html += "<option value='1' " + String(s.outMode == OUT_FLOAT ? "selected" : "") + ">Float</option>";
-    html += "<option value='2' id='s" + idx + "_opt_string' " + String(s.outMode == OUT_STRING ? "selected" : "") + ">String</option>";
-    html += "</select><br>";
-    html += "<div id='s" + idx + "_range'>";
-    html += "Output min: <input name='s" + idx + "_omin' type='number' step='0.001' value='" + String(s.outMin, 3) + "'><br>";
-    html += "Output max: <input name='s" + idx + "_omax' type='number' step='0.001' value='" + String(s.outMax, 3) + "'><br>";
-    html += "</div>";
-
-    html += "<div id='s" + idx + "_string'>";
-    html += "On string: <input name='s" + idx + "_on' type='text' value='" + s.onString + "'><br>";
-    html += "Off string: <input name='s" + idx + "_off' type='text' value='" + s.offString + "'><br>";
-    html += "</div>";
-    html += "<div id='s" + idx + "_cooldown'>";
-    html += "Cooldown enabled: <input name='s" + idx + "_cd_en' type='checkbox' " + String(s.cooldownEnabled ? "checked" : "") + "><br>";
-    html += "Cooldown ms: <input name='s" + idx + "_cd_ms' type='number' value='" + String(s.cooldownMs) + "'><br>";
-    html += "<small>Cooldown blocks repeat presses and only sends the press message.</small><br>";
-    html += "</div>";
-    html += "</fieldset>";
-  }
-
-  html += "<button type='submit' class='primary'>Save</button>";
-  html += "<div class='card'>";
-  html += "<b>Security</b><br>";
-  html += "Username: <input name='username' type='text' value='" + config.username + "'><br>";
-  html += "Enable password: <input name='pwd_enabled' type='checkbox' " + String(config.passwordEnabled ? "checked" : "") + "><br>";
-  html += "New password: <input name='pwd_new' type='password' value=''><br>";
-  html += "<small>Leave new password blank to keep current.</small><br>";
-  html += "</div>";
-  html += "<div class='card'>";
-  html += "<b>Firmware Update</b><br>";
-  html += "Upload a new .bin over your local network.";
-  html += " <a href='/update'>Open updater</a><br>";
-  html += "</div>";
-  html += "<hr>";
-  html += "<div style='margin-top:8px;'>";
-  html += "<button type='button' id='factory_reset_btn' class='danger'>Factory Reset</button>";
-  html += "</div>";
-  html += "<script>";
-  html += "function updateSensor(i){";
-  html += "const tSel=document.getElementById('s'+i+'_type');";
-  html += "const t=tSel.value;";
-  html += "const om=document.getElementById('s'+i+'_omode');";
-  html += "const m=om.value;";
-  html += "const a=document.getElementById('s'+i+'_analog');";
-  html += "const d=document.getElementById('s'+i+'_digital');";
-  html += "const s=document.getElementById('s'+i+'_string');";
-  html += "const r=document.getElementById('s'+i+'_range');";
-  html += "const opt=document.getElementById('s'+i+'_opt_string');";
-  html += "const ah=document.getElementById('s'+i+'_ah');";
-  html += "const addr=document.getElementById('s'+i+'_addr_block');";
-  html += "const addrInput=document.getElementById('s'+i+'_addr');";
-  html += "const pin=document.getElementById('s'+i+'_pin_block');";
-  html += "const enc=document.getElementById('s'+i+'_encoder');";
-    html += "const btnAddrBlock=document.getElementById('s'+i+'_button_addr');";
-  html += "const cd=document.getElementById('s'+i+'_cooldown');";
-  html += "const encAddr=document.getElementById('s'+i+'_enc_addr');";
-  html += "const btnAddr=document.getElementById('s'+i+'_btn_addr');";
-  html += "const isEnc=(t==='4');";
-  html += "const prev=tSel.dataset.prev||t;";
-  html += "a.style.display=(t==='0')?'block':'none';";
-  html += "d.style.display=(t!=='0'&&!isEnc)?'block':'none';";
-  html += "if(t==='0'){";
-  html += "opt.disabled=true;";
-  html += "if(om.value==='2'){om.value='1';}";
-  html += "}else{";
-  html += "opt.disabled=false;";
-  html += "}";
-  html += "s.style.display=(om.value==='2')?'block':'none';";
-  html += "r.style.display=(om.value==='2')?'none':'block';";
-  html += "addr.style.display=isEnc?'none':'block';";
-  html += "pin.style.display=isEnc?'none':'block';";
-  html += "enc.style.display=isEnc?'block':'none';";
-  html += "btnAddrBlock.style.display=isEnc?'block':'none';";
-  html += "";
-  html += "if(addrInput){addrInput.disabled=isEnc;}";
-  html += "if(encAddr){encAddr.disabled=!isEnc;}";
-  html += "if(btnAddr){btnAddr.disabled=!isEnc;}";
-  html += "cd.style.display=(t==='1')?'block':'none';";
-  html += "if(isEnc){";
-  html += "if(encAddr&&encAddr.value.trim()===''){encAddr.value='/encoder';}";
-  html += "if(btnAddr&&btnAddr.value.trim()===''){btnAddr.value='/button';}";
-  html += "}";
-  html += "tSel.dataset.prev=t;";
-  html += "}";
-  html += "const dh=document.getElementById('dhcp_enabled');";
-  html += "const sf=document.getElementById('static_fields');";
-  html += "const nm=document.getElementById('net_mode');";
-  html += "const wf=document.getElementById('wifi_fields');";
-  html += "const helpBtn=document.getElementById('pin_help_btn');";
-  html += "const helpModal=document.getElementById('pin_help_modal');";
-  html += "const helpClose=document.getElementById('pin_help_close');";
-  html += "const resetBtn=document.getElementById('factory_reset_btn');";
-  html += "const form=document.querySelector('form[action=\"/\"]');";
-  html += "const testBtn=document.getElementById('test_send_btn');";
-  html += "const testAddr=document.getElementById('test_addr');";
-  html += "const testType=document.getElementById('test_type');";
-  html += "const testValue=document.getElementById('test_value');";
-  html += "const reservedPins=new Set([0,1,2,3,4,12,14,15,34]);";
-  html += "const analogPins=new Set([32,35,36]);";
-  html += "function pinInputError(){";
-  html += "for(let i=0;i<" + String(MAX_TRIGGERS) + ";i++){";
-  html += "const el=document.querySelector('input[name=\"s'+i+'_pin\"]');";
-  html += "const typeEl=document.getElementById('s'+i+'_type');";
-  html += "if(!el){continue;}";
-  html += "const v=parseInt(el.value,10);";
-  html += "if(!isNaN(v)&&reservedPins.has(v)){return v;}";
-  html += "if(typeEl&&typeEl.value==='0'&&!isNaN(v)&&!analogPins.has(v)){return v;}";
-  html += "if(typeEl&&typeEl.value==='4'){";
-  html += "const clk=document.querySelector('input[name=\"s'+i+'_clk\"]');";
-  html += "const dt=document.querySelector('input[name=\"s'+i+'_dt\"]');";
-  html += "const sw=document.querySelector('input[name=\"s'+i+'_sw\"]');";
-  html += "const pins=[clk,dt,sw];";
-  html += "for(let p=0;p<pins.length;p++){";
-  html += "const val=parseInt(pins[p].value,10);";
-  html += "if(!isNaN(val)&&reservedPins.has(val)){return val;}";
-  html += "}";
-  html += "}";
-  html += "}";
-  html += "return null;";
-  html += "}";
-  html += "function toggleDhcp(){sf.style.display=dh.checked?'none':'block';}";
-  html += "function toggleNet(){";
-  html += "if(!nm){wf.style.display='block';return;}";
-  html += "wf.style.display=(nm.value==='1')?'block':'none';";
-  html += "}";
-  html += "helpBtn.addEventListener('click',()=>{helpModal.style.display='block';});";
-  html += "helpClose.addEventListener('click',()=>{helpModal.style.display='none';});";
-  html += "helpModal.addEventListener('click',(e)=>{if(e.target===helpModal){helpModal.style.display='none';}});";
-  html += "resetBtn.addEventListener('click',()=>{";
-  html += "if(!confirm('Factory reset will erase all settings. Continue?')){return;}";
-  html += "fetch('/reset',{method:'POST'});";
-  html += "});";
-  html += "if(testBtn&&testAddr){testBtn.addEventListener('click',()=>{";
-  html += "const data=new URLSearchParams();";
-  html += "data.set('test_addr',testAddr.value||'/test');";
-  html += "if(testType){data.set('test_type',testType.value);}";
-  html += "if(testValue){data.set('test_value',testValue.value);}";
-  html += "fetch('/send_test',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data.toString()});";
-  html += "});}";
-  html += "if(form){form.addEventListener('submit',(e)=>{";
-  html += "const bad=pinInputError();";
-  html += "if(bad!==null){alert('GPIO '+bad+' is not allowed for this selection.');e.preventDefault();}});}";
-  html += "dh.addEventListener('change',toggleDhcp);";
-  html += "if(nm){nm.addEventListener('change',toggleNet);}";
-  html += "toggleDhcp();";
-  html += "toggleNet();";
-  html += "for(let i=0;i<" + String(MAX_TRIGGERS) + ";i++){";
-  html += "const tSel=document.getElementById('s'+i+'_type');";
-  html += "tSel.dataset.prev=tSel.value;";
-  html += "tSel.addEventListener('change',()=>updateSensor(i));";
-  html += "document.getElementById('s'+i+'_omode').addEventListener('change',()=>updateSensor(i));";
-  html += "updateSensor(i);";
-  html += "}";
-  html += "</script>";
-  html += "</form></div></body></html>";
-  server.send(200, "text/html", html);
-}
-
-static void handleSave() {
-  if (!ensureAuthenticated()) return;
-  String oldHostname = config.hostname;
-  bool wantPassword = server.hasArg("pwd_enabled");
-  String newPassword = server.arg("pwd_new");
-
-  if (server.hasArg("hostname")) {
-    config.hostname = sanitizeHostname(server.arg("hostname"));
-  }
-  if (server.hasArg("username")) {
-    String user = server.arg("username");
-    user.trim();
-    if (user.length() == 0) user = DEFAULT_USERNAME;
-    config.username = user;
-  }
-
-  if (server.hasArg("net_mode")) {
-    config.netMode = sanitizeNetworkMode(server.arg("net_mode").toInt());
-  }
-#if !USE_ETHERNET
-  config.netMode = NET_WIFI;
-#endif
-
-  if (server.hasArg("client_ip")) {
-    IPAddress parsed;
-    if (parseIpString(server.arg("client_ip"), parsed)) {
-      config.clientIp = parsed;
-    }
-  }
-
-  if (server.hasArg("client_port")) {
-    int port = server.arg("client_port").toInt();
-    if (port > 0 && port <= 65535) config.clientPort = static_cast<uint16_t>(port);
-  }
-
-#if !USE_ETHERNET
-  if (server.hasArg("wifi_ssid")) {
-    config.wifiSsid = server.arg("wifi_ssid");
-  }
-  if (server.hasArg("wifi_pass")) {
-    String pass = server.arg("wifi_pass");
-    if (pass.length() > 0) config.wifiPass = pass;
-  }
-#endif
-
-  config.useStatic = !server.hasArg("dhcp_enabled");
-
-  if (server.hasArg("static_ip")) {
-    IPAddress parsed;
-    if (parseIpString(server.arg("static_ip"), parsed)) {
-      config.staticIp = parsed;
-    }
-  }
-
-  if (server.hasArg("gateway")) {
-    IPAddress parsed;
-    if (parseIpString(server.arg("gateway"), parsed)) {
-      config.gateway = parsed;
-    }
-  }
-
-  if (server.hasArg("subnet")) {
-    IPAddress parsed;
-    if (parseIpString(server.arg("subnet"), parsed)) {
-      config.subnet = parsed;
-    }
-  }
-
-  if (server.hasArg("dns1")) {
-    IPAddress parsed;
-    if (parseIpString(server.arg("dns1"), parsed)) {
-      config.dns1 = parsed;
-    }
-  }
-
-  if (server.hasArg("dns2")) {
-    IPAddress parsed;
-    if (parseIpString(server.arg("dns2"), parsed)) {
-      config.dns2 = parsed;
-    }
-  }
-
-  config.heartbeatEnabled = server.hasArg("hb_en");
-  if (server.hasArg("hb_addr")) {
-    config.heartbeatAddress = normalizeOscAddress(server.arg("hb_addr"));
-  }
-  if (server.hasArg("hb_ms")) {
-    uint32_t ms = static_cast<uint32_t>(server.arg("hb_ms").toInt());
-    if (ms > 0) config.heartbeatMs = ms;
-  }
-  if (server.hasArg("click_db")) {
-    uint32_t ms = static_cast<uint32_t>(server.arg("click_db").toInt());
-    if (ms > 0) config.clickDebounceMs = ms;
-  }
-  if (server.hasArg("click_gap")) {
-    uint32_t ms = static_cast<uint32_t>(server.arg("click_gap").toInt());
-    if (ms > 0) config.multiClickGapMs = ms;
-  }
-  if (server.hasArg("long_ms")) {
-    uint32_t ms = static_cast<uint32_t>(server.arg("long_ms").toInt());
-    if (ms > 0) config.longPressMs = ms;
-  }
-
-  for (int i = 0; i < MAX_TRIGGERS; i++) {
-    SensorConfig s = config.sensors[i];
-    String idx = String(i);
-
-    s.enabled = server.hasArg("s" + idx + "_en");
-
-    if (server.hasArg("s" + idx + "_type")) {
-      s.type = sanitizeSensorType(server.arg("s" + idx + "_type").toInt());
-    }
-
-    if (server.hasArg("s" + idx + "_addr")) {
-      s.oscAddress = normalizeOscAddress(server.arg("s" + idx + "_addr"));
-    }
-    if (s.type == SENSOR_ENCODER) {
-      if (server.hasArg("s" + idx + "_enc_addr")) {
-        s.oscAddress = normalizeOscAddress(server.arg("s" + idx + "_enc_addr"));
-      }
-      if (server.hasArg("s" + idx + "_btn_addr")) {
-        s.buttonAddress = normalizeOscAddress(server.arg("s" + idx + "_btn_addr"));
-      }
-      if (s.oscAddress.length() == 0) s.oscAddress = "/encoder";
-      if (s.buttonAddress.length() == 0) s.buttonAddress = "/button";
-    }
-
-    s.invert = server.hasArg("s" + idx + "_inv");
-    s.activeHigh = server.hasArg("s" + idx + "_ah");
-    s.pullup = server.hasArg("s" + idx + "_pu");
-    s.cooldownEnabled = server.hasArg("s" + idx + "_cd_en");
-    if (server.hasArg("s" + idx + "_cd_ms")) {
-      uint32_t ms = static_cast<uint32_t>(server.arg("s" + idx + "_cd_ms").toInt());
-      if (ms > 0) s.cooldownMs = ms;
-    }
-
-    if (server.hasArg("s" + idx + "_omin")) {
-      s.outMin = server.arg("s" + idx + "_omin").toFloat();
-    }
-
-    if (server.hasArg("s" + idx + "_omax")) {
-      s.outMax = server.arg("s" + idx + "_omax").toFloat();
-    }
-
-    if (server.hasArg("s" + idx + "_omode")) {
-      s.outMode = sanitizeOutputMode(server.arg("s" + idx + "_omode").toInt());
-    }
-
-    if (server.hasArg("s" + idx + "_on")) {
-      s.onString = server.arg("s" + idx + "_on");
-      if (s.onString.length() == 0) s.onString = DEFAULT_ON_STRING;
-    }
-
-    if (server.hasArg("s" + idx + "_off")) {
-      s.offString = server.arg("s" + idx + "_off");
-      if (s.offString.length() == 0) s.offString = DEFAULT_OFF_STRING;
-    }
-
-    if (server.hasArg("s" + idx + "_pin")) {
-      int pin = server.arg("s" + idx + "_pin").toInt();
-      if (pin >= 0 && pin <= 39 && !isReservedPin(pin)) {
-        if (s.type != SENSOR_ANALOG || isAllowedAnalogPin(pin)) {
-          s.pin = pin;
-        }
-      }
-    }
-    if (s.type == SENSOR_ENCODER) {
-      int clk = server.arg("s" + idx + "_clk").toInt();
-      int dt = server.arg("s" + idx + "_dt").toInt();
-      int sw = server.arg("s" + idx + "_sw").toInt();
-      if (clk >= 0 && clk <= 39 && !isReservedPin(clk)) s.encClkPin = clk;
-      if (dt >= 0 && dt <= 39 && !isReservedPin(dt)) s.encDtPin = dt;
-      if (sw >= 0 && sw <= 39 && !isReservedPin(sw)) s.encSwPin = sw;
-    }
-
-    if (s.type == SENSOR_ANALOG && s.outMode == OUT_STRING) {
-      s.outMode = OUT_FLOAT;
-    }
-
-    config.sensors[i] = s;
-  }
-
-  if (!wantPassword) {
-    config.passwordEnabled = false;
-    config.password = "";
-  } else if (newPassword.length() > 0) {
-    config.passwordEnabled = true;
-    config.password = newPassword;
-  } else if (config.password.length() > 0) {
-    config.passwordEnabled = true;
-  } else {
-    config.passwordEnabled = false;
-  }
-
-  saveConfig();
-  addLog("Settings saved.");
-  pendingNetApply = true;
-  pendingApplyAt = millis();
-  pendingMdnsRestart = (config.hostname != oldHostname);
-
-  applySensorPinModes();
-  resetRuntimeState();
-
-  server.sendHeader("Location", "/", true);
   server.send(303, "text/plain", "Saved.");
 }
 
@@ -2659,14 +2281,14 @@ void loop() {
     dnsServer.processNextRequest();
   }
 
-  if (config.heartbeatEnabled && config.heartbeatAddress.length() > 0) {
-    unsigned long now = millis();
-    if (now - lastHeartbeatSentMs >= config.heartbeatMs) {
-      lastHeartbeatSentMs = now;
-      IPAddress ip;
-      uint16_t port;
-      getOscTarget(config.heartbeatDevice, ip, port);
-      sendOscIntTo(ip, port, config.heartbeatAddress.c_str(), 1);
+  unsigned long now = millis();
+  for (int i = 0; i < config.oscDeviceCount; i++) {
+    int idx = config.oscDeviceOrder[i];
+    const OscDevice& d = config.oscDevices[idx];
+    if (!d.enabled || !d.hbEnabled || d.hbAddress.length() == 0) continue;
+    if (now - hbLastSent[idx] >= d.hbMs) {
+      hbLastSent[idx] = now;
+      sendOscIntTo(d.ip, d.port, d.hbAddress.c_str(), 1);
     }
   }
 }
