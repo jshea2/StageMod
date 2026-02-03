@@ -15,6 +15,7 @@
 #include <WiFiUdp.h>
 #include <WebServer.h>
 #include <LittleFS.h>
+#include <Update.h>
 
 // =========================
 // Config (edit these)
@@ -45,7 +46,10 @@ enum SensorType {
   SENSOR_BUTTON = 1,
   SENSOR_TOGGLE = 2,
   SENSOR_DIGITAL = 3,
-  SENSOR_ENCODER = 4
+  SENSOR_ENCODER = 4,
+  SENSOR_BUTTON_DOUBLE = 5,
+  SENSOR_BUTTON_TRIPLE = 6,
+  SENSOR_BUTTON_LONG = 7
 };
 
 enum OutputMode {
@@ -78,6 +82,10 @@ const int LOOP_DELAY_MS = 10;                  // read/send cycle
 const int SAMPLES       = 8;                   // oversample to calm noise
 const float ALPHA       = 0.30f;               // exponential smoothing 0..1
 const int DEAD_BAND     = 1;                   // percent hysteresis to stop flicker
+
+const uint32_t DEFAULT_CLICK_DEBOUNCE_MS = 30;   // debounce for buttons
+const uint32_t DEFAULT_MULTI_CLICK_GAP_MS = 350; // max gap between clicks
+const uint32_t DEFAULT_LONG_PRESS_MS = 700;      // long-press threshold
 
 const uint16_t LOCAL_PORT = 9000;              // Local UDP port
 const float SNAP_PERCENT = 1.0f;               // snap edges to min/max
@@ -122,6 +130,9 @@ struct Config {
   bool heartbeatEnabled;
   String heartbeatAddress;
   uint32_t heartbeatMs;
+  uint32_t clickDebounceMs;
+  uint32_t multiClickGapMs;
+  uint32_t longPressMs;
   SensorConfig sensors[MAX_SENSORS];
 };
 
@@ -138,6 +149,12 @@ int8_t lastEncB[MAX_SENSORS];
 int8_t lastEncState[MAX_SENSORS];
 int8_t encAccum[MAX_SENSORS];
 uint32_t lastButtonTriggerMs[MAX_SENSORS];
+uint8_t clickCount[MAX_SENSORS];
+bool multiPrevPressed[MAX_SENSORS];
+bool multiLongFired[MAX_SENSORS];
+unsigned long multiLastChangeMs[MAX_SENSORS];
+unsigned long multiPressStartMs[MAX_SENSORS];
+unsigned long multiLastReleaseMs[MAX_SENSORS];
 unsigned long lastAnalogPrintMs[MAX_SENSORS];
 WiFiUDP udp;
 WebServer server(80);
@@ -320,7 +337,7 @@ static int defaultSensorPin(int index) {
 }
 
 static SensorType sanitizeSensorType(int value) {
-  if (value < SENSOR_ANALOG || value > SENSOR_ENCODER) return SENSOR_ANALOG;
+  if (value < SENSOR_ANALOG || value > SENSOR_BUTTON_LONG) return SENSOR_ANALOG;
   return static_cast<SensorType>(value);
 }
 
@@ -393,6 +410,12 @@ static void resetRuntimeState() {
     lastEncState[i] = -1;
     encAccum[i] = 0;
     lastButtonTriggerMs[i] = 0;
+    clickCount[i] = 0;
+    multiPrevPressed[i] = false;
+    multiLongFired[i] = false;
+    multiLastChangeMs[i] = 0;
+    multiPressStartMs[i] = 0;
+    multiLastReleaseMs[i] = 0;
     lastAnalogPrintMs[i] = 0;
   }
   lastHeartbeatSentMs = 0;
@@ -469,6 +492,12 @@ static void loadConfig() {
   if (config.heartbeatAddress.length() == 0) config.heartbeatAddress = "/heartbeat";
   config.heartbeatMs = prefs.getUInt("hb_ms", 5000);
   if (config.heartbeatMs == 0) config.heartbeatMs = 5000;
+  config.clickDebounceMs = prefs.getUInt("click_db", DEFAULT_CLICK_DEBOUNCE_MS);
+  if (config.clickDebounceMs == 0) config.clickDebounceMs = DEFAULT_CLICK_DEBOUNCE_MS;
+  config.multiClickGapMs = prefs.getUInt("click_gap", DEFAULT_MULTI_CLICK_GAP_MS);
+  if (config.multiClickGapMs == 0) config.multiClickGapMs = DEFAULT_MULTI_CLICK_GAP_MS;
+  config.longPressMs = prefs.getUInt("long_ms", DEFAULT_LONG_PRESS_MS);
+  if (config.longPressMs == 0) config.longPressMs = DEFAULT_LONG_PRESS_MS;
   config.passwordEnabled = prefs.getBool("pwd_en", false);
   config.password = prefs.getString("pwd", "");
   if (!config.passwordEnabled || config.password.length() == 0) {
@@ -547,6 +576,9 @@ static void saveConfig() {
   prefs.putBool("hb_en", config.heartbeatEnabled);
   prefs.putString("hb_addr", config.heartbeatAddress);
   prefs.putUInt("hb_ms", config.heartbeatMs);
+  prefs.putUInt("click_db", config.clickDebounceMs);
+  prefs.putUInt("click_gap", config.multiClickGapMs);
+  prefs.putUInt("long_ms", config.longPressMs);
   prefs.putBool("pwd_en", config.passwordEnabled);
   prefs.putString("pwd", config.password);
 
@@ -730,6 +762,57 @@ static bool parseIpString(const String& s, IPAddress& out) {
   return true;
 }
 
+static void sendTriggerOutput(const SensorConfig& sensor, const String& addr) {
+  if (addr.length() == 0) return;
+  if (sensor.outMode == OUT_STRING) {
+    const char* value = sensor.onString.c_str();
+    if (value[0] == '\0') return;
+    sendOscString(addr.c_str(), value);
+  } else if (sensor.outMode == OUT_FLOAT) {
+    float outputValue = mapOutput(sensor, 1.0f);
+    outputValue = snapOutput(sensor, outputValue);
+    sendOscFloat(addr.c_str(), outputValue);
+  } else {
+    float outputValue = mapOutput(sensor, 1.0f);
+    outputValue = snapOutput(sensor, outputValue);
+    int intValue = lroundf(outputValue);
+    sendOscInt(addr.c_str(), intValue);
+  }
+}
+
+static void processClickPattern(int index, const SensorConfig& sensor, bool pressed, int targetClicks, bool longPress) {
+  unsigned long now = millis();
+
+  if (pressed != multiPrevPressed[index]) {
+    if (now - multiLastChangeMs[index] >= config.clickDebounceMs) {
+      multiPrevPressed[index] = pressed;
+      multiLastChangeMs[index] = now;
+      if (pressed) {
+        multiPressStartMs[index] = now;
+        multiLongFired[index] = false;
+      } else {
+        if (!multiLongFired[index]) {
+          clickCount[index]++;
+          multiLastReleaseMs[index] = now;
+        }
+      }
+    }
+  }
+
+  if (longPress && pressed && !multiLongFired[index] && (now - multiPressStartMs[index] >= config.longPressMs)) {
+    sendTriggerOutput(sensor, sensor.oscAddress);
+    multiLongFired[index] = true;
+    clickCount[index] = 0;
+  }
+
+  if (!pressed && clickCount[index] > 0 && (now - multiLastReleaseMs[index] >= config.multiClickGapMs)) {
+    if (targetClicks > 0 && clickCount[index] == targetClicks) {
+      sendTriggerOutput(sensor, sensor.oscAddress);
+    }
+    clickCount[index] = 0;
+  }
+}
+
 static void handleRoot() {
   if (!ensureAuthenticated()) return;
   String html;
@@ -795,7 +878,7 @@ static void handleRoot() {
     }
   }
   if (anyConflict) {
-    html += "<p style='color:#b00;'>Pin conflict detected: two sensors share the same GPIO.</p>";
+    html += "<p style='color:#b00;'>Pin conflict detected: two triggers share the same GPIO.</p>";
   }
 
   html += "<form method='POST' action='/'>";
@@ -839,10 +922,21 @@ static void handleRoot() {
   html += "<button type='button' id='test_send_btn'>Send</button>";
   html += "</div>";
   html += "<div class='card'>";
+  html += "<b>Firmware Update</b><br>";
+  html += "Upload a new .bin over your local network.";
+  html += " <a href='/update'>Open updater</a><br>";
+  html += "</div>";
+  html += "<div class='card'>";
   html += "<b>Heartbeat</b><br>";
   html += "Enable: <input name='hb_en' type='checkbox' " + String(config.heartbeatEnabled ? "checked" : "") + "><br>";
   html += "Address: <input name='hb_addr' type='text' value='" + config.heartbeatAddress + "'><br>";
   html += "Interval ms: <input name='hb_ms' type='number' value='" + String(config.heartbeatMs) + "'><br>";
+  html += "</div>";
+  html += "<div class='card'>";
+  html += "<b>Trigger timing</b><br>";
+  html += "Debounce ms: <input name='click_db' type='number' value='" + String(config.clickDebounceMs) + "'><br>";
+  html += "Multi-click gap ms: <input name='click_gap' type='number' value='" + String(config.multiClickGapMs) + "'><br>";
+  html += "Long press ms: <input name='long_ms' type='number' value='" + String(config.longPressMs) + "'><br>";
   html += "</div>";
   html += "<hr>";
 
@@ -850,7 +944,7 @@ static void handleRoot() {
     const SensorConfig& s = config.sensors[i];
     String idx = String(i);
     html += "<fieldset>";
-    html += "<legend><b>Sensor " + String(i + 1) + "</b></legend>";
+    html += "<legend><b>Trigger " + String(i + 1) + "</b></legend>";
     html += "Enable: <input name='s" + idx + "_en' type='checkbox' " + String(s.enabled ? "checked" : "") + "><br>";
     html += "Type: <select name='s" + idx + "_type' id='s" + idx + "_type'>";
     html += "<option value='0' " + String(s.type == SENSOR_ANALOG ? "selected" : "") + ">Analog (pot/slider)</option>";
@@ -858,6 +952,9 @@ static void handleRoot() {
     html += "<option value='2' " + String(s.type == SENSOR_TOGGLE ? "selected" : "") + ">Button (toggle)</option>";
     html += "<option value='3' " + String(s.type == SENSOR_DIGITAL ? "selected" : "") + ">Digital (touch/motion)</option>";
     html += "<option value='4' " + String(s.type == SENSOR_ENCODER ? "selected" : "") + ">Encoder</option>";
+    html += "<option value='5' " + String(s.type == SENSOR_BUTTON_DOUBLE ? "selected" : "") + ">Button (double click)</option>";
+    html += "<option value='6' " + String(s.type == SENSOR_BUTTON_TRIPLE ? "selected" : "") + ">Button (triple click)</option>";
+    html += "<option value='7' " + String(s.type == SENSOR_BUTTON_LONG ? "selected" : "") + ">Button (long press)</option>";
     html += "</select><br>";
     html += "<div id='s" + idx + "_pin_block'>";
     html += "GPIO Pin: <input name='s" + idx + "_pin' type='number' value='" + String(s.pin) + "'><br>";
@@ -885,6 +982,9 @@ static void handleRoot() {
     html += "<small>Encoder sends -1/+1 on each step.</small><br>";
     html += "</div>";
     html += "<div id='s" + idx + "_button_addr'>";
+    html += "<b>Button</b><br>";
+    html += "Button address: <input id='s" + idx + "_btn_addr' name='s" + idx + "_btn_addr' type='text' value='" + s.buttonAddress + "'><br>";
+    html += "</div>";
     html += "<b>Button</b><br>";
     html += "Button address: <input id='s" + idx + "_btn_addr' name='s" + idx + "_btn_addr' type='text' value='" + s.buttonAddress + "'><br>";
     html += "</div>";
@@ -938,7 +1038,7 @@ static void handleRoot() {
   html += "const addrInput=document.getElementById('s'+i+'_addr');";
   html += "const pin=document.getElementById('s'+i+'_pin_block');";
   html += "const enc=document.getElementById('s'+i+'_encoder');";
-  html += "const btnAddrBlock=document.getElementById('s'+i+'_button_addr');";
+    html += "const btnAddrBlock=document.getElementById('s'+i+'_button_addr');";
   html += "const cd=document.getElementById('s'+i+'_cooldown');";
   html += "const encAddr=document.getElementById('s'+i+'_enc_addr');";
   html += "const btnAddr=document.getElementById('s'+i+'_btn_addr');";
@@ -958,6 +1058,7 @@ static void handleRoot() {
   html += "pin.style.display=isEnc?'none':'block';";
   html += "enc.style.display=isEnc?'block':'none';";
   html += "btnAddrBlock.style.display=isEnc?'block':'none';";
+  html += "";
   html += "if(addrInput){addrInput.disabled=isEnc;}";
   html += "if(encAddr){encAddr.disabled=!isEnc;}";
   html += "if(btnAddr){btnAddr.disabled=!isEnc;}";
@@ -1133,6 +1234,18 @@ static void handleSave() {
     uint32_t ms = static_cast<uint32_t>(server.arg("hb_ms").toInt());
     if (ms > 0) config.heartbeatMs = ms;
   }
+  if (server.hasArg("click_db")) {
+    uint32_t ms = static_cast<uint32_t>(server.arg("click_db").toInt());
+    if (ms > 0) config.clickDebounceMs = ms;
+  }
+  if (server.hasArg("click_gap")) {
+    uint32_t ms = static_cast<uint32_t>(server.arg("click_gap").toInt());
+    if (ms > 0) config.multiClickGapMs = ms;
+  }
+  if (server.hasArg("long_ms")) {
+    uint32_t ms = static_cast<uint32_t>(server.arg("long_ms").toInt());
+    if (ms > 0) config.longPressMs = ms;
+  }
 
   for (int i = 0; i < MAX_SENSORS; i++) {
     SensorConfig s = config.sensors[i];
@@ -1278,6 +1391,50 @@ static void handleReset() {
   doFactoryReset(true);
 }
 
+static void handleUpdatePage() {
+  if (!ensureAuthenticated()) return;
+  String html;
+  html.reserve(1600);
+  html += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>StageMod Firmware Update</title>";
+  html += "<style>body{font-family:'Avenir Next','Trebuchet MS','Segoe UI',sans-serif;background:#f4f1ea;color:#1a1a1a;padding:20px;}";
+  html += ".card{background:#fff;border:1px solid #ddd;border-radius:12px;padding:16px;max-width:520px;}";
+  html += "button{border:1px solid #b9b9b9;background:#0b6b6f;color:#fff;padding:8px 12px;border-radius:8px;cursor:pointer;}";
+  html += "</style></head><body>";
+  html += "<div class='card'>";
+  html += "<h2>Firmware Update</h2>";
+  html += "<p>Upload a new firmware .bin over your local network. Internet is not required.</p>";
+  html += "<form method='POST' action='/update' enctype='multipart/form-data'>";
+  html += "<input type='file' name='update' accept='.bin'><br><br>";
+  html += "<button type='submit'>Install Update</button>";
+  html += "</form>";
+  html += "<p><a href='/'>Back to settings</a></p>";
+  html += "</div></body></html>";
+  server.send(200, "text/html", html);
+}
+
+static void handleUpdateFinished() {
+  if (!ensureAuthenticated()) return;
+  bool ok = !Update.hasError();
+  server.sendHeader("Connection", "close");
+  server.send(200, "text/plain", ok ? "Update successful. Rebooting..." : "Update failed.");
+  delay(200);
+  if (ok) {
+    ESP.restart();
+  }
+}
+
+static void handleUpdateUpload() {
+  HTTPUpload& upload = server.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    Update.begin(UPDATE_SIZE_UNKNOWN);
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    Update.write(upload.buf, upload.currentSize);
+  } else if (upload.status == UPLOAD_FILE_END) {
+    Update.end(true);
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(300);
@@ -1310,6 +1467,8 @@ void setup() {
   server.on("/save", HTTP_POST, handleSave);
   server.on("/send_test", HTTP_POST, handleSendTestOsc);
   server.on("/reset", HTTP_POST, handleReset);
+  server.on("/update", HTTP_GET, handleUpdatePage);
+  server.on("/update", HTTP_POST, handleUpdateFinished, handleUpdateUpload);
   server.on("/pinout.png", HTTP_GET, []() {
     if (!littleFsOk) {
       server.send(404, "text/plain", "Not found");
@@ -1406,6 +1565,22 @@ void loop() {
 
       bool pressed = (digitalRead(s.encSwPin) == LOW);
       norm = pressed ? 1.0f : 0.0f;
+    }
+
+    if (s.type == SENSOR_BUTTON_DOUBLE) {
+      bool pressed = readDigitalActive(s);
+      processClickPattern(i, s, pressed, 2, false);
+      continue;
+    }
+    if (s.type == SENSOR_BUTTON_TRIPLE) {
+      bool pressed = readDigitalActive(s);
+      processClickPattern(i, s, pressed, 3, false);
+      continue;
+    }
+    if (s.type == SENSOR_BUTTON_LONG) {
+      bool pressed = readDigitalActive(s);
+      processClickPattern(i, s, pressed, 0, true);
+      continue;
     }
 
     if (outAddress.length() == 0) continue;
