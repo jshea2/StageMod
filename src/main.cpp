@@ -16,11 +16,13 @@
 #include <WiFiUdp.h>
 #include <time.h>
 #include <sys/time.h>
+#include "driver/pcnt.h"
 #ifndef WEBSERVER_MAX_POST_ARGS
 #define WEBSERVER_MAX_POST_ARGS 800
 #endif
 #include <WebServer.h>
 #include <Update.h>
+#include <ArduinoJson.h>
 
 // =========================
 // Config (edit these)
@@ -62,7 +64,8 @@ enum SensorType {
   SENSOR_BUTTON_DOUBLE = 5,
   SENSOR_BUTTON_TRIPLE = 6,
   SENSOR_BUTTON_LONG = 7,
-  SENSOR_GPIO = 8
+  SENSOR_GPIO = 8,
+  SENSOR_HCSR04 = 9
 };
 
 enum SensorSource {
@@ -115,7 +118,7 @@ const bool DEFAULT_INVERT = false;
 const float DEFAULT_OUT_MIN = 0.0f;
 const float DEFAULT_OUT_MAX = 100.0f;
 const OutputMode DEFAULT_OUT_MODE = OUT_INT;
-const bool DEFAULT_DIGITAL_ACTIVE_HIGH = true;
+const bool DEFAULT_DIGITAL_ACTIVE_HIGH = false;
 const bool DEFAULT_DIGITAL_PULLUP = true;
 const char* DEFAULT_ON_STRING = "on";
 const char* DEFAULT_OFF_STRING = "off";
@@ -132,12 +135,15 @@ const unsigned long RESET_ARM_MS = 500;
 // Behavior
 const int LOOP_DELAY_MS = 10;                  // read/send cycle
 const int SAMPLES       = 8;                   // oversample to calm noise
-const float ALPHA       = 0.30f;               // exponential smoothing 0..1
+const float ALPHA       = 0.30f;               // potentiometer smoothing 0..1
+const float ALPHA_HC    = 0.20f;               // ultrasonic smoothing 0..1
 const int DEAD_BAND     = 1;                   // percent hysteresis to stop flicker
 
 const uint32_t DEFAULT_CLICK_DEBOUNCE_MS = 30;   // debounce for buttons
 const uint32_t DEFAULT_MULTI_CLICK_GAP_MS = 350; // max gap between clicks
 const uint32_t DEFAULT_LONG_PRESS_MS = 2000;     // long-press threshold
+const uint8_t DEFAULT_ENC_STEPS = 2;             // encoder steps per output (fixed)
+const bool DEFAULT_ANALOG_SMOOTHING = true;
 
 const uint16_t LOCAL_PORT = 9000;              // Local UDP port
 const float SNAP_PERCENT = 1.0f;               // snap edges to min/max
@@ -164,9 +170,17 @@ struct SensorConfig {
   int encClkPin;
   int encDtPin;
   int encSwPin;
+  bool encAppendSign;
+  bool encSignArg;
+  bool encInvert;
+  uint8_t encSteps;
   bool invert;
   bool activeHigh;
   bool pullup;
+  int hcTrigPin;
+  int hcEchoPin;
+  float hcMinCm;
+  float hcMaxCm;
   bool cooldownEnabled;
   uint32_t cooldownMs;
   uint8_t outputCount;
@@ -178,6 +192,9 @@ struct SensorConfig {
     float outMin;
     float outMax;
     OutputMode outMode;
+    float buttonOutMin;
+    float buttonOutMax;
+    OutputMode buttonOutMode;
     bool sendMinOnRelease;
     String udpPayload;
     int8_t gpioPin;
@@ -192,6 +209,8 @@ struct SensorConfig {
     uint8_t httpDevice;
     String onString;
     String offString;
+    String buttonOnString;
+    String buttonOffString;
   } outputs[MAX_OUTPUTS_PER_TRIGGER];
   TimeTriggerType timeType;
   uint16_t timeYear;
@@ -224,6 +243,7 @@ struct Config {
   uint32_t clickDebounceMs;
   uint32_t multiClickGapMs;
   uint32_t longPressMs;
+  bool analogSmoothing;
   uint8_t timeMode;
   String ntpServer;
   String timeZone;
@@ -249,6 +269,7 @@ int8_t lastEncA[MAX_TRIGGERS];
 int8_t lastEncB[MAX_TRIGGERS];
 int8_t lastEncState[MAX_TRIGGERS];
 int8_t encAccum[MAX_TRIGGERS];
+int8_t encUnitByTrigger[MAX_TRIGGERS];
 uint32_t lastButtonTriggerMs[MAX_TRIGGERS];
 uint32_t hbLastSent[MAX_OSC_DEVICES];
 uint8_t clickCount[MAX_TRIGGERS];
@@ -283,6 +304,7 @@ const int LOG_LINES = 120;
 String logLines[LOG_LINES];
 int logHead = 0;
 int logCount = 0;
+String importPayload;
 
 static String ipToString(const IPAddress& ip);
 static bool parseIpString(const String& s, IPAddress& out);
@@ -293,6 +315,9 @@ static void addLog(const String& msg);
 static bool parseOrderList(const String& s, uint8_t* order, uint8_t& count);
 static String buildOrderList(const uint8_t* order, uint8_t count);
 static int findUnusedTrigger();
+static bool isAllowedAnalogPin(int pin);
+static bool isAllowedDigitalPin(int pin);
+static int defaultSensorPin(int index);
 static String jsonEscape(const String& s);
 static void clearSensorKeys(int index);
 static void clearDeviceKeys(int index);
@@ -307,6 +332,9 @@ static bool parseDateYMD(const String& dateStr, uint16_t& y, uint8_t& m, uint8_t
 static bool parseTimeHMS(const String& timeStr, uint8_t& h, uint8_t& m, uint8_t& s);
 static void sendOutputNow(const SensorConfig& sensor, const SensorConfig::OutputConfig& out, const String& addr, float norm);
 static bool handleTimeTrigger(int index, SensorConfig& s);
+static int compareVersion(const String& a, const String& b);
+static String exportConfigJson();
+static bool applyConfigFromJson(const JsonObject& cfg, String& err);
 
 static int readAveragedADC(int pin) {
   uint32_t acc = 0;
@@ -352,11 +380,62 @@ static float readAnalogNormalized(int index, const SensorConfig& sensor) {
     Serial.println(raw);
     addLog(String("ADC GPIO") + String(sensor.pin) + " raw " + String(raw));
   }
-  if (ema[index] < 0) ema[index] = raw;
-  ema[index] = ALPHA * raw + (1.0f - ALPHA) * ema[index];
-  float norm = ema[index] / 4095.0f;
+  float norm = 0.0f;
+  if (config.analogSmoothing) {
+    if (ema[index] < 0) ema[index] = raw;
+    ema[index] = ALPHA * raw + (1.0f - ALPHA) * ema[index];
+    norm = ema[index] / 4095.0f;
+  } else {
+    norm = raw / 4095.0f;
+  }
   norm = clampFloat(norm, 0.0f, 1.0f);
   if (sensor.invert) norm = 1.0f - norm;
+  return norm;
+}
+
+static float readHcSr04Normalized(int index, const SensorConfig& sensor) {
+  digitalWrite(sensor.hcTrigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(sensor.hcTrigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(sensor.hcTrigPin, LOW);
+
+  unsigned long duration = pulseIn(sensor.hcEchoPin, HIGH, 25000); // ~4m max
+  float dist = (duration == 0) ? -1.0f : (duration / 58.0f);
+  if (dist < 0) {
+    if (ema[index] >= 0) {
+      float norm = ema[index] / 4095.0f;
+      norm = clampFloat(norm, 0.0f, 1.0f);
+      if (sensor.invert) norm = 1.0f - norm;
+      return norm;
+    }
+    return 0.0f;
+  }
+
+  float minCm = sensor.hcMinCm;
+  float maxCm = sensor.hcMaxCm;
+  bool invertRange = false;
+  if (maxCm < minCm) {
+    float tmp = minCm;
+    minCm = maxCm;
+    maxCm = tmp;
+    invertRange = true;
+  }
+  if (maxCm == minCm) {
+    return 0.0f;
+  }
+  float norm = (dist - minCm) / (maxCm - minCm);
+  if (invertRange) norm = 1.0f - norm;
+  norm = clampFloat(norm, 0.0f, 1.0f);
+  if (sensor.invert) norm = 1.0f - norm;
+
+  if (config.analogSmoothing) {
+    float raw = norm * 4095.0f;
+    if (ema[index] < 0) ema[index] = raw;
+    ema[index] = ALPHA_HC * raw + (1.0f - ALPHA_HC) * ema[index];
+    norm = ema[index] / 4095.0f;
+    norm = clampFloat(norm, 0.0f, 1.0f);
+  }
   return norm;
 }
 
@@ -376,9 +455,30 @@ static float mapOutput(const SensorConfig::OutputConfig& outCfg, float norm) {
   return clampFloat(out, outCfg.outMax, outCfg.outMin);
 }
 
+static float mapOutputRange(float norm, float minV, float maxV) {
+  if (norm <= 0.015f) return minV;
+  if (norm >= 0.985f) return maxV;
+  float out = minV + norm * (maxV - minV);
+  if (minV < maxV) {
+    return clampFloat(out, minV, maxV);
+  }
+  return clampFloat(out, maxV, minV);
+}
+
 static float snapOutput(const SensorConfig::OutputConfig& outCfg, float value) {
   float minV = outCfg.outMin;
   float maxV = outCfg.outMax;
+  float span = fabsf(maxV - minV);
+  if (span <= 0.0f) return value;
+  float snap = (SNAP_PERCENT / 100.0f) * span;
+  float low = (minV < maxV) ? minV : maxV;
+  float high = (minV < maxV) ? maxV : minV;
+  if (value <= low + snap) return minV;
+  if (value >= high - snap) return maxV;
+  return value;
+}
+
+static float snapOutputRange(float value, float minV, float maxV) {
   float span = fabsf(maxV - minV);
   if (span <= 0.0f) return value;
   float snap = (SNAP_PERCENT / 100.0f) * span;
@@ -451,6 +551,318 @@ static String jsonEscape(const String& s) {
   return out;
 }
 
+static int compareVersion(const String& a, const String& b) {
+  int ap[3] = {0, 0, 0};
+  int bp[3] = {0, 0, 0};
+  auto parse = [](const String& v, int* out) {
+    int idx = 0;
+    int val = 0;
+    for (size_t i = 0; i < v.length(); i++) {
+      char c = v[i];
+      if (c >= '0' && c <= '9') {
+        val = val * 10 + (c - '0');
+      } else if (c == '.') {
+        if (idx < 3) out[idx++] = val;
+        val = 0;
+      }
+    }
+    if (idx < 3) out[idx++] = val;
+    while (idx < 3) out[idx++] = 0;
+  };
+  parse(a, ap);
+  parse(b, bp);
+  for (int i = 0; i < 3; i++) {
+    if (ap[i] < bp[i]) return -1;
+    if (ap[i] > bp[i]) return 1;
+  }
+  return 0;
+}
+
+static String exportConfigJson() {
+  DynamicJsonDocument doc(32768);
+  doc["version"] = FIRMWARE_VERSION;
+  JsonObject c = doc.createNestedObject("config");
+  c["username"] = config.username;
+  c["testDevice"] = config.testDevice;
+  c["clickDebounceMs"] = config.clickDebounceMs;
+  c["multiClickGapMs"] = config.multiClickGapMs;
+  c["longPressMs"] = config.longPressMs;
+  c["analogSmoothing"] = config.analogSmoothing;
+  c["timeMode"] = config.timeMode;
+  c["ntpServer"] = config.ntpServer;
+  c["timeZone"] = config.timeZone;
+  c["manualEpoch"] = config.manualEpoch;
+  c["timeDisplay24h"] = config.timeDisplay24h;
+
+  c["oscDeviceCount"] = config.oscDeviceCount;
+  JsonArray devOrder = c.createNestedArray("oscDeviceOrder");
+  for (int i = 0; i < config.oscDeviceCount; i++) {
+    devOrder.add(config.oscDeviceOrder[i]);
+  }
+  JsonArray devs = c.createNestedArray("oscDevices");
+  for (int i = 0; i < MAX_OSC_DEVICES; i++) {
+    const OscDevice& d = config.oscDevices[i];
+    JsonObject od = devs.createNestedObject();
+    od["index"] = i;
+    od["enabled"] = d.enabled;
+    od["name"] = d.name;
+    od["ip"] = ipToString(d.ip);
+    od["port"] = d.port;
+    od["hbEnabled"] = d.hbEnabled;
+    od["hbAddress"] = d.hbAddress;
+    od["hbMs"] = d.hbMs;
+  }
+
+  c["triggerCount"] = config.triggerCount;
+  JsonArray trOrder = c.createNestedArray("triggerOrder");
+  for (int i = 0; i < config.triggerCount; i++) {
+    trOrder.add(config.triggerOrder[i]);
+  }
+  JsonArray sensors = c.createNestedArray("sensors");
+  for (int i = 0; i < MAX_TRIGGERS; i++) {
+    const SensorConfig& s = config.sensors[i];
+    JsonObject so = sensors.createNestedObject();
+    so["index"] = i;
+    so["enabled"] = s.enabled;
+    so["name"] = s.name;
+    so["source"] = static_cast<int>(s.source);
+    so["type"] = static_cast<int>(s.type);
+    so["pin"] = s.pin;
+    so["encClkPin"] = s.encClkPin;
+    so["encDtPin"] = s.encDtPin;
+    so["encSwPin"] = s.encSwPin;
+    so["encAppendSign"] = s.encAppendSign;
+    so["encSignArg"] = s.encSignArg;
+    so["encInvert"] = s.encInvert;
+    so["invert"] = s.invert;
+    so["activeHigh"] = s.activeHigh;
+    so["pullup"] = s.pullup;
+    so["hcTrigPin"] = s.hcTrigPin;
+    so["hcEchoPin"] = s.hcEchoPin;
+    so["hcMinCm"] = s.hcMinCm;
+    so["hcMaxCm"] = s.hcMaxCm;
+    so["cooldownEnabled"] = s.cooldownEnabled;
+    so["cooldownMs"] = s.cooldownMs;
+    so["outputCount"] = s.outputCount;
+    JsonArray outs = so.createNestedArray("outputs");
+    for (int o = 0; o < s.outputCount && o < MAX_OUTPUTS_PER_TRIGGER; o++) {
+      const SensorConfig::OutputConfig& out = s.outputs[o];
+      JsonObject oo = outs.createNestedObject();
+      oo["index"] = o;
+      oo["target"] = static_cast<int>(out.target);
+      oo["device"] = out.device;
+      oo["oscAddress"] = out.oscAddress;
+      oo["buttonAddress"] = out.buttonAddress;
+      oo["outMin"] = out.outMin;
+      oo["outMax"] = out.outMax;
+      oo["outMode"] = static_cast<int>(out.outMode);
+      oo["buttonOutMin"] = out.buttonOutMin;
+      oo["buttonOutMax"] = out.buttonOutMax;
+      oo["buttonOutMode"] = static_cast<int>(out.buttonOutMode);
+      oo["sendMinOnRelease"] = out.sendMinOnRelease;
+      oo["udpPayload"] = out.udpPayload;
+      oo["gpioPin"] = out.gpioPin;
+      oo["gpioMode"] = static_cast<int>(out.gpioMode);
+      oo["gpioPulseMs"] = out.gpioPulseMs;
+      oo["gpioInvert"] = out.gpioInvert;
+      oo["httpMethod"] = static_cast<int>(out.httpMethod);
+      oo["httpUrl"] = out.httpUrl;
+      oo["httpBody"] = out.httpBody;
+      oo["httpIp"] = out.httpIp;
+      oo["httpPort"] = out.httpPort;
+      oo["httpDevice"] = out.httpDevice;
+      oo["onString"] = out.onString;
+      oo["offString"] = out.offString;
+      oo["buttonOnString"] = out.buttonOnString;
+      oo["buttonOffString"] = out.buttonOffString;
+    }
+    so["timeType"] = static_cast<int>(s.timeType);
+    so["timeYear"] = s.timeYear;
+    so["timeMonth"] = s.timeMonth;
+    so["timeDay"] = s.timeDay;
+    so["timeHour"] = s.timeHour;
+    so["timeMinute"] = s.timeMinute;
+    so["timeSecond"] = s.timeSecond;
+    so["weeklyMask"] = s.weeklyMask;
+    so["intervalSeconds"] = s.intervalSeconds;
+  }
+
+  String out;
+  serializeJson(doc, out);
+  return out;
+}
+
+static bool applyConfigFromJson(const JsonObject& cfg, String& err) {
+  if (cfg.isNull()) {
+    err = "Missing config object.";
+    return false;
+  }
+
+  if (cfg.containsKey("username")) config.username = String(cfg["username"].as<const char*>());
+  if (cfg.containsKey("testDevice")) {
+    int v = cfg["testDevice"];
+    if (v >= 0 && v < MAX_OSC_DEVICES) config.testDevice = static_cast<uint8_t>(v);
+  }
+  if (cfg.containsKey("clickDebounceMs")) config.clickDebounceMs = cfg["clickDebounceMs"];
+  if (cfg.containsKey("multiClickGapMs")) config.multiClickGapMs = cfg["multiClickGapMs"];
+  if (cfg.containsKey("longPressMs")) config.longPressMs = cfg["longPressMs"];
+  if (cfg.containsKey("analogSmoothing")) config.analogSmoothing = cfg["analogSmoothing"];
+  if (cfg.containsKey("timeMode")) {
+    int mode = cfg["timeMode"];
+    if (mode == TIME_NTP || mode == TIME_MANUAL) config.timeMode = mode;
+  }
+  if (cfg.containsKey("ntpServer")) config.ntpServer = String(cfg["ntpServer"].as<const char*>());
+  if (cfg.containsKey("timeZone")) config.timeZone = String(cfg["timeZone"].as<const char*>());
+  if (cfg.containsKey("manualEpoch")) config.manualEpoch = cfg["manualEpoch"];
+  if (cfg.containsKey("timeDisplay24h")) config.timeDisplay24h = cfg["timeDisplay24h"];
+
+  if (cfg.containsKey("oscDeviceCount")) {
+    int count = cfg["oscDeviceCount"];
+    if (count < 1) count = 1;
+    if (count > MAX_OSC_DEVICES) count = MAX_OSC_DEVICES;
+    config.oscDeviceCount = static_cast<uint8_t>(count);
+  }
+  JsonArray devOrder = cfg["oscDeviceOrder"].as<JsonArray>();
+  if (!devOrder.isNull()) {
+    uint8_t count = 0;
+    for (JsonVariant v : devOrder) {
+      int idx = v.as<int>();
+      if (idx >= 0 && idx < MAX_OSC_DEVICES) config.oscDeviceOrder[count++] = static_cast<uint8_t>(idx);
+      if (count >= config.oscDeviceCount) break;
+    }
+    if (count == 0) {
+      for (int i = 0; i < config.oscDeviceCount; i++) config.oscDeviceOrder[i] = i;
+    }
+  }
+  JsonArray devs = cfg["oscDevices"].as<JsonArray>();
+  if (!devs.isNull()) {
+    for (JsonObject d : devs) {
+      int idx = d["index"] | -1;
+      if (idx < 0 || idx >= MAX_OSC_DEVICES) continue;
+      OscDevice od = config.oscDevices[idx];
+      if (d.containsKey("enabled")) od.enabled = d["enabled"];
+      if (d.containsKey("name")) od.name = String(d["name"].as<const char*>());
+      if (d.containsKey("ip")) {
+        IPAddress ip;
+        if (parseIpString(String(d["ip"].as<const char*>()), ip)) od.ip = ip;
+      }
+      if (d.containsKey("port")) od.port = d["port"];
+      if (d.containsKey("hbEnabled")) od.hbEnabled = d["hbEnabled"];
+      if (d.containsKey("hbAddress")) od.hbAddress = String(d["hbAddress"].as<const char*>());
+      if (d.containsKey("hbMs")) od.hbMs = d["hbMs"];
+      config.oscDevices[idx] = od;
+    }
+  }
+
+  if (cfg.containsKey("triggerCount")) {
+    int count = cfg["triggerCount"];
+    if (count < 1) count = 1;
+    if (count > MAX_TRIGGERS) count = MAX_TRIGGERS;
+    config.triggerCount = static_cast<uint8_t>(count);
+  }
+  JsonArray trOrder = cfg["triggerOrder"].as<JsonArray>();
+  if (!trOrder.isNull()) {
+    uint8_t count = 0;
+    for (JsonVariant v : trOrder) {
+      int idx = v.as<int>();
+      if (idx >= 0 && idx < MAX_TRIGGERS) config.triggerOrder[count++] = static_cast<uint8_t>(idx);
+      if (count >= config.triggerCount) break;
+    }
+    if (count == 0) {
+      for (int i = 0; i < config.triggerCount; i++) config.triggerOrder[i] = i;
+    }
+  }
+  JsonArray sensors = cfg["sensors"].as<JsonArray>();
+  if (!sensors.isNull()) {
+    for (JsonObject so : sensors) {
+      int idx = so["index"] | -1;
+      if (idx < 0 || idx >= MAX_TRIGGERS) continue;
+      SensorConfig s = config.sensors[idx];
+      if (so.containsKey("enabled")) s.enabled = so["enabled"];
+      if (so.containsKey("name")) s.name = String(so["name"].as<const char*>());
+      if (so.containsKey("source")) s.source = static_cast<SensorSource>(so["source"].as<int>());
+      if (so.containsKey("type")) s.type = static_cast<SensorType>(so["type"].as<int>());
+      if (so.containsKey("pin")) s.pin = so["pin"];
+      if (so.containsKey("encClkPin")) s.encClkPin = so["encClkPin"];
+      if (so.containsKey("encDtPin")) s.encDtPin = so["encDtPin"];
+      if (so.containsKey("encSwPin")) s.encSwPin = so["encSwPin"];
+      if (so.containsKey("encAppendSign")) s.encAppendSign = so["encAppendSign"];
+      if (so.containsKey("encSignArg")) s.encSignArg = so["encSignArg"];
+      if (so.containsKey("encInvert")) s.encInvert = so["encInvert"];
+      if (so.containsKey("invert")) s.invert = so["invert"];
+      if (so.containsKey("activeHigh")) s.activeHigh = so["activeHigh"];
+      if (so.containsKey("pullup")) s.pullup = so["pullup"];
+      if (so.containsKey("hcTrigPin")) s.hcTrigPin = so["hcTrigPin"];
+      if (so.containsKey("hcEchoPin")) s.hcEchoPin = so["hcEchoPin"];
+      if (so.containsKey("hcMinCm")) s.hcMinCm = so["hcMinCm"];
+      if (so.containsKey("hcMaxCm")) s.hcMaxCm = so["hcMaxCm"];
+      if (so.containsKey("cooldownEnabled")) s.cooldownEnabled = so["cooldownEnabled"];
+      if (so.containsKey("cooldownMs")) s.cooldownMs = so["cooldownMs"];
+      if (so.containsKey("outputCount")) {
+        int oc = so["outputCount"];
+        if (oc < 1) oc = 1;
+        if (oc > MAX_OUTPUTS_PER_TRIGGER) oc = MAX_OUTPUTS_PER_TRIGGER;
+        s.outputCount = static_cast<uint8_t>(oc);
+      }
+      JsonArray outs = so["outputs"].as<JsonArray>();
+      if (!outs.isNull()) {
+        for (JsonObject oo : outs) {
+          int oidx = oo["index"] | -1;
+          if (oidx < 0 || oidx >= MAX_OUTPUTS_PER_TRIGGER) continue;
+          SensorConfig::OutputConfig out = s.outputs[oidx];
+          if (oo.containsKey("target")) out.target = static_cast<OutputTarget>(oo["target"].as<int>());
+          if (oo.containsKey("device")) out.device = oo["device"];
+          if (oo.containsKey("oscAddress")) out.oscAddress = String(oo["oscAddress"].as<const char*>());
+          if (oo.containsKey("buttonAddress")) out.buttonAddress = String(oo["buttonAddress"].as<const char*>());
+          if (oo.containsKey("outMin")) out.outMin = oo["outMin"];
+          if (oo.containsKey("outMax")) out.outMax = oo["outMax"];
+          if (oo.containsKey("outMode")) out.outMode = static_cast<OutputMode>(oo["outMode"].as<int>());
+          if (oo.containsKey("buttonOutMin")) out.buttonOutMin = oo["buttonOutMin"];
+          if (oo.containsKey("buttonOutMax")) out.buttonOutMax = oo["buttonOutMax"];
+          if (oo.containsKey("buttonOutMode")) out.buttonOutMode = static_cast<OutputMode>(oo["buttonOutMode"].as<int>());
+          if (oo.containsKey("sendMinOnRelease")) out.sendMinOnRelease = oo["sendMinOnRelease"];
+          if (oo.containsKey("udpPayload")) out.udpPayload = String(oo["udpPayload"].as<const char*>());
+          if (oo.containsKey("gpioPin")) out.gpioPin = oo["gpioPin"];
+          if (oo.containsKey("gpioMode")) out.gpioMode = static_cast<GpioOutMode>(oo["gpioMode"].as<int>());
+          if (oo.containsKey("gpioPulseMs")) out.gpioPulseMs = oo["gpioPulseMs"];
+          if (oo.containsKey("gpioInvert")) out.gpioInvert = oo["gpioInvert"];
+          if (oo.containsKey("httpMethod")) out.httpMethod = static_cast<HttpMethod>(oo["httpMethod"].as<int>());
+          if (oo.containsKey("httpUrl")) out.httpUrl = String(oo["httpUrl"].as<const char*>());
+          if (oo.containsKey("httpBody")) out.httpBody = String(oo["httpBody"].as<const char*>());
+          if (oo.containsKey("httpIp")) out.httpIp = String(oo["httpIp"].as<const char*>());
+          if (oo.containsKey("httpPort")) out.httpPort = oo["httpPort"];
+          if (oo.containsKey("httpDevice")) out.httpDevice = oo["httpDevice"];
+          if (oo.containsKey("onString")) out.onString = String(oo["onString"].as<const char*>());
+          if (oo.containsKey("offString")) out.offString = String(oo["offString"].as<const char*>());
+          if (oo.containsKey("buttonOnString")) out.buttonOnString = String(oo["buttonOnString"].as<const char*>());
+          if (oo.containsKey("buttonOffString")) out.buttonOffString = String(oo["buttonOffString"].as<const char*>());
+          s.outputs[oidx] = out;
+        }
+      }
+      if (so.containsKey("timeType")) s.timeType = static_cast<TimeTriggerType>(so["timeType"].as<int>());
+      if (so.containsKey("timeYear")) s.timeYear = so["timeYear"];
+      if (so.containsKey("timeMonth")) s.timeMonth = so["timeMonth"];
+      if (so.containsKey("timeDay")) s.timeDay = so["timeDay"];
+      if (so.containsKey("timeHour")) s.timeHour = so["timeHour"];
+      if (so.containsKey("timeMinute")) s.timeMinute = so["timeMinute"];
+      if (so.containsKey("timeSecond")) s.timeSecond = so["timeSecond"];
+      if (so.containsKey("weeklyMask")) s.weeklyMask = so["weeklyMask"];
+      if (so.containsKey("intervalSeconds")) s.intervalSeconds = so["intervalSeconds"];
+
+      if (!isAllowedDigitalPin(s.pin) && s.type != SENSOR_ANALOG) s.pin = defaultSensorPin(idx);
+      if (!isAllowedAnalogPin(s.pin) && s.type == SENSOR_ANALOG) s.pin = defaultSensorPin(idx);
+      if (!isAllowedDigitalPin(s.encClkPin)) s.encClkPin = 13;
+      if (!isAllowedDigitalPin(s.encDtPin)) s.encDtPin = 16;
+      if (!isAllowedDigitalPin(s.encSwPin)) s.encSwPin = 33;
+      if (!isAllowedDigitalPin(s.hcTrigPin)) s.hcTrigPin = 13;
+      if (!isAllowedDigitalPin(s.hcEchoPin)) s.hcEchoPin = 16;
+      config.sensors[idx] = s;
+    }
+  }
+
+  return true;
+}
+
 static void startWifiAp() {
   String apSsid = buildApSsid();
   WiFi.mode(WIFI_AP_STA);
@@ -493,7 +905,7 @@ static int defaultSensorPin(int index) {
 }
 
 static SensorType sanitizeSensorType(int value) {
-  if (value < SENSOR_ANALOG || value > SENSOR_GPIO) return SENSOR_ANALOG;
+  if (value < SENSOR_ANALOG || value > SENSOR_HCSR04) return SENSOR_ANALOG;
   if (value == SENSOR_DIGITAL) return SENSOR_BUTTON;
   return static_cast<SensorType>(value);
 }
@@ -542,6 +954,8 @@ static bool isInputPinInUse(int pin, int triggerIndex, const SensorConfig& curre
     if (s.source == SRC_TIME) continue;
     if (s.type == SENSOR_ENCODER) {
       if (s.encClkPin == pin || s.encDtPin == pin || s.encSwPin == pin) return true;
+    } else if (s.type == SENSOR_HCSR04) {
+      if (s.hcTrigPin == pin || s.hcEchoPin == pin) return true;
     } else {
       if (s.pin == pin) return true;
     }
@@ -585,11 +999,19 @@ static SensorConfig defaultSensorConfig(int index) {
   s.enabled = (index == 0);
   s.name = String("Trigger ") + String(index + 1);
   s.source = SRC_SENSORS;
-  s.type = (index == 0) ? SENSOR_ANALOG : SENSOR_BUTTON;
+  s.type = SENSOR_BUTTON;
   s.pin = defaultSensorPin(index);
   s.encClkPin = 13;
   s.encDtPin = 16;
   s.encSwPin = 33;
+  s.encAppendSign = false;
+  s.encSignArg = false;
+  s.encInvert = true;
+  s.encSteps = DEFAULT_ENC_STEPS;
+  s.hcTrigPin = 13;
+  s.hcEchoPin = 16;
+  s.hcMinCm = 2.0f;
+  s.hcMaxCm = 400.0f;
   s.invert = DEFAULT_INVERT;
   s.activeHigh = DEFAULT_DIGITAL_ACTIVE_HIGH;
   s.pullup = DEFAULT_DIGITAL_PULLUP;
@@ -605,6 +1027,9 @@ static SensorConfig defaultSensorConfig(int index) {
     s.outputs[o].outMin = DEFAULT_OUT_MIN;
     s.outputs[o].outMax = DEFAULT_OUT_MAX;
     s.outputs[o].outMode = DEFAULT_OUT_MODE;
+    s.outputs[o].buttonOutMin = DEFAULT_OUT_MIN;
+    s.outputs[o].buttonOutMax = DEFAULT_OUT_MAX;
+    s.outputs[o].buttonOutMode = DEFAULT_OUT_MODE;
     s.outputs[o].sendMinOnRelease = defaultSendMin;
     s.outputs[o].udpPayload = "";
     s.outputs[o].gpioPin = 5;
@@ -619,6 +1044,8 @@ static SensorConfig defaultSensorConfig(int index) {
     s.outputs[o].httpDevice = 0;
     s.outputs[o].onString = DEFAULT_ON_STRING;
     s.outputs[o].offString = DEFAULT_OFF_STRING;
+    s.outputs[o].buttonOnString = DEFAULT_ON_STRING;
+    s.outputs[o].buttonOffString = DEFAULT_OFF_STRING;
   }
   s.timeType = TIME_DAILY;
   s.timeYear = 2025;
@@ -807,6 +1234,7 @@ static void resetRuntimeState(bool keepOutputState = false) {
     lastEncB[i] = -1;
     lastEncState[i] = -1;
     encAccum[i] = 0;
+    encUnitByTrigger[i] = -1;
     lastButtonTriggerMs[i] = 0;
     clickCount[i] = 0;
     multiPrevPressed[i] = false;
@@ -852,6 +1280,8 @@ static void clearSensorKeys(int index) {
   removeIfExists(sensorKey(index, "clk"));
   removeIfExists(sensorKey(index, "dt"));
   removeIfExists(sensorKey(index, "sw"));
+  removeIfExists(sensorKey(index, "enc_app"));
+  removeIfExists(sensorKey(index, "enc_arg"));
   removeIfExists(sensorKey(index, "inv"));
   removeIfExists(sensorKey(index, "ah"));
   removeIfExists(sensorKey(index, "pu"));
@@ -863,6 +1293,11 @@ static void clearSensorKeys(int index) {
   removeIfExists(sensorKey(index, "omin"));
   removeIfExists(sensorKey(index, "omax"));
   removeIfExists(sensorKey(index, "omode"));
+  removeIfExists(sensorKey(index, "bmin"));
+  removeIfExists(sensorKey(index, "bmax"));
+  removeIfExists(sensorKey(index, "bmode"));
+  removeIfExists(sensorKey(index, "bon"));
+  removeIfExists(sensorKey(index, "boff"));
   removeIfExists(sensorKey(index, "ot"));
   removeIfExists(sensorKey(index, "od"));
   removeIfExists(sensorKey(index, "on"));
@@ -875,6 +1310,11 @@ static void clearSensorKeys(int index) {
     removeIfExists(outputKey(index, o, "omin"));
     removeIfExists(outputKey(index, o, "omax"));
     removeIfExists(outputKey(index, o, "omode"));
+    removeIfExists(outputKey(index, o, "bmin"));
+    removeIfExists(outputKey(index, o, "bmax"));
+    removeIfExists(outputKey(index, o, "bmode"));
+    removeIfExists(outputKey(index, o, "bon"));
+    removeIfExists(outputKey(index, o, "boff"));
     removeIfExists(outputKey(index, o, "smin"));
     removeIfExists(outputKey(index, o, "udp"));
     removeIfExists(outputKey(index, o, "gpin"));
@@ -923,13 +1363,51 @@ static void applySensorPinModes() {
     const SensorConfig& sensor = config.sensors[i];
     if (!sensor.enabled) continue;
     if (sensor.source == SRC_TIME) continue;
-    if (sensor.type == SENSOR_ENCODER) {
-      pinMode(sensor.encClkPin, INPUT_PULLUP);
-      pinMode(sensor.encDtPin, INPUT_PULLUP);
-      pinMode(sensor.encSwPin, INPUT_PULLUP);
-    } else if (sensor.type != SENSOR_ANALOG) {
-      pinMode(sensor.pin, sensor.pullup ? INPUT_PULLUP : INPUT);
+  if (sensor.type == SENSOR_ENCODER) {
+    pinMode(sensor.encClkPin, INPUT_PULLUP);
+    pinMode(sensor.encDtPin, INPUT_PULLUP);
+    pinMode(sensor.encSwPin, INPUT_PULLUP);
+  } else if (sensor.type == SENSOR_HCSR04) {
+    pinMode(sensor.hcTrigPin, OUTPUT);
+    pinMode(sensor.hcEchoPin, INPUT);
+  } else if (sensor.type != SENSOR_ANALOG) {
+    pinMode(sensor.pin, sensor.pullup ? INPUT_PULLUP : INPUT);
+  }
+  }
+}
+
+static void setupEncoderCounters() {
+  for (int i = 0; i < MAX_TRIGGERS; i++) {
+    encUnitByTrigger[i] = -1;
+  }
+  int unitsUsed = 0;
+  for (int i = 0; i < MAX_TRIGGERS; i++) {
+    const SensorConfig& s = config.sensors[i];
+    if (!s.enabled || s.source == SRC_TIME || s.type != SENSOR_ENCODER) continue;
+    if (unitsUsed >= 2) {
+      addLog("Encoder PCNT limit reached. Extra encoder uses fallback polling.");
+      continue;
     }
+    pcnt_unit_t unit = (unitsUsed == 0) ? PCNT_UNIT_0 : PCNT_UNIT_1;
+    pcnt_config_t cfg = {};
+    cfg.pulse_gpio_num = s.encClkPin;
+    cfg.ctrl_gpio_num = s.encDtPin;
+    cfg.channel = PCNT_CHANNEL_0;
+    cfg.unit = unit;
+    cfg.pos_mode = PCNT_COUNT_INC;
+    cfg.neg_mode = PCNT_COUNT_DEC;
+    cfg.lctrl_mode = PCNT_MODE_REVERSE;
+    cfg.hctrl_mode = PCNT_MODE_KEEP;
+    cfg.counter_h_lim = 32767;
+    cfg.counter_l_lim = -32768;
+    pcnt_unit_config(&cfg);
+    pcnt_counter_pause(unit);
+    pcnt_counter_clear(unit);
+    pcnt_set_filter_value(unit, 1000); // ~12.5us filter
+    pcnt_filter_enable(unit);
+    pcnt_counter_resume(unit);
+    encUnitByTrigger[i] = static_cast<int8_t>(unit);
+    unitsUsed++;
   }
 }
 
@@ -943,6 +1421,9 @@ static bool hasPinConflict(int index) {
     pinsA[countA++] = a.encClkPin;
     pinsA[countA++] = a.encDtPin;
     pinsA[countA++] = a.encSwPin;
+  } else if (a.type == SENSOR_HCSR04) {
+    pinsA[countA++] = a.hcTrigPin;
+    pinsA[countA++] = a.hcEchoPin;
   } else {
     pinsA[countA++] = a.pin;
   }
@@ -955,19 +1436,40 @@ static bool hasPinConflict(int index) {
       pinsB[countB++] = b.encClkPin;
       pinsB[countB++] = b.encDtPin;
       pinsB[countB++] = b.encSwPin;
+    } else if (b.type == SENSOR_HCSR04) {
+      pinsB[countB++] = b.hcTrigPin;
+      pinsB[countB++] = b.hcEchoPin;
     } else {
       pinsB[countB++] = b.pin;
     }
     for (int ia = 0; ia < countA; ia++) {
       for (int ib = 0; ib < countB; ib++) {
         if (pinsA[ia] == pinsB[ib]) {
-          if (isClickPatternType(a.type) && isClickPatternType(b.type) &&
-              a.pin == b.pin && a.activeHigh == b.activeHigh && a.pullup == b.pullup) {
+          bool aShared = (a.type == SENSOR_BUTTON) || isClickPatternType(a.type);
+          bool bShared = (b.type == SENSOR_BUTTON) || isClickPatternType(b.type);
+          if (aShared && bShared && a.pin == b.pin &&
+              a.activeHigh == b.activeHigh && a.pullup == b.pullup) {
             continue;
           }
           return true;
         }
       }
+    }
+  }
+  return false;
+}
+
+static bool hasSharedClickPattern(int index) {
+  const SensorConfig& a = config.sensors[index];
+  if (!a.enabled || a.source == SRC_TIME) return false;
+  if (a.type != SENSOR_BUTTON) return false;
+  for (int i = 0; i < MAX_TRIGGERS; i++) {
+    if (i == index) continue;
+    const SensorConfig& b = config.sensors[i];
+    if (!b.enabled || b.source == SRC_TIME) continue;
+    if (!isClickPatternType(b.type)) continue;
+    if (b.pin == a.pin && b.activeHigh == a.activeHigh && b.pullup == a.pullup) {
+      return true;
     }
   }
   return false;
@@ -1005,6 +1507,7 @@ static void loadConfig() {
   if (config.multiClickGapMs == 0) config.multiClickGapMs = DEFAULT_MULTI_CLICK_GAP_MS;
   config.longPressMs = prefs.getUInt("long_ms", DEFAULT_LONG_PRESS_MS);
   if (config.longPressMs == 0) config.longPressMs = DEFAULT_LONG_PRESS_MS;
+  config.analogSmoothing = prefs.getBool("analog_smooth", DEFAULT_ANALOG_SMOOTHING);
   config.timeMode = prefs.getUInt("time_mode", DEFAULT_TIME_MODE);
   if (config.timeMode > TIME_MANUAL) config.timeMode = DEFAULT_TIME_MODE;
   config.ntpServer = prefs.getString("ntp_srv", DEFAULT_NTP_SERVER);
@@ -1115,6 +1618,10 @@ static void loadConfig() {
     s.encClkPin = prefs.getInt(sensorKey(i, "clk").c_str(), s.encClkPin);
     s.encDtPin = prefs.getInt(sensorKey(i, "dt").c_str(), s.encDtPin);
     s.encSwPin = prefs.getInt(sensorKey(i, "sw").c_str(), s.encSwPin);
+    s.encAppendSign = prefs.getBool(sensorKey(i, "enc_app").c_str(), s.encAppendSign);
+    s.encSignArg = prefs.getBool(sensorKey(i, "enc_arg").c_str(), s.encSignArg);
+    s.encInvert = prefs.getBool(sensorKey(i, "enc_inv").c_str(), s.encInvert);
+    s.encSteps = DEFAULT_ENC_STEPS;
     if (s.type == SENSOR_ANALOG) {
       if (!isAllowedAnalogPin(s.pin)) s.pin = defaultSensorPin(i);
     } else {
@@ -1123,6 +1630,8 @@ static void loadConfig() {
     if (!isAllowedDigitalPin(s.encClkPin)) s.encClkPin = 13;
     if (!isAllowedDigitalPin(s.encDtPin)) s.encDtPin = 16;
     if (!isAllowedDigitalPin(s.encSwPin)) s.encSwPin = 33;
+    if (!isAllowedDigitalPin(s.hcTrigPin)) s.hcTrigPin = 13;
+    if (!isAllowedDigitalPin(s.hcEchoPin)) s.hcEchoPin = 16;
     s.invert = prefs.getBool(sensorKey(i, "inv").c_str(), s.invert);
     s.activeHigh = prefs.getBool(sensorKey(i, "ah").c_str(), s.activeHigh);
     s.pullup = prefs.getBool(sensorKey(i, "pu").c_str(), s.pullup);
@@ -1142,6 +1651,11 @@ static void loadConfig() {
         String baseOmin = hasOutputCount ? outputKey(i, o, "omin") : sensorKey(i, "omin");
         String baseOmax = hasOutputCount ? outputKey(i, o, "omax") : sensorKey(i, "omax");
         String baseOmode = hasOutputCount ? outputKey(i, o, "omode") : sensorKey(i, "omode");
+        String baseBmin = hasOutputCount ? outputKey(i, o, "bmin") : sensorKey(i, "bmin");
+        String baseBmax = hasOutputCount ? outputKey(i, o, "bmax") : sensorKey(i, "bmax");
+        String baseBmode = hasOutputCount ? outputKey(i, o, "bmode") : sensorKey(i, "bmode");
+        String baseBon = hasOutputCount ? outputKey(i, o, "bon") : sensorKey(i, "bon");
+        String baseBoff = hasOutputCount ? outputKey(i, o, "boff") : sensorKey(i, "boff");
         String baseOt = hasOutputCount ? outputKey(i, o, "tgt") : sensorKey(i, "ot");
         String baseOd = hasOutputCount ? outputKey(i, o, "dev") : sensorKey(i, "od");
         String baseOn = hasOutputCount ? outputKey(i, o, "on") : sensorKey(i, "on");
@@ -1152,6 +1666,9 @@ static void loadConfig() {
         s.outputs[o].outMin = prefs.getFloat(baseOmin.c_str(), s.outputs[o].outMin);
         s.outputs[o].outMax = prefs.getFloat(baseOmax.c_str(), s.outputs[o].outMax);
         s.outputs[o].outMode = sanitizeOutputMode(prefs.getInt(baseOmode.c_str(), s.outputs[o].outMode));
+        s.outputs[o].buttonOutMin = prefs.getFloat(baseBmin.c_str(), s.outputs[o].buttonOutMin);
+        s.outputs[o].buttonOutMax = prefs.getFloat(baseBmax.c_str(), s.outputs[o].buttonOutMax);
+        s.outputs[o].buttonOutMode = sanitizeOutputMode(prefs.getInt(baseBmode.c_str(), s.outputs[o].buttonOutMode));
         s.outputs[o].target = sanitizeOutputTarget(prefs.getInt(baseOt.c_str(), s.outputs[o].target));
         s.outputs[o].device = prefs.getInt(baseOd.c_str(), s.outputs[o].device);
         if (s.outputs[o].device >= MAX_OSC_DEVICES) s.outputs[o].device = 0;
@@ -1216,6 +1733,8 @@ static void loadConfig() {
         }
         s.outputs[o].onString = prefs.getString(baseOn.c_str(), s.outputs[o].onString);
         s.outputs[o].offString = prefs.getString(baseOff.c_str(), s.outputs[o].offString);
+        s.outputs[o].buttonOnString = prefs.getString(baseBon.c_str(), s.outputs[o].buttonOnString);
+        s.outputs[o].buttonOffString = prefs.getString(baseBoff.c_str(), s.outputs[o].buttonOffString);
       }
       if (s.outputs[o].oscAddress.length() == 0) s.outputs[o].oscAddress = defaultOscAddress(i);
       if (s.outputs[o].buttonAddress.length() == 0) s.outputs[o].buttonAddress = "/button";
@@ -1277,6 +1796,7 @@ static void saveConfig() {
   prefs.putUInt("click_db", config.clickDebounceMs);
   prefs.putUInt("click_gap", config.multiClickGapMs);
   prefs.putUInt("long_ms", config.longPressMs);
+  prefs.putBool("analog_smooth", config.analogSmoothing);
   prefs.putUInt("time_mode", config.timeMode);
   prefs.putString("ntp_srv", config.ntpServer);
   prefs.putString("tz", config.timeZone);
@@ -1338,6 +1858,9 @@ static void saveConfig() {
     prefs.putInt(sensorKey(i, "clk").c_str(), s.encClkPin);
     prefs.putInt(sensorKey(i, "dt").c_str(), s.encDtPin);
     prefs.putInt(sensorKey(i, "sw").c_str(), s.encSwPin);
+    prefs.putBool(sensorKey(i, "enc_app").c_str(), s.encAppendSign);
+    prefs.putBool(sensorKey(i, "enc_arg").c_str(), s.encSignArg);
+    prefs.putBool(sensorKey(i, "enc_inv").c_str(), s.encInvert);
     prefs.putBool(sensorKey(i, "inv").c_str(), s.invert);
     prefs.putBool(sensorKey(i, "ah").c_str(), s.activeHigh);
     prefs.putBool(sensorKey(i, "pu").c_str(), s.pullup);
@@ -1353,6 +1876,9 @@ static void saveConfig() {
       prefs.putFloat(outputKey(i, o, "omin").c_str(), out.outMin);
       prefs.putFloat(outputKey(i, o, "omax").c_str(), out.outMax);
       prefs.putInt(outputKey(i, o, "omode").c_str(), out.outMode);
+      prefs.putFloat(outputKey(i, o, "bmin").c_str(), out.buttonOutMin);
+      prefs.putFloat(outputKey(i, o, "bmax").c_str(), out.buttonOutMax);
+      prefs.putInt(outputKey(i, o, "bmode").c_str(), out.buttonOutMode);
       prefs.putBool(outputKey(i, o, "smin").c_str(), out.sendMinOnRelease);
       prefs.putString(outputKey(i, o, "udp").c_str(), out.udpPayload);
       prefs.putInt(outputKey(i, o, "gpin").c_str(), out.gpioPin);
@@ -1367,6 +1893,8 @@ static void saveConfig() {
       prefs.putUInt(outputKey(i, o, "hdev").c_str(), out.httpDevice);
       prefs.putString(outputKey(i, o, "on").c_str(), out.onString);
       prefs.putString(outputKey(i, o, "off").c_str(), out.offString);
+      prefs.putString(outputKey(i, o, "bon").c_str(), out.buttonOnString);
+      prefs.putString(outputKey(i, o, "boff").c_str(), out.buttonOffString);
     }
     prefs.putInt(sensorKey(i, "tt").c_str(), s.timeType);
     prefs.putInt(sensorKey(i, "ty").c_str(), s.timeYear);
@@ -1575,6 +2103,69 @@ static void sendOscStringTo(const IPAddress& ip, uint16_t port, const char* addr
   udp.write(packet, idx);
   udp.endPacket();
   addLog(String("OSC string ") + address + " " + String(value));
+}
+
+static void sendOscStringIntTo(const IPAddress& ip, uint16_t port, const char* address, const char* svalue, int32_t ivalue) {
+  uint8_t packet[256];
+  size_t idx = 0;
+
+  auto addPaddedString = [&](const char* s) {
+    size_t len = strlen(s) + 1; // include null
+    if (idx + len >= sizeof(packet)) return;
+    memcpy(packet + idx, s, len);
+    idx += len;
+    while (idx % 4 != 0 && idx < sizeof(packet)) {
+      packet[idx++] = 0;
+    }
+  };
+
+  addPaddedString(address);
+  addPaddedString(",si");
+  addPaddedString(svalue);
+  if (idx + 4 > sizeof(packet)) return;
+  packet[idx++] = (ivalue >> 24) & 0xFF;
+  packet[idx++] = (ivalue >> 16) & 0xFF;
+  packet[idx++] = (ivalue >> 8) & 0xFF;
+  packet[idx++] = ivalue & 0xFF;
+
+  udp.beginPacket(ip, port);
+  udp.write(packet, idx);
+  udp.endPacket();
+  addLog(String("OSC string+int ") + address + " " + String(svalue) + " " + String(ivalue));
+}
+
+static void sendOscStringFloatTo(const IPAddress& ip, uint16_t port, const char* address, const char* svalue, float fvalue) {
+  uint8_t packet[256];
+  size_t idx = 0;
+
+  auto addPaddedString = [&](const char* s) {
+    size_t len = strlen(s) + 1; // include null
+    if (idx + len >= sizeof(packet)) return;
+    memcpy(packet + idx, s, len);
+    idx += len;
+    while (idx % 4 != 0 && idx < sizeof(packet)) {
+      packet[idx++] = 0;
+    }
+  };
+
+  addPaddedString(address);
+  addPaddedString(",sf");
+  addPaddedString(svalue);
+  if (idx + 4 > sizeof(packet)) return;
+  union {
+    float f;
+    uint32_t u;
+  } conv;
+  conv.f = fvalue;
+  packet[idx++] = (conv.u >> 24) & 0xFF;
+  packet[idx++] = (conv.u >> 16) & 0xFF;
+  packet[idx++] = (conv.u >> 8) & 0xFF;
+  packet[idx++] = conv.u & 0xFF;
+
+  udp.beginPacket(ip, port);
+  udp.write(packet, idx);
+  udp.endPacket();
+  addLog(String("OSC string+float ") + address + " " + String(svalue) + " " + String(fvalue, 3));
 }
 
 static void sendOscString(const char* address, const char* value) {
@@ -1898,8 +2489,14 @@ static void processClickPattern(int index, const SensorConfig& sensor, bool pres
         multiLongFired[index] = false;
       } else {
         if (!multiLongFired[index]) {
+          if (!longPress && (now - multiPressStartMs[index] >= config.longPressMs)) {
+            // Suppress single-click if this press exceeded long-press duration
+            // when sharing a button with long-press triggers.
+            multiLongFired[index] = false;
+          } else {
           clickCount[index]++;
           multiLastReleaseMs[index] = now;
+          }
         }
       }
     }
@@ -2025,7 +2622,7 @@ static void handleTriggers() {
     SensorConfig& s = config.sensors[i];
     String idx = String(i);
 
-    html += "<details " + String(tIndex == 0 ? "open" : "") + ">";
+    html += "<details data-trigger='" + String(idx) + "'>";
     html += "<summary>";
     html += "<span style='display:flex;align-items:center;gap:10px;'>";
     html += "<span class='chev'>&#9654;</span>";
@@ -2056,12 +2653,21 @@ static void handleTriggers() {
     html += "<option value='6' " + String(s.type == SENSOR_BUTTON_TRIPLE ? "selected" : "") + ">Button (triple click)</option>";
     html += "<option value='7' " + String(s.type == SENSOR_BUTTON_LONG ? "selected" : "") + ">Button (long press)</option>";
     html += "<option value='8' " + String(s.type == SENSOR_GPIO ? "selected" : "") + ">GPIO (input)</option>";
+    html += "<option value='9' " + String(s.type == SENSOR_HCSR04 ? "selected" : "") + ">Ultrasonic (HC-SR04)</option>";
     html += "<option value='0' " + String(s.type == SENSOR_ANALOG ? "selected" : "") + ">Analog (pot/slider)</option>";
     html += "<option value='4' " + String(s.type == SENSOR_ENCODER ? "selected" : "") + ">Encoder</option>";
     html += "</select><br></div>";
     html += "<div id='s" + idx + "_pin_block'>";
     html += "GPIO Pin: <input name='s" + idx + "_pin' type='number' value='" + String(s.pin) + "'><br>";
     html += "<small>Analog pins allowed: 32,35,36. Digital pins allowed: 5,13,16,17,18,19,21,22,23,25,26,27,32,33,35,36,39</small><br>";
+    html += "</div>";
+    html += "<div id='s" + idx + "_hcsr04'>";
+    html += "<b>HC-SR04</b><br>";
+    html += "Trig pin: <input name='s" + idx + "_hc_t' type='number' value='" + String(s.hcTrigPin) + "'><br>";
+    html += "Echo pin: <input name='s" + idx + "_hc_e' type='number' value='" + String(s.hcEchoPin) + "'><br>";
+    html += "Min cm: <input name='s" + idx + "_hc_min' type='number' step='0.1' value='" + String(s.hcMinCm, 1) + "'><br>";
+    html += "Max cm: <input name='s" + idx + "_hc_max' type='number' step='0.1' value='" + String(s.hcMaxCm, 1) + "'><br>";
+    html += "<small>Tip: set Min higher than Max to invert.</small><br>";
     html += "</div>";
     html += "<div id='s" + idx + "_analog'>";
     html += "Invert: <input name='s" + idx + "_inv' type='checkbox' " + String(s.invert ? "checked" : "") + "><br>";
@@ -2082,7 +2688,10 @@ static void handleTriggers() {
     html += "CLK pin: <input name='s" + idx + "_clk' type='number' value='" + String(s.encClkPin) + "'><br>";
     html += "DT pin: <input name='s" + idx + "_dt' type='number' value='" + String(s.encDtPin) + "'><br>";
     html += "SW pin: <input name='s" + idx + "_sw' type='number' value='" + String(s.encSwPin) + "'><br>";
-    html += "<small>Encoder sends -1/+1 on each step.</small><br>";
+    html += "Append /+/- to address: <input name='s" + idx + "_enc_app' type='checkbox' " + String(s.encAppendSign ? "checked" : "") + "><br>";
+    html += "Insert +/- as 1st arg: <input name='s" + idx + "_enc_arg' type='checkbox' " + String(s.encSignArg ? "checked" : "") + "><br>";
+    html += "Invert direction: <input name='s" + idx + "_enc_inv' type='checkbox' " + String(s.encInvert ? "checked" : "") + "><br>";
+    html += "<small>Encoder step sends relative changes. Use options above for QLab/Resolume.</small><br>";
     html += "</div>";
 
     html += "<div id='s" + idx + "_time_block'>";
@@ -2157,28 +2766,52 @@ static void handleTriggers() {
       html += "<div id='s" + idx + "_o" + oidx + "_enc_addr'>";
       html += "Encoder address: <input name='s" + idx + "_o" + oidx + "_enc_addr' type='text' value='" + out.oscAddress + "'><br>";
       html += "</div>";
-      html += "<div id='s" + idx + "_o" + oidx + "_button_addr'>";
-      html += "Button address: <input name='s" + idx + "_o" + oidx + "_btn_addr' type='text' value='" + out.buttonAddress + "'><br>";
-      html += "</div>";
       html += "Argument type: <select name='s" + idx + "_o" + oidx + "_omode' id='s" + idx + "_o" + oidx + "_omode'>";
       html += "<option value='0' " + String(out.outMode == OUT_INT ? "selected" : "") + ">Int</option>";
       html += "<option value='1' " + String(out.outMode == OUT_FLOAT ? "selected" : "") + ">Float</option>";
       html += "<option value='2' id='s" + idx + "_o" + oidx + "_opt_string' " + String(out.outMode == OUT_STRING ? "selected" : "") + ">String</option>";
       html += "</select><br>";
+      html += "<div id='s" + idx + "_o" + oidx + "_minrel_slot_main'></div>";
       html += "<div id='s" + idx + "_o" + oidx + "_minrel'>";
       html += "Send max on press only: <input id='s" + idx + "_o" + oidx + "_smin' name='s" + idx + "_o" + oidx + "_smin' type='checkbox' " + String(!out.sendMinOnRelease ? "checked" : "") + "><br>";
       html += "</div>";
-      html += "<div id='s" + idx + "_o" + oidx + "_string'>";
-      html += "On string: <input name='s" + idx + "_o" + oidx + "_on' type='text' value='" + out.onString + "'><br>";
-      html += "Off string: <input name='s" + idx + "_o" + oidx + "_off' type='text' value='" + out.offString + "'><br>";
+      String mainStrStyle = (s.type == SENSOR_ENCODER || out.outMode != OUT_STRING) ? " style='display:none;'" : "";
+      html += "<div id='s" + idx + "_o" + oidx + "_string'" + mainStrStyle + ">";
+      html += "<div id='s" + idx + "_o" + oidx + "_offrow'>Off string: <input name='s" + idx + "_o" + oidx + "_off' type='text' value='" + out.offString + "'><button type='button' class='icon-btn' data-idx='" + idx + "' data-oidx='" + oidx + "' data-test='min' onclick='sendOutputTest(" + idx + "," + oidx + ",\"min\");return false;'>Test</button><br></div>";
+      html += "<div id='s" + idx + "_o" + oidx + "_onrow'>On string: <input name='s" + idx + "_o" + oidx + "_on' type='text' value='" + out.onString + "'><button type='button' class='icon-btn' data-idx='" + idx + "' data-oidx='" + oidx + "' data-test='max' onclick='sendOutputTest(" + idx + "," + oidx + ",\"max\");return false;'>Test</button><br></div>";
       html += "</div>";
       html += "</div>";
       html += "<div id='s" + idx + "_o" + oidx + "_range'>";
-      html += "<div id='s" + idx + "_o" + oidx + "_minrow'>Output min: <input name='s" + idx + "_o" + oidx + "_omin' type='number' step='0.001' value='" + String(out.outMin, 3) + "'><button type='button' class='icon-btn' data-idx='" + idx + "' data-oidx='" + oidx + "' data-test='min'>Test</button><br></div>";
-      html += "Output max: <input name='s" + idx + "_o" + oidx + "_omax' type='number' step='0.001' value='" + String(out.outMax, 3) + "'><button type='button' class='icon-btn' data-idx='" + idx + "' data-oidx='" + oidx + "' data-test='max'>Test</button><br>";
+      bool hideMainMin = (s.type == SENSOR_ENCODER) || (out.outMode == OUT_STRING) || (!out.sendMinOnRelease);
+      String mainMinStyle = hideMainMin ? " style='display:none;'" : "";
+      html += "<div id='s" + idx + "_o" + oidx + "_minrow'" + mainMinStyle + ">Output min: <input name='s" + idx + "_o" + oidx + "_omin' type='number' step='0.001' value='" + String(out.outMin, 3) + "'><button type='button' class='icon-btn' data-idx='" + idx + "' data-oidx='" + oidx + "' data-test='min' onclick='sendOutputTest(" + idx + "," + oidx + ",\"min\");return false;'>Test</button><br></div>";
+      html += "<span id='s" + idx + "_o" + oidx + "_omax_label'>Output max</span>: <input name='s" + idx + "_o" + oidx + "_omax' type='number' step='0.001' value='" + String(out.outMax, 3) + "'><button type='button' class='icon-btn' data-idx='" + idx + "' data-oidx='" + oidx + "' data-test='max' onclick='sendOutputTest(" + idx + "," + oidx + ",\"max\");return false;'>Test</button><br>";
+      html += "</div>";
+      html += "<div id='s" + idx + "_o" + oidx + "_btn_block'>";
+      html += "<div id='s" + idx + "_o" + oidx + "_button_addr'>";
+      html += "Button address: <input name='s" + idx + "_o" + oidx + "_btn_addr' type='text' value='" + out.buttonAddress + "'><br>";
+      html += "</div>";
+      html += "Button argument type: <select name='s" + idx + "_o" + oidx + "_bmode' id='s" + idx + "_o" + oidx + "_bmode'>";
+      html += "<option value='0' " + String(out.buttonOutMode == OUT_INT ? "selected" : "") + ">Int</option>";
+      html += "<option value='1' " + String(out.buttonOutMode == OUT_FLOAT ? "selected" : "") + ">Float</option>";
+      html += "<option value='2' " + String(out.buttonOutMode == OUT_STRING ? "selected" : "") + ">String</option>";
+      html += "</select><br>";
+      html += "<div id='s" + idx + "_o" + oidx + "_minrel_slot_btn'></div>";
+      String bStrStyle = (out.buttonOutMode == OUT_STRING) ? "" : " style='display:none;'";
+      html += "<div id='s" + idx + "_o" + oidx + "_bstring'" + bStrStyle + ">";
+      html += "<div id='s" + idx + "_o" + oidx + "_boffrow'>Off string: <input name='s" + idx + "_o" + oidx + "_boff' type='text' value='" + out.buttonOffString + "'><button type='button' class='icon-btn' data-idx='" + idx + "' data-oidx='" + oidx + "' data-test='bmin' onclick='sendOutputTest(" + idx + "," + oidx + ",\"bmin\");return false;'>Test</button><br></div>";
+      html += "<div id='s" + idx + "_o" + oidx + "_bonrow'>On string: <input name='s" + idx + "_o" + oidx + "_bon' type='text' value='" + out.buttonOnString + "'><button type='button' class='icon-btn' data-idx='" + idx + "' data-oidx='" + oidx + "' data-test='bmax' onclick='sendOutputTest(" + idx + "," + oidx + ",\"bmax\");return false;'>Test</button><br></div>";
+      html += "</div>";
+      String bRangeStyle = (out.buttonOutMode == OUT_STRING) ? " style='display:none;'" : "";
+      html += "<div id='s" + idx + "_o" + oidx + "_brange'" + bRangeStyle + ">";
+      bool hideBtnMin = (!out.sendMinOnRelease) || (out.buttonOutMode == OUT_STRING);
+      String bMinStyle = hideBtnMin ? " style='display:none;'" : "";
+      html += "<div id='s" + idx + "_o" + oidx + "_bminrow'" + bMinStyle + ">Output min: <input name='s" + idx + "_o" + oidx + "_bmin' type='number' step='0.001' value='" + String(out.buttonOutMin, 3) + "'><button type='button' class='icon-btn' data-idx='" + idx + "' data-oidx='" + oidx + "' data-test='bmin' onclick='sendOutputTest(" + idx + "," + oidx + ",\"bmin\");return false;'>Test</button><br></div>";
+      html += "Output max: <input name='s" + idx + "_o" + oidx + "_bmax' type='number' step='0.001' value='" + String(out.buttonOutMax, 3) + "'><button type='button' class='icon-btn' data-idx='" + idx + "' data-oidx='" + oidx + "' data-test='bmax' onclick='sendOutputTest(" + idx + "," + oidx + ",\"bmax\");return false;'>Test</button><br>";
+      html += "</div>";
       html += "</div>";
       html += "<div id='s" + idx + "_o" + oidx + "_udp_block'>";
-      html += "UDP payload: <input name='s" + idx + "_o" + oidx + "_udp' type='text' value='" + out.udpPayload + "'><button type='button' class='icon-btn' data-idx='" + idx + "' data-oidx='" + oidx + "' data-test='udp'>Test</button><br>";
+      html += "UDP payload: <input name='s" + idx + "_o" + oidx + "_udp' type='text' value='" + out.udpPayload + "'><button type='button' class='icon-btn' data-idx='" + idx + "' data-oidx='" + oidx + "' data-test='udp' onclick='sendOutputTest(" + idx + "," + oidx + ",\"udp\");return false;'>Test</button><br>";
       html += "</div>";
       html += "<div id='s" + idx + "_o" + oidx + "_http_block'>";
       html += "Method: <select name='s" + idx + "_o" + oidx + "_hm'>";
@@ -2211,7 +2844,7 @@ static void handleTriggers() {
       html += "Invert: <input type='checkbox' name='s" + idx + "_o" + oidx + "_ginv' " + String(out.gpioInvert ? "checked" : "") + "><br>";
       html += "<div id='s" + idx + "_o" + oidx + "_gpulse'>Pulse ms: <input name='s" + idx + "_o" + oidx + "_gpms' type='number' min='1' value='" + String(out.gpioPulseMs) + "' style='max-width:120px;'></div>";
       html += "<div class='helper'>Level: LOW by default, goes HIGH while active. Invert flips it. Pulse: LOW then HIGH for duration (Invert pulses LOW). PWM uses output min/max as duty (0-255); Invert reverses duty.</div>";
-      html += "<button type='button' class='icon-btn' data-idx='" + idx + "' data-oidx='" + oidx + "' data-test='gpio'>Test</button><br>";
+      html += "<button type='button' class='icon-btn' data-idx='" + idx + "' data-oidx='" + oidx + "' data-test='gpio' onclick='sendOutputTest(" + idx + "," + oidx + ",\"gpio\");return false;'>Test</button><br>";
       html += "</div>";
       html += "</div>";
     }
@@ -2236,6 +2869,7 @@ static void handleTriggers() {
   html += "const d=document.getElementById('s'+i+'_digital');";
   html += "const pin=document.getElementById('s'+i+'_pin_block');";
   html += "const enc=document.getElementById('s'+i+'_encoder');";
+  html += "const hc=document.getElementById('s'+i+'_hcsr04');";
   html += "const cd=document.getElementById('s'+i+'_cooldown');";
   html += "const timeBlock=document.getElementById('s'+i+'_time_block');";
   html += "const timeOnce=document.getElementById('s'+i+'_time_once');";
@@ -2255,8 +2889,9 @@ static void handleTriggers() {
   html += "}";
   html += "if(a){a.style.display=(!isTime && t==='0')?'block':'none';}";
   html += "if(d){d.style.display=(!isTime && t!=='0'&&!isEnc)?'block':'none';}";
-  html += "if(pin){pin.style.display=(isEnc||isTime)?'none':'block';}";
+  html += "if(pin){pin.style.display=(isEnc||isTime||t==='9')?'none':'block';}";
   html += "if(enc){enc.style.display=isEnc?'block':'none';}";
+  html += "if(hc){hc.style.display=(t==='9')?'block':'none';}";
   html += "if(cd){cd.style.display=(!isTime && (t==='1' || t==='8'))?'block':'none';}";
   html += "for(let o=0;o<" + String(MAX_OUTPUTS_PER_TRIGGER) + ";o++){";
   html += "const tgt=document.getElementById('s'+i+'_o'+o+'_tgt');";
@@ -2275,13 +2910,25 @@ static void handleTriggers() {
   html += "const addrBlock=document.getElementById('s'+i+'_o'+o+'_addr_block');";
   html += "const encAddr=document.getElementById('s'+i+'_o'+o+'_enc_addr');";
   html += "const btnAddr=document.getElementById('s'+i+'_o'+o+'_button_addr');";
+  html += "const btnBlock=document.getElementById('s'+i+'_o'+o+'_btn_block');";
   html += "const om=document.getElementById('s'+i+'_o'+o+'_omode');";
   html += "const opt=document.getElementById('s'+i+'_o'+o+'_opt_string');";
   html += "const range=document.getElementById('s'+i+'_o'+o+'_range');";
   html += "const minRow=document.getElementById('s'+i+'_o'+o+'_minrow');";
   html += "const minRel=document.getElementById('s'+i+'_o'+o+'_minrel');";
+  html += "const minRelSlotMain=document.getElementById('s'+i+'_o'+o+'_minrel_slot_main');";
+  html += "const minRelSlotBtn=document.getElementById('s'+i+'_o'+o+'_minrel_slot_btn');";
   html += "const smin=document.getElementById('s'+i+'_o'+o+'_smin');";
   html += "const str=document.getElementById('s'+i+'_o'+o+'_string');";
+  html += "const onRow=document.getElementById('s'+i+'_o'+o+'_onrow');";
+  html += "const offRow=document.getElementById('s'+i+'_o'+o+'_offrow');";
+  html += "const bmode=document.getElementById('s'+i+'_o'+o+'_bmode');";
+  html += "const bstring=document.getElementById('s'+i+'_o'+o+'_bstring');";
+  html += "const bonRow=document.getElementById('s'+i+'_o'+o+'_bonrow');";
+  html += "const boffRow=document.getElementById('s'+i+'_o'+o+'_boffrow');";
+  html += "const brange=document.getElementById('s'+i+'_o'+o+'_brange');";
+  html += "const bminrow=document.getElementById('s'+i+'_o'+o+'_bminrow');";
+  html += "const omaxLabel=document.getElementById('s'+i+'_o'+o+'_omax_label');";
   html += "const ominInput=document.querySelector(\"input[name='s\"+i+\"_o\"+o+\"_omin']\");";
   html += "const omaxInput=document.querySelector(\"input[name='s\"+i+\"_o\"+o+\"_omax']\");";
   html += "const isOsc=(tgt.value==='0');";
@@ -2293,6 +2940,11 @@ static void handleTriggers() {
   html += "if(udpBlock){udpBlock.style.display=isUdp?'block':'none';}";
   html += "if(gpioBlock){gpioBlock.style.display=isGpio?'block':'none';}";
   html += "if(httpBlock){httpBlock.style.display=isHttp?'block':'none';}";
+  html += "if(omaxLabel){omaxLabel.textContent=isEnc?'Output':'Output max';}";
+  html += "if(minRel){";
+  html += "if(isEnc){if(minRelSlotBtn){minRelSlotBtn.appendChild(minRel);}}";
+  html += "else{if(minRelSlotMain){minRelSlotMain.appendChild(minRel);}}";
+  html += "}";
   html += "if(httpBody&&isHttp){";
   html += "const m=document.querySelector(\"select[name='s\"+i+\"_o\"+o+\"_hm']\");";
   html += "if(m){httpBody.style.display=(m.value==='1')?'block':'none';}";
@@ -2320,23 +2972,48 @@ static void handleTriggers() {
   html += "if(om){om.disabled=!(isOsc||isHttp);}";
   html += "if(om&&opt){";
   html += "if(!isOsc){opt.disabled=true;}";
-  html += "else if(!isTime && t==='0'){";
+  html += "else if(isEnc){";
+  html += "opt.disabled=true;";
+  html += "if(om.value==='2'){om.value='1';}";
+  html += "}else if(!isTime && t==='0'){";
   html += "opt.disabled=true;";
   html += "if(om.value==='2'){om.value='1';}";
   html += "}else{";
   html += "opt.disabled=false;";
   html += "}";
   html += "}";
-  html += "if(str&&om){str.style.display=((isOsc||isHttp) && om.value==='2')?'block':'none';}";
+  html += "if(str&&om){";
+  html += "const showStr=((isOsc||isHttp) && !isEnc && om.value==='2');";
+  html += "str.style.display=showStr?'block':'none';";
+  html += "if(offRow){offRow.style.display=(showStr && smin && smin.checked)?'none':'block';}";
+  html += "}";
   html += "if(range&&om){range.style.display=((isOsc||isHttp) && om.value!=='2')?'block':(isGpio && gmode && gmode.value==='3' ? 'block' : 'none');}";
   html += "if(addrBlock){addrBlock.style.display=(isOsc && !isEnc)?'block':'none';}";
   html += "if(encAddr){encAddr.style.display=(isOsc && isEnc)?'block':'none';}";
   html += "if(btnAddr){btnAddr.style.display=(isOsc && isEnc)?'block':'none';}";
-  html += "if(minRel){minRel.style.display=((isOsc||isHttp) && !isEnc && t!=='0')?'block':'none';}";
-  html += "if(minRow&&smin){";
-  html += "if(isOsc||isHttp){minRow.style.display=smin.checked?'none':'block';}";
-  html += "else if(isGpio && gmode && gmode.value==='3'){minRow.style.display='block';}";
+  html += "if(btnBlock){btnBlock.style.display=(isOsc && isEnc)?'block':'none';}";
+  html += "if(minRel){";
+  html += "if(isOsc||isHttp){minRel.style.display=(isEnc||t!=='0')?'block':'none';}";
+  html += "else{minRel.style.display='none';}";
+  html += "}";
+  html += "if(minRow&&smin&&om){";
+  html += "if(isOsc||isHttp){";
+  html += "if(isEnc){minRow.style.display='none';}";
+  html += "else if(om.value==='2'){minRow.style.display='none';}";
+  html += "else{minRow.style.display=smin.checked?'none':'block';}";
+  html += "}else if(isGpio && gmode && gmode.value==='3'){minRow.style.display='block';}";
   html += "else{minRow.style.display='none';}";
+  html += "}";
+  html += "if(bstring&&bmode){";
+  html += "const showBStr=(isOsc && isEnc && bmode.value==='2');";
+  html += "bstring.style.display=showBStr?'block':'none';";
+  html += "if(boffRow){boffRow.style.display=(showBStr && smin && smin.checked)?'none':'block';}";
+  html += "}";
+  html += "if(brange&&bmode){brange.style.display=(isOsc && isEnc && bmode.value!=='2')?'block':'none';}";
+  html += "if(bminrow&&smin&&bmode){";
+  html += "if(!(isOsc && isEnc)){bminrow.style.display='none';}";
+  html += "else if(bmode.value==='2'){bminrow.style.display='none';}";
+  html += "else{bminrow.style.display=smin.checked?'none':'block';}";
   html += "}";
   html += "}";
   html += "}";
@@ -2352,6 +3029,8 @@ static void handleTriggers() {
   html += "for(let o=0;o<" + String(MAX_OUTPUTS_PER_TRIGGER) + ";o++){";
   html += "const om=document.getElementById('s'+i+'_o'+o+'_omode');";
   html += "if(om){om.addEventListener('change',()=>updateTrigger(i));}";
+  html += "const bm=document.getElementById('s'+i+'_o'+o+'_bmode');";
+  html += "if(bm){bm.addEventListener('change',()=>updateTrigger(i));}";
   html += "const ot=document.getElementById('s'+i+'_o'+o+'_tgt');";
   html += "if(ot){ot.addEventListener('change',()=>updateTrigger(i));}";
   html += "const smin=document.getElementById('s'+i+'_o'+o+'_smin');";
@@ -2365,6 +3044,11 @@ static void handleTriggers() {
   html += "}";
   html += "updateTrigger(i);";
   html += "}";
+  html += "const detailsEls=document.querySelectorAll('details[data-trigger]');";
+  html += "const stored=localStorage.getItem('trigger_open');";
+  html += "let openIdx=-1; if(stored!==null){openIdx=parseInt(stored,10);}"; 
+  html += "if(detailsEls.length){detailsEls.forEach(d=>{const idx=d.getAttribute('data-trigger'); if(openIdx>=0 && idx===String(openIdx)){d.open=true;} else if(openIdx>=0){d.open=false;}});}";
+  html += "detailsEls.forEach(d=>{d.addEventListener('toggle',()=>{if(d.open){localStorage.setItem('trigger_open',d.getAttribute('data-trigger'));}});});";
   html += "function sendOutputTest(idx, oidx, kind){";
   html += "const tSel=document.getElementById('s'+idx+'_type');";
   html += "const t=tSel? tSel.value : '0';";
@@ -2394,19 +3078,41 @@ static void handleTriggers() {
   html += "}";
   html += "if(tgt && tgt.value!=='0'){return;}";
   html += "const addrInput=document.getElementById('s'+idx+'_o'+oidx+'_addr');";
-  html += "const encAddr=document.getElementById('s'+idx+'_o'+oidx+'_enc_addr');";
-  html += "const addr=isEnc?(encAddr?encAddr.value:''):(addrInput?addrInput.value:'');";
+  html += "const encAddrInput=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_enc_addr']\");";
+  html += "const btnAddrInput=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_btn_addr']\");";
+  html += "const useBtn=(kind==='bmin' || kind==='bmax');";
+  html += "const addr=useBtn?(btnAddrInput?btnAddrInput.value:''):(isEnc?(encAddrInput?encAddrInput.value:''):(addrInput?addrInput.value:''));";
   html += "const dev=document.getElementById('s'+idx+'_o'+oidx+'_dev');";
   html += "const om=document.getElementById('s'+idx+'_o'+oidx+'_omode');";
   html += "const onStr=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_on']\");";
   html += "const offStr=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_off']\");";
   html += "const omin=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_omin']\");";
   html += "const omax=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_omax']\");";
+  html += "const bm=document.getElementById('s'+idx+'_o'+oidx+'_bmode');";
+  html += "const bon=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_bon']\");";
+  html += "const boff=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_boff']\");";
+  html += "const bmin=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_bmin']\");";
+  html += "const bmax=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_bmax']\");";
   html += "if(!addr){return;}";
   html += "const data=new URLSearchParams();";
   html += "data.set('test_addr',addr);";
   html += "if(dev){data.set('test_dev',dev.value);}"; 
-  html += "if(om&&om.value==='2'){";
+  html += "if(useBtn){";
+  html += "const mode=bm?bm.value:'0';";
+  html += "if(mode==='2'){";
+  html += "data.set('test_type','string');";
+  html += "const v=(kind==='bmax')?(bon?bon.value:''):(boff?boff.value:'');";
+  html += "data.set('test_value',v||'');";
+  html += "}else if(mode==='1'){";
+  html += "data.set('test_type','float');";
+  html += "const v=(kind==='bmax')?(bmax?bmax.value:'0'):(bmin?bmin.value:'0');";
+  html += "data.set('test_value',v);";
+  html += "}else{";
+  html += "data.set('test_type','int');";
+  html += "const v=(kind==='bmax')?(bmax?bmax.value:'0'):(bmin?bmin.value:'0');";
+  html += "data.set('test_value',v);";
+  html += "}";
+  html += "}else if(om&&om.value==='2'){";
   html += "data.set('test_type','string');";
   html += "const v=(kind==='max')?(onStr?onStr.value:''):(offStr?offStr.value:'');";
   html += "data.set('test_value',v||'');";
@@ -2421,9 +3127,6 @@ static void handleTriggers() {
   html += "}";
   html += "fetch('/send_test',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data.toString(),credentials:'same-origin'}).then(r=>r.text()).then(t=>console.log('test send',t)).catch(e=>console.warn('test send failed',e));";
   html += "}";
-  html += "document.querySelectorAll(\"button[data-test]\").forEach(btn=>{";
-  html += "btn.addEventListener('click',()=>{sendOutputTest(btn.dataset.idx,btn.dataset.oidx,btn.dataset.test);});";
-  html += "});";
   html += "</script>";
   html += "</form></div></body></html>";
   server.send(200, "text/html", html);
@@ -2538,6 +3241,15 @@ static void handleSaveTriggers() {
       if (server.hasArg("s" + idx + "_o" + oidx + "_omode")) {
         out.outMode = sanitizeOutputMode(server.arg("s" + idx + "_o" + oidx + "_omode").toInt());
       }
+      if (server.hasArg("s" + idx + "_o" + oidx + "_bmode")) {
+        out.buttonOutMode = sanitizeOutputMode(server.arg("s" + idx + "_o" + oidx + "_bmode").toInt());
+      }
+      if (server.hasArg("s" + idx + "_o" + oidx + "_bmin")) {
+        out.buttonOutMin = server.arg("s" + idx + "_o" + oidx + "_bmin").toFloat();
+      }
+      if (server.hasArg("s" + idx + "_o" + oidx + "_bmax")) {
+        out.buttonOutMax = server.arg("s" + idx + "_o" + oidx + "_bmax").toFloat();
+      }
       out.sendMinOnRelease = !server.hasArg("s" + idx + "_o" + oidx + "_smin");
       if (server.hasArg("s" + idx + "_o" + oidx + "_udp")) {
         out.udpPayload = server.arg("s" + idx + "_o" + oidx + "_udp");
@@ -2608,23 +3320,28 @@ static void handleSaveTriggers() {
         out.offString = server.arg("s" + idx + "_o" + oidx + "_off");
         if (out.offString.length() == 0) out.offString = DEFAULT_OFF_STRING;
       }
+      if (server.hasArg("s" + idx + "_o" + oidx + "_bon")) {
+        out.buttonOnString = server.arg("s" + idx + "_o" + oidx + "_bon");
+        if (out.buttonOnString.length() == 0) out.buttonOnString = DEFAULT_ON_STRING;
+      }
+      if (server.hasArg("s" + idx + "_o" + oidx + "_boff")) {
+        out.buttonOffString = server.arg("s" + idx + "_o" + oidx + "_boff");
+        if (out.buttonOffString.length() == 0) out.buttonOffString = DEFAULT_OFF_STRING;
+      }
       if (out.oscAddress.length() == 0) out.oscAddress = defaultOscAddress(i);
       if (out.buttonAddress.length() == 0) out.buttonAddress = "/button";
-      if (s.type == SENSOR_ANALOG && out.outMode == OUT_STRING) out.outMode = OUT_FLOAT;
-      if (s.type == SENSOR_ANALOG || s.type == SENSOR_ENCODER) out.sendMinOnRelease = true;
+      if ((s.type == SENSOR_ANALOG || s.type == SENSOR_ENCODER) && out.outMode == OUT_STRING) out.outMode = OUT_FLOAT;
+      if (out.buttonOutMode == OUT_STRING) {
+        if (out.buttonOnString.length() == 0) out.buttonOnString = DEFAULT_ON_STRING;
+        if (out.buttonOffString.length() == 0) out.buttonOffString = DEFAULT_OFF_STRING;
+      }
+      if (s.type == SENSOR_ANALOG) out.sendMinOnRelease = true;
       s.outputs[outCount++] = out;
     }
     if (outCount == 0) {
       outCount = 1;
     }
     s.outputCount = outCount;
-
-    if (s.source == SRC_SENSORS && s.type == SENSOR_ENCODER) {
-      for (int o = 0; o < s.outputCount; o++) {
-        s.outputs[o].outMin = -1.0f;
-        s.outputs[o].outMax = 1.0f;
-      }
-    }
 
     s.invert = server.hasArg("s" + idx + "_inv");
     s.activeHigh = server.hasArg("s" + idx + "_ah");
@@ -2644,14 +3361,25 @@ static void handleSaveTriggers() {
           }
         }
       }
-      if (s.type == SENSOR_ENCODER) {
-        int clk = server.arg("s" + idx + "_clk").toInt();
-        int dt = server.arg("s" + idx + "_dt").toInt();
-        int sw = server.arg("s" + idx + "_sw").toInt();
-        if (clk >= 0 && clk <= 39 && !isReservedPin(clk) && isAllowedDigitalPin(clk)) s.encClkPin = clk;
-        if (dt >= 0 && dt <= 39 && !isReservedPin(dt) && isAllowedDigitalPin(dt)) s.encDtPin = dt;
-        if (sw >= 0 && sw <= 39 && !isReservedPin(sw) && isAllowedDigitalPin(sw)) s.encSwPin = sw;
-      }
+    if (s.type == SENSOR_ENCODER) {
+      int clk = server.arg("s" + idx + "_clk").toInt();
+      int dt = server.arg("s" + idx + "_dt").toInt();
+      int sw = server.arg("s" + idx + "_sw").toInt();
+      if (clk >= 0 && clk <= 39 && !isReservedPin(clk) && isAllowedDigitalPin(clk)) s.encClkPin = clk;
+      if (dt >= 0 && dt <= 39 && !isReservedPin(dt) && isAllowedDigitalPin(dt)) s.encDtPin = dt;
+      if (sw >= 0 && sw <= 39 && !isReservedPin(sw) && isAllowedDigitalPin(sw)) s.encSwPin = sw;
+      s.encAppendSign = server.hasArg("s" + idx + "_enc_app");
+      s.encSignArg = server.hasArg("s" + idx + "_enc_arg");
+      s.encInvert = server.hasArg("s" + idx + "_enc_inv");
+    } else if (s.type == SENSOR_HCSR04) {
+      int trig = server.arg("s" + idx + "_hc_t").toInt();
+      int echo = server.arg("s" + idx + "_hc_e").toInt();
+      if (trig >= 0 && trig <= 39 && !isReservedPin(trig) && isAllowedDigitalPin(trig)) s.hcTrigPin = trig;
+      if (echo >= 0 && echo <= 39 && !isReservedPin(echo) && isAllowedDigitalPin(echo)) s.hcEchoPin = echo;
+      if (server.hasArg("s" + idx + "_hc_min")) s.hcMinCm = server.arg("s" + idx + "_hc_min").toFloat();
+      if (server.hasArg("s" + idx + "_hc_max")) s.hcMaxCm = server.arg("s" + idx + "_hc_max").toFloat();
+      if (s.hcMaxCm == s.hcMinCm) s.hcMaxCm = s.hcMinCm + 1.0f;
+    }
     }
 
     config.sensors[i] = s;
@@ -2728,9 +3456,10 @@ static void handleSaveTriggers() {
 
   saveConfig();
   addLog("Triggers saved.");
+  resetRuntimeState(true);
   applySensorPinModes();
+  setupEncoderCounters();
   applyGpioOutputsNow();
-  resetRuntimeState();
 
   server.sendHeader("Location", "/", true);
   server.send(303, "text/plain", "Saved.");
@@ -2864,9 +3593,14 @@ static void handleSettings() {
   html += "</div>";
 
   html += "<div class='card'><b>Sensors</b><br>";
+  html += "<b>Buttons</b><br>";
   html += "Debounce ms: <input name='click_db' type='number' value='" + String(config.clickDebounceMs) + "'><br>";
   html += "Multi-click gap ms: <input name='click_gap' type='number' value='" + String(config.multiClickGapMs) + "'><br>";
-  html += "Long press ms: <input name='long_ms' type='number' value='" + String(config.longPressMs) + "'><br>";
+  html += "Long press ms: <input name='long_ms' type='number' value='" + String(config.longPressMs) + "'><br><br>";
+  html += "<b>Encoder</b><br>";
+  html += "<small>Steps per output is fixed at 2 (more sensitive).</small><br><br>";
+  html += "<b>Potentiometer / Ultrasonic</b><br>";
+  html += "Smoothing: <input name='analog_smooth' type='checkbox' " + String(config.analogSmoothing ? "checked" : "") + "><br>";
   html += "</div>";
 
   html += "<div class='card'><b>Time</b><br>";
@@ -2909,6 +3643,16 @@ static void handleSettings() {
   html += "<button type='submit' class='primary'>Save Settings</button>";
   html += "</form>";
 
+  html += "<div class='card'><b>Config Import/Export</b><br>";
+  html += "<div style='margin-top:6px;'>";
+  html += "<a href='/export_config' class='nav-pill'>Download Config</a>";
+  html += "</div>";
+  html += "<form method='POST' action='/import_config' enctype='multipart/form-data' style='margin-top:8px;'>";
+  html += "<input type='file' name='config' accept='.json,application/json,text/plain' style='margin-right:8px;'><button type='submit'>Import Config</button>";
+  html += "</form>";
+  html += "<small>Network settings and passwords are not included.</small><br>";
+  html += "</div>";
+
   html += "<div class='card'><b>Update</b><br>";
   html += "<div>Firmware version: <b>" + String(FIRMWARE_VERSION) + "</b></div>";
   html += "<div style='margin-top:8px;'><b>Firmware Update</b><br>";
@@ -2917,6 +3661,9 @@ static void handleSettings() {
   html += "<input type='file' name='update' accept='.bin'><br><br>";
   html += "<button type='submit' class='primary'>Install Update</button>";
   html += "</form></div><br>";
+  html += "</div>";
+
+  html += "<div class='card'><b>Device</b><br>";
   html += "<button type='button' id='reboot_btn'>Reboot Device</button> ";
   html += "<button type='button' id='factory_reset_btn' class='danger'>Factory Reset</button>";
   html += "</div>";
@@ -2951,6 +3698,7 @@ static void handleSettings() {
   html += "list.forEach(item=>{const o=document.createElement('option');o.value=item.ssid;o.textContent=item.ssid+' ('+item.rssi+'dBm)';wifiSelect.appendChild(o);});";
   html += "const o=document.createElement('option');o.value='__custom__';o.textContent='Custom...';wifiSelect.appendChild(o);";
   html += "const current=wifiInput.value; if(current){for(const opt of wifiSelect.options){if(opt.value===current){wifiSelect.value=current;break;}}}";
+  html += "if(!current && wifiSelect.options.length){const first=wifiSelect.options[0]; if(first && first.value && first.value!=='__custom__'){wifiSelect.value=first.value; wifiInput.value=first.value;}}";
   html += "}).catch(()=>{wifiSelect.innerHTML='';const o=document.createElement('option');o.textContent='Scan failed';o.value='';wifiSelect.appendChild(o);});";
   html += "});}";
   html += "const testBtn=document.getElementById('test_send_btn');";
@@ -2999,19 +3747,41 @@ static void handleSettings() {
   html += "}";
   html += "if(tgt && tgt.value!=='0'){return;}";
   html += "const addrInput=document.getElementById('s'+idx+'_o'+oidx+'_addr');";
-  html += "const encAddr=document.getElementById('s'+idx+'_o'+oidx+'_enc_addr');";
-  html += "const addr=isEnc?(encAddr?encAddr.value:''):(addrInput?addrInput.value:'');";
+  html += "const encAddrInput=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_enc_addr']\");";
+  html += "const btnAddrInput=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_btn_addr']\");";
+  html += "const useBtn=(kind==='bmin' || kind==='bmax');";
+  html += "const addr=useBtn?(btnAddrInput?btnAddrInput.value:''):(isEnc?(encAddrInput?encAddrInput.value:''):(addrInput?addrInput.value:''));";
   html += "const dev=document.getElementById('s'+idx+'_o'+oidx+'_dev');";
   html += "const om=document.getElementById('s'+idx+'_o'+oidx+'_omode');";
   html += "const onStr=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_on']\");";
   html += "const offStr=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_off']\");";
   html += "const omin=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_omin']\");";
   html += "const omax=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_omax']\");";
+  html += "const bm=document.getElementById('s'+idx+'_o'+oidx+'_bmode');";
+  html += "const bon=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_bon']\");";
+  html += "const boff=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_boff']\");";
+  html += "const bmin=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_bmin']\");";
+  html += "const bmax=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_bmax']\");";
   html += "if(!addr){return;}";
   html += "const data=new URLSearchParams();";
   html += "data.set('test_addr',addr);";
   html += "if(dev){data.set('test_dev',dev.value);}"; 
-  html += "if(om&&om.value==='2'){";
+  html += "if(useBtn){";
+  html += "const mode=bm?bm.value:'0';";
+  html += "if(mode==='2'){";
+  html += "data.set('test_type','string');";
+  html += "const v=(kind==='bmax')?(bon?bon.value:''):(boff?boff.value:'');";
+  html += "data.set('test_value',v||'');";
+  html += "}else if(mode==='1'){";
+  html += "data.set('test_type','float');";
+  html += "const v=(kind==='bmax')?(bmax?bmax.value:'0'):(bmin?bmin.value:'0');";
+  html += "data.set('test_value',v);";
+  html += "}else{";
+  html += "data.set('test_type','int');";
+  html += "const v=(kind==='bmax')?(bmax?bmax.value:'0'):(bmin?bmin.value:'0');";
+  html += "data.set('test_value',v);";
+  html += "}";
+  html += "}else if(om&&om.value==='2'){";
   html += "data.set('test_type','string');";
   html += "const v=(kind==='max')?(onStr?onStr.value:''):(offStr?offStr.value:'');";
   html += "data.set('test_value',v||'');";
@@ -3211,6 +3981,7 @@ static void handleSaveSettings() {
     uint32_t ms = static_cast<uint32_t>(server.arg("long_ms").toInt());
     if (ms > 0) config.longPressMs = ms;
   }
+  config.analogSmoothing = server.hasArg("analog_smooth");
   if (server.hasArg("time_mode")) {
     uint8_t mode = static_cast<uint8_t>(server.arg("time_mode").toInt());
     if (mode <= TIME_MANUAL) config.timeMode = mode;
@@ -3259,9 +4030,73 @@ static void handleSaveSettings() {
   pendingNetApply = true;
   pendingApplyAt = millis();
   pendingMdnsRestart = (config.hostname != oldHostname);
+  setupEncoderCounters();
 
   server.sendHeader("Location", "/settings", true);
   server.send(303, "text/plain", "Saved.");
+}
+
+static void handleExportConfig() {
+  if (!ensureAuthenticated()) return;
+  String payload = exportConfigJson();
+  server.sendHeader("Content-Disposition", "attachment; filename=stagemod-config.json");
+  server.send(200, "application/json", payload);
+}
+
+static void handleImportUpload() {
+  HTTPUpload& upload = server.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    importPayload = "";
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    importPayload += String((const char*)upload.buf, upload.currentSize);
+  } else if (upload.status == UPLOAD_FILE_END) {
+    // no-op
+  }
+}
+
+static void handleImportConfig() {
+  if (!ensureAuthenticated()) return;
+  if (importPayload.length() == 0) {
+    server.send(400, "text/plain", "Import failed: no file content received.");
+    return;
+  }
+
+  DynamicJsonDocument doc(32768);
+  DeserializationError err = deserializeJson(doc, importPayload);
+  if (err) {
+    server.send(400, "text/plain", String("Import failed: invalid JSON (") + err.c_str() + ").");
+    return;
+  }
+
+  String fileVersion = doc["version"] | "";
+  JsonObject cfg = doc["config"].as<JsonObject>();
+  String applyErr;
+  if (!applyConfigFromJson(cfg, applyErr)) {
+    server.send(400, "text/plain", String("Import failed: ") + applyErr);
+    return;
+  }
+
+  saveConfig();
+  setupEncoderCounters();
+  applyTimeConfig();
+
+  String msg = "<html><body><h3>Import complete</h3>";
+  if (fileVersion.length() > 0) {
+    int cmp = compareVersion(fileVersion, FIRMWARE_VERSION);
+    if (cmp < 0) {
+      msg += "<p>Warning: Imported config is from an older firmware (" + fileVersion + ") than this device (" + String(FIRMWARE_VERSION) + ").</p>";
+    } else if (cmp > 0) {
+      msg += "<p>Warning: Imported config is from a newer firmware (" + fileVersion + ") than this device (" + String(FIRMWARE_VERSION) + ").</p>";
+    } else {
+      msg += "<p>Config version matches firmware (" + String(FIRMWARE_VERSION) + ").</p>";
+    }
+  } else {
+    msg += "<p>Config version not found in file.</p>";
+  }
+  msg += "<p>Network settings and passwords are not imported.</p>";
+  msg += "<p><a href='/settings'>Back to settings</a></p></body></html>";
+  server.send(200, "text/html", msg);
+  importPayload = "";
 }
 
 static void handleSendTestOsc() {
@@ -3520,6 +4355,8 @@ void setup() {
   server.on("/logs.txt", HTTP_GET, handleLogsText);
   server.on("/update", HTTP_GET, handleUpdatePage);
   server.on("/update", HTTP_POST, handleUpdateFinished, handleUpdateUpload);
+  server.on("/export_config", HTTP_GET, handleExportConfig);
+  server.on("/import_config", HTTP_POST, handleImportConfig, handleImportUpload);
   server.on("/generate_204", HTTP_GET, []() {
     server.sendHeader("Location", "/settings", true);
     server.send(302, "text/plain", "");
@@ -3544,6 +4381,7 @@ void setup() {
   Serial.println("Web server started.");
 
   applySensorPinModes();
+  setupEncoderCounters();
 }
 
 void loop() {
@@ -3594,54 +4432,162 @@ void loop() {
     bool cooldownTriggered = false;
 
     if (isEncoder) {
-      int a = digitalRead(s.encClkPin);
-      int b = digitalRead(s.encDtPin);
-      int state = (a << 1) | b;
-      if (lastEncState[i] < 0) {
-        lastEncState[i] = state;
-      }
-      if (lastEncState[i] >= 0) {
-        static const int8_t kEncTable[16] = {
-          0, -1, 1, 0,
-          1, 0, 0, -1,
-          -1, 0, 0, 1,
-          0, 1, -1, 0
-        };
-        int idx = (lastEncState[i] << 2) | state;
-        int8_t delta = kEncTable[idx];
-        if (delta != 0) {
-          encAccum[i] += delta;
-          if (encAccum[i] >= 2) {
-            for (int o = 0; o < s.outputCount; o++) {
-              const SensorConfig::OutputConfig& out = s.outputs[o];
-              if (out.target != OUT_TARGET_OSC) continue;
-              if (out.oscAddress.length() == 0) continue;
-              IPAddress ip;
-              uint16_t port;
-              if (!getOscTarget(out.device, ip, port)) continue;
-              sendOscIntTo(ip, port, out.oscAddress.c_str(), 1);
-            }
-            encAccum[i] = 0;
-          } else if (encAccum[i] <= -2) {
-            for (int o = 0; o < s.outputCount; o++) {
-              const SensorConfig::OutputConfig& out = s.outputs[o];
-              if (out.target != OUT_TARGET_OSC) continue;
-              if (out.oscAddress.length() == 0) continue;
-              IPAddress ip;
-              uint16_t port;
-              if (!getOscTarget(out.device, ip, port)) continue;
-              sendOscIntTo(ip, port, out.oscAddress.c_str(), -1);
-            }
-            encAccum[i] = 0;
+      int8_t unit = encUnitByTrigger[i];
+      if (unit >= 0) {
+        int16_t count = 0;
+        pcnt_get_counter_value(static_cast<pcnt_unit_t>(unit), &count);
+        if (count != 0) {
+          if (s.encInvert) count = -count;
+          encAccum[i] += count;
+          pcnt_counter_clear(static_cast<pcnt_unit_t>(unit));
+        }
+      } else {
+        int a = digitalRead(s.encClkPin);
+        int b = digitalRead(s.encDtPin);
+        int state = (a << 1) | b;
+        if (lastEncState[i] < 0) {
+          lastEncState[i] = state;
+        }
+        if (lastEncState[i] >= 0) {
+          static const int8_t kEncTable[16] = {
+            0, -1, 1, 0,
+            1, 0, 0, -1,
+            -1, 0, 0, 1,
+            0, 1, -1, 0
+          };
+          int idx = (lastEncState[i] << 2) | state;
+          int8_t delta = kEncTable[idx];
+          if (delta != 0) {
+            if (s.encInvert) delta = -delta;
+            encAccum[i] += delta;
           }
         }
+        lastEncState[i] = state;
+        lastEncA[i] = a;
+        lastEncB[i] = b;
       }
-      lastEncState[i] = state;
-      lastEncA[i] = a;
-      lastEncB[i] = b;
+
+      int encSteps = s.encSteps;
+      if (encSteps < 1) encSteps = 1;
+      if (encSteps > 4) encSteps = 4;
+      while (encAccum[i] >= encSteps) {
+        for (int o = 0; o < s.outputCount; o++) {
+          const SensorConfig::OutputConfig& out = s.outputs[o];
+          if (out.target != OUT_TARGET_OSC) continue;
+          if (out.oscAddress.length() == 0) continue;
+          IPAddress ip;
+          uint16_t port;
+          if (!getOscTarget(out.device, ip, port)) continue;
+          const char* sign = "+";
+          String addr = out.oscAddress;
+          if (s.encAppendSign) addr += "/+";
+          int step = lroundf(fabsf(mapOutput(out, 1.0f)));
+          if (step == 0) step = 1;
+          if (s.encSignArg) {
+            if (out.outMode == OUT_FLOAT) {
+              sendOscStringFloatTo(ip, port, addr.c_str(), sign, static_cast<float>(step));
+            } else {
+              sendOscStringIntTo(ip, port, addr.c_str(), sign, step);
+            }
+          } else {
+            if (s.encAppendSign) {
+              if (out.outMode == OUT_FLOAT) {
+                sendOscFloatTo(ip, port, addr.c_str(), static_cast<float>(step));
+              } else {
+                sendOscIntTo(ip, port, addr.c_str(), step);
+              }
+            } else {
+              if (out.outMode == OUT_FLOAT) {
+                sendOscFloatTo(ip, port, addr.c_str(), static_cast<float>(step));
+              } else {
+                sendOscIntTo(ip, port, addr.c_str(), step);
+              }
+            }
+          }
+        }
+        encAccum[i] -= encSteps;
+      }
+      while (encAccum[i] <= -encSteps) {
+        for (int o = 0; o < s.outputCount; o++) {
+          const SensorConfig::OutputConfig& out = s.outputs[o];
+          if (out.target != OUT_TARGET_OSC) continue;
+          if (out.oscAddress.length() == 0) continue;
+          IPAddress ip;
+          uint16_t port;
+          if (!getOscTarget(out.device, ip, port)) continue;
+          const char* sign = "-";
+          String addr = out.oscAddress;
+          if (s.encAppendSign) addr += "/-";
+          int step = lroundf(fabsf(mapOutput(out, 1.0f)));
+          if (step == 0) step = 1;
+          if (s.encSignArg) {
+            if (out.outMode == OUT_FLOAT) {
+              sendOscStringFloatTo(ip, port, addr.c_str(), sign, static_cast<float>(step));
+            } else {
+              sendOscStringIntTo(ip, port, addr.c_str(), sign, step);
+            }
+          } else {
+            if (s.encAppendSign) {
+              if (out.outMode == OUT_FLOAT) {
+                sendOscFloatTo(ip, port, addr.c_str(), static_cast<float>(step));
+              } else {
+                sendOscIntTo(ip, port, addr.c_str(), step);
+              }
+            } else {
+              int signedStep = -step;
+              if (out.outMode == OUT_FLOAT) {
+                sendOscFloatTo(ip, port, addr.c_str(), static_cast<float>(signedStep));
+              } else {
+                sendOscIntTo(ip, port, addr.c_str(), signedStep);
+              }
+            }
+          }
+        }
+        encAccum[i] += encSteps;
+      }
 
       bool pressed = (digitalRead(s.encSwPin) == LOW);
       norm = pressed ? 1.0f : 0.0f;
+
+      // Prime encoder outputs on first loop after reset/save to avoid sending
+      // a "default/off" message when nothing actually changed.
+      if (prevLevel == -1) {
+        lastLevel[i] = pressed ? 1 : 0;
+        for (int o = 0; o < s.outputCount; o++) {
+          const SensorConfig::OutputConfig& out = s.outputs[o];
+          const bool useButtonOsc = (out.target == OUT_TARGET_OSC);
+          const OutputMode outMode = useButtonOsc ? out.buttonOutMode : out.outMode;
+          const float outMin = useButtonOsc ? out.buttonOutMin : out.outMin;
+          const float outMax = useButtonOsc ? out.buttonOutMax : out.outMax;
+          if (out.target == OUT_TARGET_GPIO) {
+            if (out.gpioMode == GPIO_OUT_PWM) {
+              float outputValue = mapOutputRange(norm, outMin, outMax);
+              outputValue = snapOutputRange(outputValue, outMin, outMax);
+              int duty = lroundf(outputValue);
+              if (duty < 0) duty = 0;
+              if (duty > GPIO_PWM_MAX) duty = GPIO_PWM_MAX;
+              if (out.gpioInvert) duty = GPIO_PWM_MAX - duty;
+              lastInt[i][o] = duty;
+            } else {
+              lastBool[i][o] = pressed ? 1 : 0;
+            }
+          } else if (out.target == OUT_TARGET_UDP || out.target == OUT_TARGET_HTTP || out.target == OUT_TARGET_OSC) {
+            if (outMode == OUT_STRING) {
+              lastBool[i][o] = pressed ? 1 : 0;
+            } else if (outMode == OUT_FLOAT) {
+              float outputValue = mapOutputRange(norm, outMin, outMax);
+              outputValue = snapOutputRange(outputValue, outMin, outMax);
+              lastFloat[i][o] = outputValue;
+            } else {
+              float outputValue = mapOutputRange(norm, outMin, outMax);
+              outputValue = snapOutputRange(outputValue, outMin, outMax);
+              int intValue = lroundf(outputValue);
+              lastInt[i][o] = intValue;
+            }
+          }
+        }
+        continue;
+      }
     }
 
     if (s.type == SENSOR_BUTTON_DOUBLE) {
@@ -3659,9 +4605,16 @@ void loop() {
       processClickPattern(i, s, pressed, 0, true);
       continue;
     }
+    if (s.type == SENSOR_BUTTON && hasSharedClickPattern(i)) {
+      bool pressed = readDigitalActive(s);
+      processClickPattern(i, s, pressed, 1, false);
+      continue;
+    }
 
     if (s.type == SENSOR_ANALOG) {
       norm = readAnalogNormalized(i, s);
+    } else if (s.type == SENSOR_HCSR04) {
+      norm = readHcSr04Normalized(i, s);
     } else if (!isEncoder) {
       active = readDigitalActive(s);
       if (s.type == SENSOR_TOGGLE) {
@@ -3700,13 +4653,23 @@ void loop() {
     }
 
     bool risingEdge = false;
-    if (!isEncoder && s.type != SENSOR_ANALOG) {
+    if (isEncoder) {
+      bool pressed = (norm >= 0.5f);
+      risingEdge = pressed && (prevLevel <= 0);
+      lastLevel[i] = pressed ? 1 : 0;
+    } else if (s.type != SENSOR_ANALOG) {
       risingEdge = active && (prevLevel <= 0);
     }
 
     for (int o = 0; o < s.outputCount; o++) {
       const SensorConfig::OutputConfig& out = s.outputs[o];
-      const String& outAddress = isEncoder ? out.buttonAddress : out.oscAddress;
+      const bool useButtonOsc = isEncoder && out.target == OUT_TARGET_OSC;
+      const String& outAddress = useButtonOsc ? out.buttonAddress : out.oscAddress;
+      const OutputMode outMode = useButtonOsc ? out.buttonOutMode : out.outMode;
+      const float outMin = useButtonOsc ? out.buttonOutMin : out.outMin;
+      const float outMax = useButtonOsc ? out.buttonOutMax : out.outMax;
+      const String& onStr = useButtonOsc ? out.buttonOnString : out.onString;
+      const String& offStr = useButtonOsc ? out.buttonOffString : out.offString;
       bool changed = false;
 
       if (out.target == OUT_TARGET_REBOOT) {
@@ -3777,7 +4740,7 @@ void loop() {
       }
 
       if (out.target == OUT_TARGET_HTTP) {
-        if (!out.sendMinOnRelease && !isEncoder && s.type != SENSOR_ANALOG) {
+        if (!out.sendMinOnRelease && s.type != SENSOR_ANALOG) {
           bool rising = (norm >= 0.5f) && (prevLevel <= 0);
           if (!rising) {
             continue;
@@ -3785,31 +4748,35 @@ void loop() {
           sendHttpRequest(out, 1.0f);
           continue;
         }
-        if (out.outMode == OUT_STRING) {
+        if (outMode == OUT_STRING) {
           int8_t state = (norm >= 0.5f) ? 1 : 0;
           if (lastBool[i][o] == -1 || state != lastBool[i][o]) {
             sendHttpRequest(out, norm);
             lastBool[i][o] = state;
           }
-        } else if (out.outMode == OUT_FLOAT) {
-          float outputValue = mapOutput(out, norm);
-          outputValue = snapOutput(out, outputValue);
+        } else if (outMode == OUT_FLOAT) {
+          float outputValue = mapOutputRange(norm, outMin, outMax);
+          outputValue = snapOutputRange(outputValue, outMin, outMax);
           if (isnan(lastFloat[i][o]) || fabsf(outputValue - lastFloat[i][o]) > 0.0005f) {
             sendHttpRequest(out, norm);
             lastFloat[i][o] = outputValue;
           }
-        } else {
-          float outputValue = mapOutput(out, norm);
-          outputValue = snapOutput(out, outputValue);
-          int intValue = lroundf(outputValue);
-          if (s.type == SENSOR_ANALOG && lastInt[i][o] >= 0 && abs(intValue - lastInt[i][o]) <= DEAD_BAND) {
+      } else {
+        float outputValue = mapOutputRange(norm, outMin, outMax);
+        outputValue = snapOutputRange(outputValue, outMin, outMax);
+        int intValue = lroundf(outputValue);
+        bool canSend = true;
+        if (s.type == SENSOR_ANALOG) {
+          if (lastInt[i][o] >= 0 && abs(intValue - lastInt[i][o]) <= DEAD_BAND) {
             intValue = lastInt[i][o];
-          }
-          if (intValue != lastInt[i][o]) {
-            sendHttpRequest(out, norm);
-            lastInt[i][o] = intValue;
+            canSend = false;
           }
         }
+        if (intValue != lastInt[i][o] && canSend) {
+          sendHttpRequest(out, norm);
+          lastInt[i][o] = intValue;
+        }
+      }
         continue;
       }
 
@@ -3823,7 +4790,7 @@ void loop() {
         if (out.udpPayload.length() == 0) continue;
         bool pressed = (norm >= 0.5f);
         bool rising = pressed && (prevLevel <= 0);
-        if (!out.sendMinOnRelease && !isEncoder && s.type != SENSOR_ANALOG) {
+        if (!out.sendMinOnRelease && s.type != SENSOR_ANALOG) {
           if (!rising) {
             continue;
           }
@@ -3841,24 +4808,24 @@ void loop() {
 
       if (outAddress.length() == 0) continue;
 
-      if (!out.sendMinOnRelease && !isEncoder && s.type != SENSOR_ANALOG) {
+      if (!out.sendMinOnRelease && s.type != SENSOR_ANALOG) {
         if (!risingEdge) {
           continue;
         }
-        if (out.outMode == OUT_STRING) {
-          const char* value = out.onString.c_str();
+        if (outMode == OUT_STRING) {
+          const char* value = onStr.c_str();
           if (value[0] != '\0') {
             sendOscStringTo(outIp, outPort, outAddress.c_str(), value);
             lastBool[i][o] = 1;
           }
-        } else if (out.outMode == OUT_FLOAT) {
-          float outputValue = mapOutput(out, 1.0f);
-          outputValue = snapOutput(out, outputValue);
+        } else if (outMode == OUT_FLOAT) {
+          float outputValue = mapOutputRange(1.0f, outMin, outMax);
+          outputValue = snapOutputRange(outputValue, outMin, outMax);
           sendOscFloatTo(outIp, outPort, outAddress.c_str(), outputValue);
           lastFloat[i][o] = outputValue;
         } else {
-          float outputValue = mapOutput(out, 1.0f);
-          outputValue = snapOutput(out, outputValue);
+          float outputValue = mapOutputRange(1.0f, outMin, outMax);
+          outputValue = snapOutputRange(outputValue, outMin, outMax);
           int intValue = lroundf(outputValue);
           sendOscIntTo(outIp, outPort, outAddress.c_str(), intValue);
           lastInt[i][o] = intValue;
@@ -3866,11 +4833,11 @@ void loop() {
         continue;
       }
 
-      if (out.outMode == OUT_STRING) {
+      if (outMode == OUT_STRING) {
         int8_t state = (norm >= 0.5f) ? 1 : 0;
         changed = (lastBool[i][o] == -1) || (state != lastBool[i][o]);
         if (changed) {
-          const char* value = (state == 1) ? out.onString.c_str() : out.offString.c_str();
+          const char* value = (state == 1) ? onStr.c_str() : offStr.c_str();
           if (value[0] != '\0') {
             sendOscStringTo(outIp, outPort, outAddress.c_str(), value);
             lastBool[i][o] = state;
@@ -3878,22 +4845,26 @@ void loop() {
             changed = false;
           }
         }
-      } else if (out.outMode == OUT_FLOAT) {
-        float outputValue = mapOutput(out, norm);
-        outputValue = snapOutput(out, outputValue);
-        changed = isnan(lastFloat[i][o]) || fabsf(outputValue - lastFloat[i][o]) > 0.0005f;
+      } else if (outMode == OUT_FLOAT) {
+        float outputValue = mapOutputRange(norm, outMin, outMax);
+        outputValue = snapOutputRange(outputValue, outMin, outMax);
+        changed = (isnan(lastFloat[i][o]) || fabsf(outputValue - lastFloat[i][o]) > 0.0005f);
         if (changed) {
           sendOscFloatTo(outIp, outPort, outAddress.c_str(), outputValue);
           lastFloat[i][o] = outputValue;
         }
       } else {
-        float outputValue = mapOutput(out, norm);
-        outputValue = snapOutput(out, outputValue);
+        float outputValue = mapOutputRange(norm, outMin, outMax);
+        outputValue = snapOutputRange(outputValue, outMin, outMax);
         int intValue = lroundf(outputValue);
-        if (s.type == SENSOR_ANALOG && lastInt[i][o] >= 0 && abs(intValue - lastInt[i][o]) <= DEAD_BAND) {
-          intValue = lastInt[i][o];
+        bool canSend = true;
+        if (s.type == SENSOR_ANALOG) {
+          if (lastInt[i][o] >= 0 && abs(intValue - lastInt[i][o]) <= DEAD_BAND) {
+            intValue = lastInt[i][o];
+            canSend = false;
+          }
         }
-        changed = (intValue != lastInt[i][o]);
+        changed = (intValue != lastInt[i][o]) && canSend;
         if (changed) {
           sendOscIntTo(outIp, outPort, outAddress.c_str(), intValue);
           lastInt[i][o] = intValue;
@@ -3904,9 +4875,9 @@ void loop() {
         Serial.print("Sent ");
         Serial.print(outAddress);
         Serial.print(" = ");
-        if (out.outMode == OUT_STRING) {
-          Serial.println((norm >= 0.5f) ? out.onString : out.offString);
-        } else if (out.outMode == OUT_FLOAT) {
+        if (outMode == OUT_STRING) {
+          Serial.println((norm >= 0.5f) ? onStr : offStr);
+        } else if (outMode == OUT_FLOAT) {
           Serial.println(lastFloat[i][o], 4);
         } else {
           Serial.println(lastInt[i][o]);
