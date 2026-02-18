@@ -23,6 +23,7 @@
 #include <WebServer.h>
 #include <Update.h>
 #include <ArduinoJson.h>
+#include <PubSubClient.h>
 
 // =========================
 // Config (edit these)
@@ -45,10 +46,19 @@ const char* DEFAULT_NTP_SERVER = "pool.ntp.org";
 const uint8_t DEFAULT_TIME_MODE = 0; // 0 = NTP, 1 = Manual
 const char* DEFAULT_TIMEZONE = "PST8PDT,M3.2.0/2,M11.1.0/2";
 const bool DEFAULT_TIME_DISPLAY_24H = false;
+const bool DEFAULT_MQTT_ENABLED = false;
+const char* DEFAULT_MQTT_HOST = "";
+const uint16_t DEFAULT_MQTT_PORT = 1883;
+const char* DEFAULT_MQTT_USER = "";
+const char* DEFAULT_MQTT_PASS = "";
+const char* DEFAULT_MQTT_CLIENT_ID = "";
+const char* DEFAULT_MQTT_BASE_TOPIC = "stagemod";
+const uint8_t DEFAULT_MQTT_DEVICE = 0;
 
 const int MAX_TRIGGERS = 20;
 const int MAX_OSC_DEVICES = 8;
 const int MAX_OUTPUTS_PER_TRIGGER = 5;
+const uint8_t MQTT_DEVICE_CUSTOM = 255;
 
 enum NetMode {
   NET_ETHERNET = 0,
@@ -97,7 +107,8 @@ enum OutputTarget {
   OUT_TARGET_RESET_COOLDOWNS = 2,
   OUT_TARGET_UDP = 3,
   OUT_TARGET_GPIO = 4,
-  OUT_TARGET_HTTP = 5
+  OUT_TARGET_HTTP = 5,
+  OUT_TARGET_MQTT = 6
 };
 
 enum GpioOutMode {
@@ -207,6 +218,9 @@ struct SensorConfig {
     String httpIp;
     uint16_t httpPort;
     uint8_t httpDevice;
+    String mqttTopic;
+    String mqttPayload;
+    bool mqttRetain;
     String onString;
     String offString;
     String buttonOnString;
@@ -249,6 +263,14 @@ struct Config {
   String timeZone;
   uint32_t manualEpoch;
   bool timeDisplay24h;
+  bool mqttEnabled;
+  uint8_t mqttDevice;
+  String mqttHost;
+  uint16_t mqttPort;
+  String mqttUser;
+  String mqttPass;
+  String mqttClientId;
+  String mqttBaseTopic;
   uint8_t triggerCount;
   uint8_t triggerOrder[MAX_TRIGGERS];
   uint8_t oscDeviceCount;
@@ -286,6 +308,8 @@ int8_t gpioPwmChannelByPin[40];
 uint8_t nextGpioPwmChannel = 0;
 int8_t gpioPulseEndLevelByPin[40];
 WiFiUDP udp;
+WiFiClient mqttNetClient;
+PubSubClient mqttClient(mqttNetClient);
 WebServer server(80);
 Preferences prefs;
 bool pendingNetApply = false;
@@ -305,6 +329,8 @@ String logLines[LOG_LINES];
 int logHead = 0;
 int logCount = 0;
 String importPayload;
+unsigned long mqttLastConnectAttemptMs = 0;
+bool mqttReconnectRequested = false;
 
 static String ipToString(const IPAddress& ip);
 static bool parseIpString(const String& s, IPAddress& out);
@@ -335,6 +361,17 @@ static bool handleTimeTrigger(int index, SensorConfig& s);
 static int compareVersion(const String& a, const String& b);
 static String exportConfigJson();
 static bool applyConfigFromJson(const JsonObject& cfg, String& err);
+static String defaultMqttClientId();
+static String sanitizeMqttTopicSegment(const String& raw);
+static String buildDefaultMqttTopic(const SensorConfig& sensor, int triggerIndex, int outputIndex);
+static bool isAutoMqttTopic(const String& topic,
+                            const SensorConfig& previousSensor,
+                            const SensorConfig& currentSensor,
+                            int triggerIndex,
+                            int outputIndex);
+static void configureMqttClient();
+static bool ensureMqttConnected();
+static bool sendMqttMessage(const String& topic, const String& payload, bool retain);
 
 static int readAveragedADC(int pin) {
   uint32_t acc = 0;
@@ -401,17 +438,6 @@ static float readHcSr04Normalized(int index, const SensorConfig& sensor) {
   digitalWrite(sensor.hcTrigPin, LOW);
 
   unsigned long duration = pulseIn(sensor.hcEchoPin, HIGH, 25000); // ~4m max
-  float dist = (duration == 0) ? -1.0f : (duration / 58.0f);
-  if (dist < 0) {
-    if (ema[index] >= 0) {
-      float norm = ema[index] / 4095.0f;
-      norm = clampFloat(norm, 0.0f, 1.0f);
-      if (sensor.invert) norm = 1.0f - norm;
-      return norm;
-    }
-    return 0.0f;
-  }
-
   float minCm = sensor.hcMinCm;
   float maxCm = sensor.hcMaxCm;
   bool invertRange = false;
@@ -424,6 +450,10 @@ static float readHcSr04Normalized(int index, const SensorConfig& sensor) {
   if (maxCm == minCm) {
     return 0.0f;
   }
+
+  // No echo usually means "out of range / nothing in front".
+  // Map that to far distance endpoint instead of freezing the last value.
+  float dist = (duration == 0) ? (maxCm + 1.0f) : (duration / 58.0f);
   float norm = (dist - minCm) / (maxCm - minCm);
   if (invertRange) norm = 1.0f - norm;
   norm = clampFloat(norm, 0.0f, 1.0f);
@@ -502,6 +532,86 @@ static String sanitizeHostname(const String& raw) {
     out = DEFAULT_HOSTNAME;
   }
   return out;
+}
+
+static String defaultMqttClientId() {
+  uint64_t chip = ESP.getEfuseMac();
+  char buf[32];
+  snprintf(buf, sizeof(buf), "stagemod-%06llx", static_cast<unsigned long long>(chip & 0xFFFFFFULL));
+  return String(buf);
+}
+
+static String sanitizeMqttTopicSegment(const String& raw) {
+  String in = raw;
+  in.trim();
+  String out;
+  out.reserve(in.length());
+  bool wroteSep = false;
+  for (size_t i = 0; i < in.length(); i++) {
+    char c = in[i];
+    bool ok = ((c >= 'a' && c <= 'z') ||
+               (c >= 'A' && c <= 'Z') ||
+               (c >= '0' && c <= '9') ||
+               c == '_' || c == '-');
+    if (ok) {
+      out += c;
+      wroteSep = false;
+      continue;
+    }
+    if (out.length() > 0 && !wroteSep) {
+      out += '_';
+      wroteSep = true;
+    }
+  }
+  while (out.startsWith("_")) out.remove(0, 1);
+  while (out.endsWith("_")) out.remove(out.length() - 1, 1);
+  return out;
+}
+
+static String buildDefaultMqttTopic(const SensorConfig& sensor, int triggerIndex, int outputIndex) {
+  String base = config.mqttBaseTopic;
+  base.trim();
+  if (base.length() == 0) base = DEFAULT_MQTT_BASE_TOPIC;
+  while (base.endsWith("/")) base.remove(base.length() - 1, 1);
+
+  String triggerSegment = sanitizeMqttTopicSegment(sensor.name);
+  if (triggerSegment.length() == 0) {
+    triggerSegment = String("trigger_") + String(triggerIndex + 1);
+  }
+  return base + "/" + triggerSegment + "/output/" + String(outputIndex + 1);
+}
+
+static bool isAutoMqttTopic(const String& topic,
+                            const SensorConfig& previousSensor,
+                            const SensorConfig& currentSensor,
+                            int triggerIndex,
+                            int outputIndex) {
+  String t = topic;
+  t.trim();
+  if (t.length() == 0) return true;
+
+  String trigNum = String(triggerIndex + 1);
+  String outNum = String(outputIndex + 1);
+  String legacyNoOut = "trigger/" + trigNum;
+  String legacyWithOut = legacyNoOut + "/output/" + outNum;
+  if (t == legacyNoOut || t == legacyWithOut ||
+      t.endsWith("/" + legacyNoOut) || t.endsWith("/" + legacyWithOut)) {
+    return true;
+  }
+
+  String prevSeg = sanitizeMqttTopicSegment(previousSensor.name);
+  if (prevSeg.length() > 0) {
+    String prevWithOut = prevSeg + "/output/" + outNum;
+    if (t == prevWithOut || t.endsWith("/" + prevWithOut)) return true;
+  }
+
+  String curSeg = sanitizeMqttTopicSegment(currentSensor.name);
+  if (curSeg.length() > 0) {
+    String curWithOut = curSeg + "/output/" + outNum;
+    if (t == curWithOut || t.endsWith("/" + curWithOut)) return true;
+  }
+
+  return false;
 }
 
 static IPAddress getLocalIp() {
@@ -593,6 +703,13 @@ static String exportConfigJson() {
   c["timeZone"] = config.timeZone;
   c["manualEpoch"] = config.manualEpoch;
   c["timeDisplay24h"] = config.timeDisplay24h;
+  c["mqttEnabled"] = config.mqttEnabled;
+  c["mqttDevice"] = config.mqttDevice;
+  c["mqttHost"] = config.mqttHost;
+  c["mqttPort"] = config.mqttPort;
+  c["mqttUser"] = config.mqttUser;
+  c["mqttClientId"] = config.mqttClientId;
+  c["mqttBaseTopic"] = config.mqttBaseTopic;
 
   c["oscDeviceCount"] = config.oscDeviceCount;
   JsonArray devOrder = c.createNestedArray("oscDeviceOrder");
@@ -671,6 +788,9 @@ static String exportConfigJson() {
       oo["httpIp"] = out.httpIp;
       oo["httpPort"] = out.httpPort;
       oo["httpDevice"] = out.httpDevice;
+      oo["mqttTopic"] = out.mqttTopic;
+      oo["mqttPayload"] = out.mqttPayload;
+      oo["mqttRetain"] = out.mqttRetain;
       oo["onString"] = out.onString;
       oo["offString"] = out.offString;
       oo["buttonOnString"] = out.buttonOnString;
@@ -715,6 +835,21 @@ static bool applyConfigFromJson(const JsonObject& cfg, String& err) {
   if (cfg.containsKey("timeZone")) config.timeZone = String(cfg["timeZone"].as<const char*>());
   if (cfg.containsKey("manualEpoch")) config.manualEpoch = cfg["manualEpoch"];
   if (cfg.containsKey("timeDisplay24h")) config.timeDisplay24h = cfg["timeDisplay24h"];
+  if (cfg.containsKey("mqttEnabled")) config.mqttEnabled = cfg["mqttEnabled"];
+  if (cfg.containsKey("mqttDevice")) {
+    int d = cfg["mqttDevice"];
+    if ((d >= 0 && d < MAX_OSC_DEVICES) || d == MQTT_DEVICE_CUSTOM) {
+      config.mqttDevice = static_cast<uint8_t>(d);
+    }
+  }
+  if (cfg.containsKey("mqttHost")) config.mqttHost = String(cfg["mqttHost"].as<const char*>());
+  if (cfg.containsKey("mqttPort")) {
+    uint16_t p = cfg["mqttPort"];
+    if (p > 0) config.mqttPort = p;
+  }
+  if (cfg.containsKey("mqttUser")) config.mqttUser = String(cfg["mqttUser"].as<const char*>());
+  if (cfg.containsKey("mqttClientId")) config.mqttClientId = String(cfg["mqttClientId"].as<const char*>());
+  if (cfg.containsKey("mqttBaseTopic")) config.mqttBaseTopic = String(cfg["mqttBaseTopic"].as<const char*>());
 
   if (cfg.containsKey("oscDeviceCount")) {
     int count = cfg["oscDeviceCount"];
@@ -832,6 +967,9 @@ static bool applyConfigFromJson(const JsonObject& cfg, String& err) {
           if (oo.containsKey("httpIp")) out.httpIp = String(oo["httpIp"].as<const char*>());
           if (oo.containsKey("httpPort")) out.httpPort = oo["httpPort"];
           if (oo.containsKey("httpDevice")) out.httpDevice = oo["httpDevice"];
+          if (oo.containsKey("mqttTopic")) out.mqttTopic = String(oo["mqttTopic"].as<const char*>());
+          if (oo.containsKey("mqttPayload")) out.mqttPayload = String(oo["mqttPayload"].as<const char*>());
+          if (oo.containsKey("mqttRetain")) out.mqttRetain = oo["mqttRetain"];
           if (oo.containsKey("onString")) out.onString = String(oo["onString"].as<const char*>());
           if (oo.containsKey("offString")) out.offString = String(oo["offString"].as<const char*>());
           if (oo.containsKey("buttonOnString")) out.buttonOnString = String(oo["buttonOnString"].as<const char*>());
@@ -859,6 +997,13 @@ static bool applyConfigFromJson(const JsonObject& cfg, String& err) {
       config.sensors[idx] = s;
     }
   }
+
+  if (config.mqttPort == 0) config.mqttPort = DEFAULT_MQTT_PORT;
+  if (config.mqttDevice >= MAX_OSC_DEVICES && config.mqttDevice != MQTT_DEVICE_CUSTOM) {
+    config.mqttDevice = DEFAULT_MQTT_DEVICE;
+  }
+  if (config.mqttClientId.length() == 0) config.mqttClientId = defaultMqttClientId();
+  if (config.mqttBaseTopic.length() == 0) config.mqttBaseTopic = DEFAULT_MQTT_BASE_TOPIC;
 
   return true;
 }
@@ -916,7 +1061,7 @@ static OutputMode sanitizeOutputMode(int value) {
 }
 
 static OutputTarget sanitizeOutputTarget(int value) {
-  if (value < OUT_TARGET_OSC || value > OUT_TARGET_HTTP) return OUT_TARGET_OSC;
+  if (value < OUT_TARGET_OSC || value > OUT_TARGET_MQTT) return OUT_TARGET_OSC;
   return static_cast<OutputTarget>(value);
 }
 
@@ -1042,6 +1187,9 @@ static SensorConfig defaultSensorConfig(int index) {
     s.outputs[o].httpIp = "";
     s.outputs[o].httpPort = 80;
     s.outputs[o].httpDevice = 0;
+    s.outputs[o].mqttTopic = buildDefaultMqttTopic(s, index, o);
+    s.outputs[o].mqttPayload = "{value}";
+    s.outputs[o].mqttRetain = false;
     s.outputs[o].onString = DEFAULT_ON_STRING;
     s.outputs[o].offString = DEFAULT_OFF_STRING;
     s.outputs[o].buttonOnString = DEFAULT_ON_STRING;
@@ -1282,6 +1430,11 @@ static void clearSensorKeys(int index) {
   removeIfExists(sensorKey(index, "sw"));
   removeIfExists(sensorKey(index, "enc_app"));
   removeIfExists(sensorKey(index, "enc_arg"));
+  removeIfExists(sensorKey(index, "enc_inv"));
+  removeIfExists(sensorKey(index, "hct"));
+  removeIfExists(sensorKey(index, "hce"));
+  removeIfExists(sensorKey(index, "hcmin"));
+  removeIfExists(sensorKey(index, "hcmax"));
   removeIfExists(sensorKey(index, "inv"));
   removeIfExists(sensorKey(index, "ah"));
   removeIfExists(sensorKey(index, "pu"));
@@ -1327,6 +1480,9 @@ static void clearSensorKeys(int index) {
     removeIfExists(outputKey(index, o, "hip"));
     removeIfExists(outputKey(index, o, "hpt"));
     removeIfExists(outputKey(index, o, "hdev"));
+    removeIfExists(outputKey(index, o, "mt"));
+    removeIfExists(outputKey(index, o, "mp"));
+    removeIfExists(outputKey(index, o, "mr"));
     removeIfExists(outputKey(index, o, "on"));
     removeIfExists(outputKey(index, o, "off"));
   }
@@ -1516,6 +1672,20 @@ static void loadConfig() {
   if (config.timeZone.length() == 0) config.timeZone = DEFAULT_TIMEZONE;
   config.manualEpoch = prefs.getUInt("time_manual", 0);
   config.timeDisplay24h = prefs.getBool("time_24", DEFAULT_TIME_DISPLAY_24H);
+  config.mqttEnabled = prefs.getBool("mq_en", DEFAULT_MQTT_ENABLED);
+  config.mqttDevice = static_cast<uint8_t>(prefs.getUInt("mq_dev", DEFAULT_MQTT_DEVICE));
+  if (config.mqttDevice >= MAX_OSC_DEVICES && config.mqttDevice != MQTT_DEVICE_CUSTOM) {
+    config.mqttDevice = DEFAULT_MQTT_DEVICE;
+  }
+  config.mqttHost = prefs.getString("mq_host", DEFAULT_MQTT_HOST);
+  config.mqttPort = static_cast<uint16_t>(prefs.getUInt("mq_port", DEFAULT_MQTT_PORT));
+  if (config.mqttPort == 0) config.mqttPort = DEFAULT_MQTT_PORT;
+  config.mqttUser = prefs.getString("mq_user", DEFAULT_MQTT_USER);
+  config.mqttPass = prefs.getString("mq_pass", DEFAULT_MQTT_PASS);
+  config.mqttClientId = prefs.getString("mq_cid", DEFAULT_MQTT_CLIENT_ID);
+  if (config.mqttClientId.length() == 0) config.mqttClientId = defaultMqttClientId();
+  config.mqttBaseTopic = prefs.getString("mq_base", DEFAULT_MQTT_BASE_TOPIC);
+  if (config.mqttBaseTopic.length() == 0) config.mqttBaseTopic = DEFAULT_MQTT_BASE_TOPIC;
   config.passwordEnabled = prefs.getBool("pwd_en", false);
   config.password = prefs.getString("pwd", "");
   if (!config.passwordEnabled || config.password.length() == 0) {
@@ -1621,6 +1791,11 @@ static void loadConfig() {
     s.encAppendSign = prefs.getBool(sensorKey(i, "enc_app").c_str(), s.encAppendSign);
     s.encSignArg = prefs.getBool(sensorKey(i, "enc_arg").c_str(), s.encSignArg);
     s.encInvert = prefs.getBool(sensorKey(i, "enc_inv").c_str(), s.encInvert);
+    s.hcTrigPin = prefs.getInt(sensorKey(i, "hct").c_str(), s.hcTrigPin);
+    s.hcEchoPin = prefs.getInt(sensorKey(i, "hce").c_str(), s.hcEchoPin);
+    s.hcMinCm = prefs.getFloat(sensorKey(i, "hcmin").c_str(), s.hcMinCm);
+    s.hcMaxCm = prefs.getFloat(sensorKey(i, "hcmax").c_str(), s.hcMaxCm);
+    if (s.hcMaxCm == s.hcMinCm) s.hcMaxCm = s.hcMinCm + 1.0f;
     s.encSteps = DEFAULT_ENC_STEPS;
     if (s.type == SENSOR_ANALOG) {
       if (!isAllowedAnalogPin(s.pin)) s.pin = defaultSensorPin(i);
@@ -1731,6 +1906,18 @@ static void loadConfig() {
           uint16_t hd = prefs.getUInt(baseHdev.c_str(), s.outputs[o].httpDevice);
           if (hd < MAX_OSC_DEVICES || hd == 255) s.outputs[o].httpDevice = static_cast<uint8_t>(hd);
         }
+        String baseMqttTopic = hasOutputCount ? outputKey(i, o, "mt") : String();
+        if (hasOutputCount) {
+          s.outputs[o].mqttTopic = prefs.getString(baseMqttTopic.c_str(), s.outputs[o].mqttTopic);
+        }
+        String baseMqttPayload = hasOutputCount ? outputKey(i, o, "mp") : String();
+        if (hasOutputCount) {
+          s.outputs[o].mqttPayload = prefs.getString(baseMqttPayload.c_str(), s.outputs[o].mqttPayload);
+        }
+        String baseMqttRetain = hasOutputCount ? outputKey(i, o, "mr") : String();
+        if (hasOutputCount) {
+          s.outputs[o].mqttRetain = prefs.getBool(baseMqttRetain.c_str(), s.outputs[o].mqttRetain);
+        }
         s.outputs[o].onString = prefs.getString(baseOn.c_str(), s.outputs[o].onString);
         s.outputs[o].offString = prefs.getString(baseOff.c_str(), s.outputs[o].offString);
         s.outputs[o].buttonOnString = prefs.getString(baseBon.c_str(), s.outputs[o].buttonOnString);
@@ -1738,6 +1925,9 @@ static void loadConfig() {
       }
       if (s.outputs[o].oscAddress.length() == 0) s.outputs[o].oscAddress = defaultOscAddress(i);
       if (s.outputs[o].buttonAddress.length() == 0) s.outputs[o].buttonAddress = "/button";
+      if (isAutoMqttTopic(s.outputs[o].mqttTopic, s, s, i, o)) {
+        s.outputs[o].mqttTopic = buildDefaultMqttTopic(s, i, o);
+      }
       if (s.type == SENSOR_ANALOG && s.outputs[o].outMode == OUT_STRING) s.outputs[o].outMode = OUT_FLOAT;
     }
     s.timeType = static_cast<TimeTriggerType>(prefs.getInt(sensorKey(i, "tt").c_str(), s.timeType));
@@ -1802,6 +1992,14 @@ static void saveConfig() {
   prefs.putString("tz", config.timeZone);
   prefs.putUInt("time_manual", config.manualEpoch);
   prefs.putBool("time_24", config.timeDisplay24h);
+  prefs.putBool("mq_en", config.mqttEnabled);
+  prefs.putUInt("mq_dev", config.mqttDevice);
+  prefs.putString("mq_host", config.mqttHost);
+  prefs.putUInt("mq_port", config.mqttPort);
+  prefs.putString("mq_user", config.mqttUser);
+  prefs.putString("mq_pass", config.mqttPass);
+  prefs.putString("mq_cid", config.mqttClientId);
+  prefs.putString("mq_base", config.mqttBaseTopic);
   prefs.putBool("pwd_en", config.passwordEnabled);
   prefs.putString("pwd", config.password);
   prefs.putUInt("tr_count", config.triggerCount);
@@ -1861,6 +2059,10 @@ static void saveConfig() {
     prefs.putBool(sensorKey(i, "enc_app").c_str(), s.encAppendSign);
     prefs.putBool(sensorKey(i, "enc_arg").c_str(), s.encSignArg);
     prefs.putBool(sensorKey(i, "enc_inv").c_str(), s.encInvert);
+    prefs.putInt(sensorKey(i, "hct").c_str(), s.hcTrigPin);
+    prefs.putInt(sensorKey(i, "hce").c_str(), s.hcEchoPin);
+    prefs.putFloat(sensorKey(i, "hcmin").c_str(), s.hcMinCm);
+    prefs.putFloat(sensorKey(i, "hcmax").c_str(), s.hcMaxCm);
     prefs.putBool(sensorKey(i, "inv").c_str(), s.invert);
     prefs.putBool(sensorKey(i, "ah").c_str(), s.activeHigh);
     prefs.putBool(sensorKey(i, "pu").c_str(), s.pullup);
@@ -1891,6 +2093,9 @@ static void saveConfig() {
       prefs.putString(outputKey(i, o, "hip").c_str(), out.httpIp);
       prefs.putUInt(outputKey(i, o, "hpt").c_str(), out.httpPort);
       prefs.putUInt(outputKey(i, o, "hdev").c_str(), out.httpDevice);
+      prefs.putString(outputKey(i, o, "mt").c_str(), out.mqttTopic);
+      prefs.putString(outputKey(i, o, "mp").c_str(), out.mqttPayload);
+      prefs.putBool(outputKey(i, o, "mr").c_str(), out.mqttRetain);
       prefs.putString(outputKey(i, o, "on").c_str(), out.onString);
       prefs.putString(outputKey(i, o, "off").c_str(), out.offString);
       prefs.putString(outputKey(i, o, "bon").c_str(), out.buttonOnString);
@@ -2206,6 +2411,108 @@ static String replaceTokens(const String& input, const String& value, const Stri
   return out;
 }
 
+static String replaceValueTokens(const String& input, const String& value, float norm, bool state) {
+  String out = input;
+  String normText = String(norm, 3);
+  String stateText = state ? "1" : "0";
+  if (out.indexOf("{value}") >= 0) out.replace("{value}", value);
+  if (out.indexOf("{VALUE}") >= 0) out.replace("{VALUE}", value);
+  if (out.indexOf("{norm}") >= 0) out.replace("{norm}", normText);
+  if (out.indexOf("{NORM}") >= 0) out.replace("{NORM}", normText);
+  if (out.indexOf("{state}") >= 0) out.replace("{state}", stateText);
+  if (out.indexOf("{STATE}") >= 0) out.replace("{STATE}", stateText);
+  return out;
+}
+
+static void configureMqttClient() {
+  if (config.mqttDevice < MAX_OSC_DEVICES) {
+    const OscDevice& dev = config.oscDevices[config.mqttDevice];
+    uint16_t port = dev.port > 0 ? dev.port : DEFAULT_MQTT_PORT;
+    if (isValidIp(dev.ip)) {
+      mqttClient.setServer(dev.ip, port);
+      return;
+    }
+  }
+  uint16_t port = config.mqttPort > 0 ? config.mqttPort : DEFAULT_MQTT_PORT;
+  mqttClient.setServer(config.mqttHost.c_str(), port);
+}
+
+static bool ensureMqttConnected() {
+  if (!config.mqttEnabled) return false;
+  String brokerLabel = "";
+  uint16_t brokerPort = DEFAULT_MQTT_PORT;
+  bool brokerResolved = false;
+  if (config.mqttDevice < MAX_OSC_DEVICES) {
+    const OscDevice& dev = config.oscDevices[config.mqttDevice];
+    if (isValidIp(dev.ip)) {
+      brokerPort = dev.port > 0 ? dev.port : DEFAULT_MQTT_PORT;
+      brokerLabel = ipToString(dev.ip);
+      mqttClient.setServer(dev.ip, brokerPort);
+      brokerResolved = true;
+    }
+  }
+  if (!brokerResolved) {
+    String host = config.mqttHost;
+    host.trim();
+    if (host.length() == 0) return false;
+    brokerPort = config.mqttPort > 0 ? config.mqttPort : DEFAULT_MQTT_PORT;
+    brokerLabel = host;
+    mqttClient.setServer(config.mqttHost.c_str(), brokerPort);
+  }
+  if (mqttClient.connected()) return true;
+  unsigned long now = millis();
+  if (now - mqttLastConnectAttemptMs < 3000) return false;
+  mqttLastConnectAttemptMs = now;
+  String clientId = config.mqttClientId;
+  clientId.trim();
+  if (clientId.length() == 0) clientId = defaultMqttClientId();
+  bool ok = false;
+  if (config.mqttUser.length() > 0 || config.mqttPass.length() > 0) {
+    ok = mqttClient.connect(clientId.c_str(), config.mqttUser.c_str(), config.mqttPass.c_str());
+  } else {
+    ok = mqttClient.connect(clientId.c_str());
+  }
+  if (ok) {
+    addLog(String("MQTT connected to ") + brokerLabel + ":" + String(brokerPort));
+  } else {
+    addLog(String("MQTT connect failed (state ") + String(mqttClient.state()) + ")");
+  }
+  return ok;
+}
+
+static bool sendMqttMessage(const String& topic, const String& payload, bool retain) {
+  if (topic.length() == 0) return false;
+  if (!ensureMqttConnected()) return false;
+  bool ok = mqttClient.publish(topic.c_str(), payload.c_str(), retain);
+  addLog(String("MQTT ") + (ok ? "pub " : "pub failed ") + topic + " => " + payload);
+  return ok;
+}
+
+static void sendMqttOutput(const SensorConfig::OutputConfig& out, float norm, const SensorConfig* sensor, int triggerIndex, int outputIndex) {
+  String topic = out.mqttTopic;
+  topic.trim();
+  if (topic.length() == 0) {
+    if (sensor != nullptr && triggerIndex >= 0 && outputIndex >= 0) {
+      topic = buildDefaultMqttTopic(*sensor, triggerIndex, outputIndex);
+    } else {
+      topic = config.mqttBaseTopic;
+      topic.trim();
+      if (topic.length() == 0) topic = DEFAULT_MQTT_BASE_TOPIC;
+      if (!topic.endsWith("/")) topic += "/";
+      topic += "output";
+    }
+  }
+  String value = buildHttpValue(out, norm);
+  bool state = (norm >= 0.5f);
+  String payload = out.mqttPayload;
+  if (payload.length() == 0) {
+    payload = value;
+  } else {
+    payload = replaceValueTokens(payload, value, norm, state);
+  }
+  sendMqttMessage(topic, payload, out.mqttRetain);
+}
+
 static void sendHttpRequest(const SensorConfig::OutputConfig& out, float norm) {
   if (out.httpUrl.length() == 0) return;
   String value = buildHttpValue(out, norm);
@@ -2451,6 +2758,19 @@ static void sendOutputNow(const SensorConfig& sensor, const SensorConfig::Output
   }
   if (out.target == OUT_TARGET_HTTP) {
     sendHttpRequest(out, norm);
+    return;
+  }
+  if (out.target == OUT_TARGET_MQTT) {
+    int triggerIndex = -1;
+    for (int i = 0; i < MAX_TRIGGERS; i++) {
+      if (&config.sensors[i] == &sensor) {
+        triggerIndex = i;
+        break;
+      }
+    }
+    int outputIndex = static_cast<int>(&out - &sensor.outputs[0]);
+    if (outputIndex < 0 || outputIndex >= MAX_OUTPUTS_PER_TRIGGER) outputIndex = -1;
+    sendMqttOutput(out, norm, &sensor, triggerIndex, outputIndex);
     return;
   }
   IPAddress ip;
@@ -2750,7 +3070,8 @@ static void handleTriggers() {
       html += "<option value='0' " + String(out.target == OUT_TARGET_OSC ? "selected" : "") + ">OSC Out</option>";
       html += "<option value='3' " + String(out.target == OUT_TARGET_UDP ? "selected" : "") + ">UDP Raw</option>";
       html += "<option value='4' " + String(out.target == OUT_TARGET_GPIO ? "selected" : "") + ">GPIO Out</option>";
-      html += "<option value='5' " + String(out.target == OUT_TARGET_HTTP ? "selected" : "") + ">HTTP Request</option>";
+      html += "<option value='5' " + String(out.target == OUT_TARGET_HTTP ? "selected" : "") + ">HTTP Webhook</option>";
+      html += "<option value='6' " + String(out.target == OUT_TARGET_MQTT ? "selected" : "") + ">MQTT Out</option>";
       html += "<option value='2' " + String(out.target == OUT_TARGET_RESET_COOLDOWNS ? "selected" : "") + ">Reset Cooldowns</option>";
       html += "<option value='1' " + String(out.target == OUT_TARGET_REBOOT ? "selected" : "") + ">Reboot Device</option>";
       html += "</select><br>";
@@ -2833,6 +3154,12 @@ static void handleTriggers() {
       html += "<div id='s" + idx + "_o" + oidx + "_http_body'>Body: <input name='s" + idx + "_o" + oidx + "_hb' type='text' value='" + out.httpBody + "' placeholder='{value}'></div>";
       html += "<div class='helper'>Tokens: {value}, {ip}, {port} (case-insensitive). Example: http://{ip}/win&A={value} (0-255).</div>";
       html += "</div>";
+      html += "<div id='s" + idx + "_o" + oidx + "_mqtt_block'>";
+      html += "MQTT topic: <input name='s" + idx + "_o" + oidx + "_mt' type='text' value='" + out.mqttTopic + "' placeholder='stagemod/{TriggerName}/output/1'><br>";
+      html += "MQTT payload: <input name='s" + idx + "_o" + oidx + "_mp' type='text' value='" + out.mqttPayload + "' placeholder='{value}'><button type='button' class='icon-btn' data-idx='" + idx + "' data-oidx='" + oidx + "' data-test='mqtt' onclick='sendOutputTest(" + idx + "," + oidx + ",\"mqtt\");return false;'>Test</button><br>";
+      html += "Retain: <input name='s" + idx + "_o" + oidx + "_mr' type='checkbox' " + String(out.mqttRetain ? "checked" : "") + "><br>";
+      html += "<div class='helper'>Tokens: {value}, {norm}, {state}</div>";
+      html += "</div>";
       html += "<div id='s" + idx + "_o" + oidx + "_gpio_block'>";
       html += "GPIO pin: <input name='s" + idx + "_o" + oidx + "_gpin' type='number' min='0' max='39' value='" + String(out.gpioPin) + "' style='max-width:100px;'> ";
       html += "<small>Output pins allowed: 5,13,16,17,18,19,21,22,23,25,26,27,32,33 (use a pin not used by inputs)</small><br>";
@@ -2901,6 +3228,7 @@ static void handleTriggers() {
   html += "const udpBlock=document.getElementById('s'+i+'_o'+o+'_udp_block');";
   html += "const gpioBlock=document.getElementById('s'+i+'_o'+o+'_gpio_block');";
   html += "const httpBlock=document.getElementById('s'+i+'_o'+o+'_http_block');";
+  html += "const mqttBlock=document.getElementById('s'+i+'_o'+o+'_mqtt_block');";
   html += "const httpBody=document.getElementById('s'+i+'_o'+o+'_http_body');";
   html += "const httpDev=document.getElementById('s'+i+'_o'+o+'_hdev');";
   html += "const httpIp=document.querySelector(\"input[name='s\"+i+\"_o\"+o+\"_hip']\");";
@@ -2935,11 +3263,13 @@ static void handleTriggers() {
   html += "const isUdp=(tgt.value==='3');";
   html += "const isGpio=(tgt.value==='4');";
   html += "const isHttp=(tgt.value==='5');";
-  html += "if(oscOut){oscOut.style.display=isOsc?'block':'none';}";
+  html += "const isMqtt=(tgt.value==='6');";
+  html += "if(oscOut){oscOut.style.display=(isOsc||isHttp||isMqtt)?'block':'none';}";
   html += "if(devBlock){devBlock.style.display=(isOsc||isUdp)?'block':'none';}";
   html += "if(udpBlock){udpBlock.style.display=isUdp?'block':'none';}";
   html += "if(gpioBlock){gpioBlock.style.display=isGpio?'block':'none';}";
   html += "if(httpBlock){httpBlock.style.display=isHttp?'block':'none';}";
+  html += "if(mqttBlock){mqttBlock.style.display=isMqtt?'block':'none';}";
   html += "if(omaxLabel){omaxLabel.textContent=isEnc?'Output':'Output max';}";
   html += "if(minRel){";
   html += "if(isEnc){if(minRelSlotBtn){minRelSlotBtn.appendChild(minRel);}}";
@@ -2969,9 +3299,9 @@ static void handleTriggers() {
   html += "if(omax<=100){omaxInput.value='255';}";
   html += "if(omin<0||isNaN(omin)){ominInput.value='0';}";
   html += "}";
-  html += "if(om){om.disabled=!(isOsc||isHttp);}";
+  html += "if(om){om.disabled=!(isOsc||isHttp||isMqtt);}";
   html += "if(om&&opt){";
-  html += "if(!isOsc){opt.disabled=true;}";
+  html += "if(!(isOsc||isHttp||isMqtt)){opt.disabled=true;}";
   html += "else if(isEnc){";
   html += "opt.disabled=true;";
   html += "if(om.value==='2'){om.value='1';}";
@@ -2983,21 +3313,21 @@ static void handleTriggers() {
   html += "}";
   html += "}";
   html += "if(str&&om){";
-  html += "const showStr=((isOsc||isHttp) && !isEnc && om.value==='2');";
+  html += "const showStr=((isOsc||isHttp||isMqtt) && !isEnc && om.value==='2');";
   html += "str.style.display=showStr?'block':'none';";
   html += "if(offRow){offRow.style.display=(showStr && smin && smin.checked)?'none':'block';}";
   html += "}";
-  html += "if(range&&om){range.style.display=((isOsc||isHttp) && om.value!=='2')?'block':(isGpio && gmode && gmode.value==='3' ? 'block' : 'none');}";
+  html += "if(range&&om){range.style.display=((isOsc||isHttp||isMqtt) && om.value!=='2')?'block':(isGpio && gmode && gmode.value==='3' ? 'block' : 'none');}";
   html += "if(addrBlock){addrBlock.style.display=(isOsc && !isEnc)?'block':'none';}";
   html += "if(encAddr){encAddr.style.display=(isOsc && isEnc)?'block':'none';}";
   html += "if(btnAddr){btnAddr.style.display=(isOsc && isEnc)?'block':'none';}";
   html += "if(btnBlock){btnBlock.style.display=(isOsc && isEnc)?'block':'none';}";
   html += "if(minRel){";
-  html += "if(isOsc||isHttp){minRel.style.display=(isEnc||t!=='0')?'block':'none';}";
+  html += "if(isOsc||isHttp||isMqtt){minRel.style.display=(isEnc||t!=='0')?'block':'none';}";
   html += "else{minRel.style.display='none';}";
   html += "}";
   html += "if(minRow&&smin&&om){";
-  html += "if(isOsc||isHttp){";
+  html += "if(isOsc||isHttp||isMqtt){";
   html += "if(isEnc){minRow.style.display='none';}";
   html += "else if(om.value==='2'){minRow.style.display='none';}";
   html += "else{minRow.style.display=smin.checked?'none':'block';}";
@@ -3076,6 +3406,17 @@ static void handleTriggers() {
   html += "fetch('/send_gpio_test',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data.toString(),credentials:'same-origin'}).then(r=>r.text()).then(t=>console.log('gpio test',t)).catch(e=>console.warn('gpio test failed',e));";
   html += "return;";
   html += "}";
+  html += "if(tgt && tgt.value==='6'){";
+  html += "const mt=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_mt']\");";
+  html += "const mp=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_mp']\");";
+  html += "const mr=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_mr']\");";
+  html += "const data=new URLSearchParams();";
+  html += "data.set('topic',mt?mt.value:'');";
+  html += "data.set('payload',mp?mp.value:'');";
+  html += "if(mr&&mr.checked){data.set('retain','1');}";
+  html += "fetch('/send_mqtt_test',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data.toString(),credentials:'same-origin'}).then(r=>r.text()).then(t=>console.log('mqtt test',t)).catch(e=>console.warn('mqtt test failed',e));";
+  html += "return;";
+  html += "}";
   html += "if(tgt && tgt.value!=='0'){return;}";
   html += "const addrInput=document.getElementById('s'+idx+'_o'+oidx+'_addr');";
   html += "const encAddrInput=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_enc_addr']\");";
@@ -3139,7 +3480,8 @@ static void handleSaveTriggers() {
   for (int i = 0; i < MAX_TRIGGERS; i++) {
     String idx = String(i);
     if (!server.hasArg("s" + idx + "_present")) continue;
-    SensorConfig s = config.sensors[i];
+    SensorConfig previous = config.sensors[i];
+    SensorConfig s = previous;
     s.enabled = server.hasArg("s" + idx + "_en");
     if (server.hasArg("s" + idx + "_name")) {
       s.name = server.arg("s" + idx + "_name");
@@ -3295,6 +3637,17 @@ static void handleSaveTriggers() {
         uint16_t hd = static_cast<uint16_t>(server.arg("s" + idx + "_o" + oidx + "_hdev").toInt());
         if (hd < MAX_OSC_DEVICES || hd == 255) out.httpDevice = static_cast<uint8_t>(hd);
       }
+      if (server.hasArg("s" + idx + "_o" + oidx + "_mt")) {
+        out.mqttTopic = server.arg("s" + idx + "_o" + oidx + "_mt");
+        out.mqttTopic.trim();
+      }
+      if (isAutoMqttTopic(out.mqttTopic, previous, s, i, outCount)) {
+        out.mqttTopic = buildDefaultMqttTopic(s, i, outCount);
+      }
+      if (server.hasArg("s" + idx + "_o" + oidx + "_mp")) {
+        out.mqttPayload = server.arg("s" + idx + "_o" + oidx + "_mp");
+      }
+      out.mqttRetain = server.hasArg("s" + idx + "_o" + oidx + "_mr");
 
       if (out.gpioMode == GPIO_OUT_PWM) {
         if (out.outMin < 0.0f) out.outMin = 0.0f;
@@ -3399,7 +3752,9 @@ static void handleSaveTriggers() {
     if (idx >= 0 && idx < MAX_TRIGGERS) {
       SensorConfig& s = config.sensors[idx];
       if (s.outputCount < MAX_OUTPUTS_PER_TRIGGER) {
-        s.outputs[s.outputCount] = s.outputs[0];
+        int newOut = s.outputCount;
+        s.outputs[newOut] = s.outputs[0];
+        s.outputs[newOut].mqttTopic = buildDefaultMqttTopic(s, idx, newOut);
         s.outputCount++;
       }
     }
@@ -3523,7 +3878,7 @@ static void handleSettings() {
   html += "</select><br>";
   html += "<div id='wifi_fields'>";
   html += "WiFi SSID: ";
-  html += "<select id='wifi_ssid_select' name='wifi_ssid_select'><option value=''>Scan to list networks...</option></select> ";
+  html += "<select id='wifi_ssid_select' name='wifi_ssid_select' style='display:none;'><option value=''>Scan to list networks...</option></select> ";
   html += "<button type='button' id='scan_wifi'>Scan WiFi</button><br>";
   html += "<input id='wifi_ssid' name='wifi_ssid' type='text' value='" + config.wifiSsid + "' placeholder='Or type SSID manually'><br>";
   html += "WiFi pass: <input name='wifi_pass' type='password' value=''><br>";
@@ -3540,8 +3895,8 @@ static void handleSettings() {
   html += "<small>Static IP changes may require reboot.</small><br>";
   html += "</div>";
 
-  html += "<div class='card'><b>Network Clients (OSC/UDP)</b><br>";
-  html += "<small>Device 1 is the default target for OSC/UDP.</small><br>";
+  html += "<div class='card'><b>Network Clients (OSC / UDP / MQTT / HTTP Webhook)</b><br>";
+  html += "<small>Device 1 is the default target for OSC/UDP. MQTT broker and HTTP webhook can also select from this list.</small><br>";
   html += "<div style='margin-top:10px;'><b>Network Client Devices</b><br>";
 
   for (int dIndex = 0; dIndex < config.oscDeviceCount; dIndex++) {
@@ -3589,6 +3944,38 @@ static void handleSettings() {
   html += "</select><br>";
   html += "Output: <input id='test_value' name='test_value' type='text' value='1'><br>";
   html += "<button type='button' id='test_send_btn'>Send</button>";
+  html += "</div>";
+  html += "</div>";
+
+  String mqttHostDisplay = config.mqttHost;
+  uint16_t mqttPortDisplay = config.mqttPort > 0 ? config.mqttPort : DEFAULT_MQTT_PORT;
+  if (config.mqttDevice < MAX_OSC_DEVICES) {
+    const OscDevice& md = config.oscDevices[config.mqttDevice];
+    mqttHostDisplay = ipToString(md.ip);
+    mqttPortDisplay = md.port > 0 ? md.port : DEFAULT_MQTT_PORT;
+  }
+
+  html += "<div class='card'><b>MQTT</b><br>";
+  html += "Enable MQTT output: <input id='mqtt_en' name='mqtt_en' type='checkbox' " + String(config.mqttEnabled ? "checked" : "") + "><br>";
+  html += "<div id='mqtt_fields'>";
+  html += "Broker device: <select id='mqtt_dev' name='mqtt_dev'>";
+  for (int d = 0; d < config.oscDeviceCount; d++) {
+    int didx = config.oscDeviceOrder[d];
+    const OscDevice& dev = config.oscDevices[didx];
+    uint16_t devPort = dev.port > 0 ? dev.port : DEFAULT_MQTT_PORT;
+    String label = dev.name + " (" + ipToString(dev.ip) + ":" + String(devPort) + ")";
+    html += "<option value='" + String(didx) + "' data-ip='" + ipToString(dev.ip) + "' data-port='" + String(devPort) + "' " + String(config.mqttDevice == didx ? "selected" : "") + ">" + label + "</option>";
+  }
+  html += "<option value='" + String(MQTT_DEVICE_CUSTOM) + "' " + String(config.mqttDevice == MQTT_DEVICE_CUSTOM ? "selected" : "") + ">Custom...</option>";
+  html += "</select><br>";
+  html += "Broker host/IP: <input id='mqtt_host' name='mqtt_host' type='text' value='" + mqttHostDisplay + "' placeholder='192.168.1.10'><br>";
+  html += "Broker port: <input id='mqtt_port' name='mqtt_port' type='number' min='1' max='65535' value='" + String(mqttPortDisplay) + "' style='max-width:120px;'><br>";
+  html += "Client ID: <input name='mqtt_client_id' type='text' value='" + config.mqttClientId + "'><br>";
+  html += "Username: <input name='mqtt_user' type='text' value='" + config.mqttUser + "'><br>";
+  html += "Password: <input name='mqtt_pass' type='password' value=''><br>";
+  html += "Base topic: <input name='mqtt_base' type='text' value='" + config.mqttBaseTopic + "' placeholder='stagemod'><br>";
+  html += "<small>Leave password blank to keep current password.</small><br>";
+  html += "<small>Status: " + String(mqttClient.connected() ? "connected" : "disconnected") + "</small><br>";
   html += "</div>";
   html += "</div>";
 
@@ -3645,7 +4032,7 @@ static void handleSettings() {
 
   html += "<div class='card'><b>Config Import/Export</b><br>";
   html += "<div style='margin-top:6px;'>";
-  html += "<a href='/export_config' class='nav-pill'>Download Config</a>";
+  html += "<button type='button' onclick=\"window.location.href='/export_config'\">Download Config</button>";
   html += "</div>";
   html += "<form method='POST' action='/import_config' enctype='multipart/form-data' style='margin-top:8px;'>";
   html += "<input type='file' name='config' accept='.json,application/json,text/plain' style='margin-right:8px;'><button type='submit'>Import Config</button>";
@@ -3658,8 +4045,10 @@ static void handleSettings() {
   html += "<div style='margin-top:8px;'><b>Firmware Update</b><br>";
   html += "<small>Upload a new firmware .bin over your local network. Internet is not required.</small><br>";
   html += "<form method='POST' action='/update' enctype='multipart/form-data' style='margin-top:8px;'>";
-  html += "<input type='file' name='update' accept='.bin'><br><br>";
-  html += "<button type='submit' class='primary'>Install Update</button>";
+  html += "<div style='display:flex;gap:8px;align-items:center;flex-wrap:wrap;'>";
+  html += "<input type='file' name='update' accept='.bin' style='margin:0;'>";
+  html += "<button type='submit'>Install Update</button>";
+  html += "</div>";
   html += "</form></div><br>";
   html += "</div>";
 
@@ -3676,20 +4065,42 @@ static void handleSettings() {
   html += "const tm=document.getElementById('time_mode');";
   html += "const ntp=document.getElementById('ntp_fields');";
   html += "const man=document.getElementById('manual_fields');";
+  html += "const mq=document.getElementById('mqtt_en');";
+  html += "const mqf=document.getElementById('mqtt_fields');";
+  html += "const mqDev=document.getElementById('mqtt_dev');";
+  html += "const mqHost=document.getElementById('mqtt_host');";
+  html += "const mqPort=document.getElementById('mqtt_port');";
   html += "function toggleDhcp(){sf.style.display=dh.checked?'none':'block';}";
   html += "function toggleNet(){wf.style.display=(nm.value==='1')?'block':'none';}";
   html += "function toggleTime(){if(!tm){return;}ntp.style.display=(tm.value==='0')?'block':'none';man.style.display=(tm.value==='1')?'block':'none';}";
+  html += "function toggleMqtt(){if(!mq||!mqf){return;}mqf.style.display=mq.checked?'block':'none';}";
+  html += "function applyMqttDevice(){";
+  html += "if(!mqDev||!mqHost||!mqPort){return;}";
+  html += "const opt=mqDev.options[mqDev.selectedIndex];";
+  html += "const custom=(mqDev.value==='255');";
+  html += "mqHost.disabled=!custom;";
+  html += "mqPort.disabled=!custom;";
+  html += "if(custom||!opt){return;}";
+  html += "const ip=opt.getAttribute('data-ip')||'';";
+  html += "const port=opt.getAttribute('data-port')||'';";
+  html += "if(ip){mqHost.value=ip;}";
+  html += "if(port){mqPort.value=port;}";
+  html += "}";
   html += "dh.addEventListener('change',toggleDhcp);";
   html += "nm.addEventListener('change',toggleNet);";
   html += "if(tm){tm.addEventListener('change',toggleTime);}";
-  html += "toggleDhcp();toggleNet();toggleTime();";
+  html += "if(mq){mq.addEventListener('change',toggleMqtt);}";
+  html += "if(mqDev){mqDev.addEventListener('change',applyMqttDevice);}";
+  html += "toggleDhcp();toggleNet();toggleTime();toggleMqtt();applyMqttDevice();";
   html += "const scanBtn=document.getElementById('scan_wifi');";
   html += "const wifiSelect=document.getElementById('wifi_ssid_select');";
   html += "const wifiInput=document.getElementById('wifi_ssid');";
+  html += "function showWifiSelect(){if(wifiSelect){wifiSelect.style.display='inline-block';}}";
   html += "if(wifiSelect&&wifiInput){wifiSelect.addEventListener('change',()=>{";
   html += "const v=wifiSelect.value; if(v==='__custom__'){wifiInput.focus();return;} wifiInput.value=v;});}";
   html += "if(scanBtn&&wifiSelect&&wifiInput){";
   html += "scanBtn.addEventListener('click',()=>{";
+  html += "showWifiSelect();";
   html += "wifiSelect.innerHTML='';";
   html += "const opt=document.createElement('option');opt.textContent='Scanning...';opt.value='';wifiSelect.appendChild(opt);";
   html += "fetch('/scan_wifi').then(r=>r.json()).then(list=>{";
@@ -3961,6 +4372,16 @@ static void handleSaveSettings() {
       }
     }
   }
+  if (config.mqttDevice < MAX_OSC_DEVICES) {
+    bool mqttDevPresent = false;
+    for (int i = 0; i < config.oscDeviceCount; i++) {
+      if (config.oscDeviceOrder[i] == config.mqttDevice) {
+        mqttDevPresent = true;
+        break;
+      }
+    }
+    if (!mqttDevPresent) config.mqttDevice = DEFAULT_MQTT_DEVICE;
+  }
   config.clientIp = config.oscDevices[0].ip;
   config.clientPort = config.oscDevices[0].port;
 
@@ -4009,6 +4430,44 @@ static void handleSaveSettings() {
       config.manualEpoch = epoch;
     }
   }
+
+  config.mqttEnabled = server.hasArg("mqtt_en");
+  if (server.hasArg("mqtt_dev")) {
+    int d = server.arg("mqtt_dev").toInt();
+    if ((d >= 0 && d < MAX_OSC_DEVICES) || d == MQTT_DEVICE_CUSTOM) {
+      config.mqttDevice = static_cast<uint8_t>(d);
+    }
+  }
+  if (config.mqttDevice == MQTT_DEVICE_CUSTOM) {
+    if (server.hasArg("mqtt_host")) {
+      config.mqttHost = server.arg("mqtt_host");
+      config.mqttHost.trim();
+    }
+    if (server.hasArg("mqtt_port")) {
+      int p = server.arg("mqtt_port").toInt();
+      if (p > 0 && p <= 65535) config.mqttPort = static_cast<uint16_t>(p);
+    }
+  }
+  if (server.hasArg("mqtt_user")) {
+    config.mqttUser = server.arg("mqtt_user");
+    config.mqttUser.trim();
+  }
+  if (server.hasArg("mqtt_client_id")) {
+    config.mqttClientId = server.arg("mqtt_client_id");
+    config.mqttClientId.trim();
+    if (config.mqttClientId.length() == 0) config.mqttClientId = defaultMqttClientId();
+  }
+  if (server.hasArg("mqtt_base")) {
+    config.mqttBaseTopic = server.arg("mqtt_base");
+    config.mqttBaseTopic.trim();
+    if (config.mqttBaseTopic.length() == 0) config.mqttBaseTopic = DEFAULT_MQTT_BASE_TOPIC;
+  }
+  if (server.hasArg("mqtt_pass")) {
+    String pass = server.arg("mqtt_pass");
+    if (pass.length() > 0) config.mqttPass = pass;
+  }
+  if (config.mqttPort == 0) config.mqttPort = DEFAULT_MQTT_PORT;
+  mqttReconnectRequested = true;
 
   if (!wantPassword) {
     config.passwordEnabled = false;
@@ -4079,6 +4538,7 @@ static void handleImportConfig() {
   saveConfig();
   setupEncoderCounters();
   applyTimeConfig();
+  mqttReconnectRequested = true;
 
   String msg = "<html><body><h3>Import complete</h3>";
   if (fileVersion.length() > 0) {
@@ -4151,6 +4611,31 @@ static void handleSendTestUdp() {
     return;
   }
   sendUdpRawTo(ip, port, payload);
+  server.send(200, "text/plain", "Sent.");
+}
+
+static void handleSendTestMqtt() {
+  if (!ensureAuthenticated()) return;
+  String topic = server.hasArg("topic") ? server.arg("topic") : "";
+  String payload = server.hasArg("payload") ? server.arg("payload") : "";
+  bool retain = server.hasArg("retain");
+  topic.trim();
+  if (topic.length() == 0) {
+    server.send(400, "text/plain", "Missing topic");
+    return;
+  }
+  if (!config.mqttEnabled) {
+    server.send(400, "text/plain", "MQTT is disabled in settings.");
+    return;
+  }
+  if (config.mqttHost.length() == 0 || config.mqttPort == 0) {
+    server.send(400, "text/plain", "MQTT broker is not configured.");
+    return;
+  }
+  if (!sendMqttMessage(topic, payload, retain)) {
+    server.send(503, "text/plain", "MQTT publish failed.");
+    return;
+  }
   server.send(200, "text/plain", "Sent.");
 }
 
@@ -4319,6 +4804,7 @@ void setup() {
   Serial.print("StageMod firmware v");
   Serial.println(FIRMWARE_VERSION);
   loadConfig();
+  configureMqttClient();
   resetRuntimeState(true);
   pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
   resetButtonArmed = false;
@@ -4347,6 +4833,7 @@ void setup() {
   server.on("/settings", HTTP_POST, handleSaveSettings);
   server.on("/send_test", HTTP_POST, handleSendTestOsc);
   server.on("/send_udp_test", HTTP_POST, handleSendTestUdp);
+  server.on("/send_mqtt_test", HTTP_POST, handleSendTestMqtt);
   server.on("/send_gpio_test", HTTP_POST, handleSendTestGpio);
   server.on("/scan_wifi", HTTP_GET, handleScanNetworks);
   server.on("/reset", HTTP_POST, handleReset);
@@ -4571,7 +5058,7 @@ void loop() {
             } else {
               lastBool[i][o] = pressed ? 1 : 0;
             }
-          } else if (out.target == OUT_TARGET_UDP || out.target == OUT_TARGET_HTTP || out.target == OUT_TARGET_OSC) {
+          } else if (out.target == OUT_TARGET_UDP || out.target == OUT_TARGET_HTTP || out.target == OUT_TARGET_MQTT || out.target == OUT_TARGET_OSC) {
             if (outMode == OUT_STRING) {
               lastBool[i][o] = pressed ? 1 : 0;
             } else if (outMode == OUT_FLOAT) {
@@ -4776,7 +5263,48 @@ void loop() {
           sendHttpRequest(out, norm);
           lastInt[i][o] = intValue;
         }
+        }
+        continue;
       }
+
+      if (out.target == OUT_TARGET_MQTT) {
+        if (!out.sendMinOnRelease && s.type != SENSOR_ANALOG) {
+          bool rising = (norm >= 0.5f) && (prevLevel <= 0);
+          if (!rising) {
+            continue;
+          }
+          sendMqttOutput(out, 1.0f, &s, i, o);
+          continue;
+        }
+        if (outMode == OUT_STRING) {
+          int8_t state = (norm >= 0.5f) ? 1 : 0;
+          if (lastBool[i][o] == -1 || state != lastBool[i][o]) {
+            sendMqttOutput(out, norm, &s, i, o);
+            lastBool[i][o] = state;
+          }
+        } else if (outMode == OUT_FLOAT) {
+          float outputValue = mapOutputRange(norm, outMin, outMax);
+          outputValue = snapOutputRange(outputValue, outMin, outMax);
+          if (isnan(lastFloat[i][o]) || fabsf(outputValue - lastFloat[i][o]) > 0.0005f) {
+            sendMqttOutput(out, norm, &s, i, o);
+            lastFloat[i][o] = outputValue;
+          }
+        } else {
+          float outputValue = mapOutputRange(norm, outMin, outMax);
+          outputValue = snapOutputRange(outputValue, outMin, outMax);
+          int intValue = lroundf(outputValue);
+          bool canSend = true;
+          if (s.type == SENSOR_ANALOG) {
+            if (lastInt[i][o] >= 0 && abs(intValue - lastInt[i][o]) <= DEAD_BAND) {
+              intValue = lastInt[i][o];
+              canSend = false;
+            }
+          }
+          if (intValue != lastInt[i][o] && canSend) {
+            sendMqttOutput(out, norm, &s, i, o);
+            lastInt[i][o] = intValue;
+          }
+        }
         continue;
       }
 
@@ -4899,6 +5427,18 @@ void loop() {
       MDNS.end();
       startMdns();
     }
+  }
+  if (mqttReconnectRequested) {
+    mqttReconnectRequested = false;
+    mqttClient.disconnect();
+    configureMqttClient();
+    mqttLastConnectAttemptMs = 0;
+  }
+  if (config.mqttEnabled && isValidIp(getLocalIp())) {
+    ensureMqttConnected();
+  }
+  if (mqttClient.connected()) {
+    mqttClient.loop();
   }
   if (wifiReconnectStarted > 0 && config.netMode == NET_WIFI) {
     if (WiFi.status() == WL_CONNECTED && isValidIp(WiFi.localIP())) {
