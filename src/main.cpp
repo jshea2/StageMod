@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <math.h>
+#include <cstring>
 #ifndef USE_ETHERNET
 #define USE_ETHERNET 1
 #endif
@@ -46,6 +47,8 @@ const char* DEFAULT_NTP_SERVER = "pool.ntp.org";
 const uint8_t DEFAULT_TIME_MODE = 0; // 0 = NTP, 1 = Manual
 const char* DEFAULT_TIMEZONE = "PST8PDT,M3.2.0/2,M11.1.0/2";
 const bool DEFAULT_TIME_DISPLAY_24H = false;
+const bool DEFAULT_OSC_IN_ENABLED = true;
+const uint16_t DEFAULT_OSC_IN_PORT = 9001;
 const bool DEFAULT_MQTT_ENABLED = false;
 const char* DEFAULT_MQTT_HOST = "";
 const uint16_t DEFAULT_MQTT_PORT = 1883;
@@ -80,7 +83,21 @@ enum SensorType {
 
 enum SensorSource {
   SRC_SENSORS = 0,
-  SRC_TIME = 1
+  SRC_TIME = 1,
+  SRC_OSC = 2
+};
+
+enum OscInArgType {
+  OSC_IN_ARG_ANY = 0,
+  OSC_IN_ARG_INT = 1,
+  OSC_IN_ARG_FLOAT = 2,
+  OSC_IN_ARG_STRING = 3
+};
+
+enum OscInMatchMode {
+  OSC_IN_MATCH_ANY = 0,
+  OSC_IN_MATCH_EQUAL = 1,
+  OSC_IN_MATCH_RANGE = 2
 };
 
 enum TimeTriggerType {
@@ -176,6 +193,13 @@ struct SensorConfig {
   bool enabled;
   String name;
   SensorSource source;
+  String oscInAddress;
+  uint8_t oscInArgType;
+  uint8_t oscInMatchMode;
+  float oscInValue;
+  float oscInMin;
+  float oscInMax;
+  String oscInString;
   SensorType type;
   int pin;
   int encClkPin;
@@ -240,6 +264,8 @@ struct SensorConfig {
 struct Config {
   String hostname;
   NetMode netMode;
+  bool oscInEnabled;
+  uint16_t oscInPort;
   IPAddress clientIp;
   uint16_t clientPort;
   bool useStatic;
@@ -308,6 +334,7 @@ int8_t gpioPwmChannelByPin[40];
 uint8_t nextGpioPwmChannel = 0;
 int8_t gpioPulseEndLevelByPin[40];
 WiFiUDP udp;
+uint16_t udpListenPort = 0;
 WiFiClient mqttNetClient;
 PubSubClient mqttClient(mqttNetClient);
 WebServer server(80);
@@ -331,6 +358,19 @@ int logCount = 0;
 String importPayload;
 unsigned long mqttLastConnectAttemptMs = 0;
 bool mqttReconnectRequested = false;
+bool oscInputTokenOverrideActive = false;
+String oscInputTokenValue = "";
+float oscInputTokenNorm = 1.0f;
+bool oscInputTokenState = true;
+
+struct OscInMessage {
+  String address;
+  bool hasArg;
+  uint8_t argType;
+  int32_t intValue;
+  float floatValue;
+  String stringValue;
+};
 
 static String ipToString(const IPAddress& ip);
 static bool parseIpString(const String& s, IPAddress& out);
@@ -372,6 +412,11 @@ static bool isAutoMqttTopic(const String& topic,
 static void configureMqttClient();
 static bool ensureMqttConnected();
 static bool sendMqttMessage(const String& topic, const String& payload, bool retain);
+static void configureUdpListener();
+static bool matchOscAddressPattern(const String& pattern, const String& value);
+static bool parseOscInPacket(const uint8_t* data, size_t len, OscInMessage& msg);
+static bool matchOscInTrigger(const SensorConfig& s, const OscInMessage& msg, float& normOut, String& valueOut);
+static void processOscInput();
 
 static int readAveragedADC(int pin) {
   uint32_t acc = 0;
@@ -703,6 +748,8 @@ static String exportConfigJson() {
   c["timeZone"] = config.timeZone;
   c["manualEpoch"] = config.manualEpoch;
   c["timeDisplay24h"] = config.timeDisplay24h;
+  c["oscInEnabled"] = config.oscInEnabled;
+  c["oscInPort"] = config.oscInPort;
   c["mqttEnabled"] = config.mqttEnabled;
   c["mqttDevice"] = config.mqttDevice;
   c["mqttHost"] = config.mqttHost;
@@ -743,6 +790,13 @@ static String exportConfigJson() {
     so["enabled"] = s.enabled;
     so["name"] = s.name;
     so["source"] = static_cast<int>(s.source);
+    so["oscInAddress"] = s.oscInAddress;
+    so["oscInArgType"] = s.oscInArgType;
+    so["oscInMatchMode"] = s.oscInMatchMode;
+    so["oscInValue"] = s.oscInValue;
+    so["oscInMin"] = s.oscInMin;
+    so["oscInMax"] = s.oscInMax;
+    so["oscInString"] = s.oscInString;
     so["type"] = static_cast<int>(s.type);
     so["pin"] = s.pin;
     so["encClkPin"] = s.encClkPin;
@@ -835,6 +889,11 @@ static bool applyConfigFromJson(const JsonObject& cfg, String& err) {
   if (cfg.containsKey("timeZone")) config.timeZone = String(cfg["timeZone"].as<const char*>());
   if (cfg.containsKey("manualEpoch")) config.manualEpoch = cfg["manualEpoch"];
   if (cfg.containsKey("timeDisplay24h")) config.timeDisplay24h = cfg["timeDisplay24h"];
+  if (cfg.containsKey("oscInEnabled")) config.oscInEnabled = cfg["oscInEnabled"];
+  if (cfg.containsKey("oscInPort")) {
+    uint16_t p = cfg["oscInPort"];
+    if (p > 0) config.oscInPort = p;
+  }
   if (cfg.containsKey("mqttEnabled")) config.mqttEnabled = cfg["mqttEnabled"];
   if (cfg.containsKey("mqttDevice")) {
     int d = cfg["mqttDevice"];
@@ -916,6 +975,13 @@ static bool applyConfigFromJson(const JsonObject& cfg, String& err) {
       if (so.containsKey("enabled")) s.enabled = so["enabled"];
       if (so.containsKey("name")) s.name = String(so["name"].as<const char*>());
       if (so.containsKey("source")) s.source = static_cast<SensorSource>(so["source"].as<int>());
+      if (so.containsKey("oscInAddress")) s.oscInAddress = String(so["oscInAddress"].as<const char*>());
+      if (so.containsKey("oscInArgType")) s.oscInArgType = so["oscInArgType"];
+      if (so.containsKey("oscInMatchMode")) s.oscInMatchMode = so["oscInMatchMode"];
+      if (so.containsKey("oscInValue")) s.oscInValue = so["oscInValue"];
+      if (so.containsKey("oscInMin")) s.oscInMin = so["oscInMin"];
+      if (so.containsKey("oscInMax")) s.oscInMax = so["oscInMax"];
+      if (so.containsKey("oscInString")) s.oscInString = String(so["oscInString"].as<const char*>());
       if (so.containsKey("type")) s.type = static_cast<SensorType>(so["type"].as<int>());
       if (so.containsKey("pin")) s.pin = so["pin"];
       if (so.containsKey("encClkPin")) s.encClkPin = so["encClkPin"];
@@ -994,11 +1060,17 @@ static bool applyConfigFromJson(const JsonObject& cfg, String& err) {
       if (!isAllowedDigitalPin(s.encSwPin)) s.encSwPin = 33;
       if (!isAllowedDigitalPin(s.hcTrigPin)) s.hcTrigPin = 13;
       if (!isAllowedDigitalPin(s.hcEchoPin)) s.hcEchoPin = 16;
+      if (s.source != SRC_TIME && s.source != SRC_OSC) s.source = SRC_SENSORS;
+      if (s.oscInAddress.length() == 0) s.oscInAddress = "/trigger/*";
+      if (s.oscInArgType > OSC_IN_ARG_STRING) s.oscInArgType = OSC_IN_ARG_ANY;
+      if (s.oscInMatchMode > OSC_IN_MATCH_RANGE) s.oscInMatchMode = OSC_IN_MATCH_ANY;
+      if (s.oscInString.length() == 0) s.oscInString = "go";
       config.sensors[idx] = s;
     }
   }
 
   if (config.mqttPort == 0) config.mqttPort = DEFAULT_MQTT_PORT;
+  if (config.oscInPort == 0) config.oscInPort = DEFAULT_OSC_IN_PORT;
   if (config.mqttDevice >= MAX_OSC_DEVICES && config.mqttDevice != MQTT_DEVICE_CUSTOM) {
     config.mqttDevice = DEFAULT_MQTT_DEVICE;
   }
@@ -1096,7 +1168,7 @@ static bool isInputPinInUse(int pin, int triggerIndex, const SensorConfig& curre
   for (int i = 0; i < MAX_TRIGGERS; i++) {
     const SensorConfig& s = (i == triggerIndex) ? current : config.sensors[i];
     if (!s.enabled) continue;
-    if (s.source == SRC_TIME) continue;
+    if (s.source == SRC_TIME || s.source == SRC_OSC) continue;
     if (s.type == SENSOR_ENCODER) {
       if (s.encClkPin == pin || s.encDtPin == pin || s.encSwPin == pin) return true;
     } else if (s.type == SENSOR_HCSR04) {
@@ -1144,6 +1216,13 @@ static SensorConfig defaultSensorConfig(int index) {
   s.enabled = (index == 0);
   s.name = String("Trigger ") + String(index + 1);
   s.source = SRC_SENSORS;
+  s.oscInAddress = "/trigger/*";
+  s.oscInArgType = OSC_IN_ARG_ANY;
+  s.oscInMatchMode = OSC_IN_MATCH_ANY;
+  s.oscInValue = 1.0f;
+  s.oscInMin = 0.0f;
+  s.oscInMax = 1.0f;
+  s.oscInString = "go";
   s.type = SENSOR_BUTTON;
   s.pin = defaultSensorPin(index);
   s.encClkPin = 13;
@@ -1423,6 +1502,13 @@ static void clearSensorKeys(int index) {
   removeIfExists(sensorKey(index, "en"));
   removeIfExists(sensorKey(index, "name"));
   removeIfExists(sensorKey(index, "src"));
+  removeIfExists(sensorKey(index, "osia"));
+  removeIfExists(sensorKey(index, "osit"));
+  removeIfExists(sensorKey(index, "osim"));
+  removeIfExists(sensorKey(index, "osiv"));
+  removeIfExists(sensorKey(index, "osmn"));
+  removeIfExists(sensorKey(index, "osmx"));
+  removeIfExists(sensorKey(index, "osis"));
   removeIfExists(sensorKey(index, "type"));
   removeIfExists(sensorKey(index, "pin"));
   removeIfExists(sensorKey(index, "clk"));
@@ -1518,17 +1604,17 @@ static void applySensorPinModes() {
   for (int i = 0; i < MAX_TRIGGERS; i++) {
     const SensorConfig& sensor = config.sensors[i];
     if (!sensor.enabled) continue;
-    if (sensor.source == SRC_TIME) continue;
-  if (sensor.type == SENSOR_ENCODER) {
-    pinMode(sensor.encClkPin, INPUT_PULLUP);
-    pinMode(sensor.encDtPin, INPUT_PULLUP);
-    pinMode(sensor.encSwPin, INPUT_PULLUP);
-  } else if (sensor.type == SENSOR_HCSR04) {
-    pinMode(sensor.hcTrigPin, OUTPUT);
-    pinMode(sensor.hcEchoPin, INPUT);
-  } else if (sensor.type != SENSOR_ANALOG) {
-    pinMode(sensor.pin, sensor.pullup ? INPUT_PULLUP : INPUT);
-  }
+    if (sensor.source == SRC_TIME || sensor.source == SRC_OSC) continue;
+    if (sensor.type == SENSOR_ENCODER) {
+      pinMode(sensor.encClkPin, INPUT_PULLUP);
+      pinMode(sensor.encDtPin, INPUT_PULLUP);
+      pinMode(sensor.encSwPin, INPUT_PULLUP);
+    } else if (sensor.type == SENSOR_HCSR04) {
+      pinMode(sensor.hcTrigPin, OUTPUT);
+      pinMode(sensor.hcEchoPin, INPUT);
+    } else if (sensor.type != SENSOR_ANALOG) {
+      pinMode(sensor.pin, sensor.pullup ? INPUT_PULLUP : INPUT);
+    }
   }
 }
 
@@ -1539,7 +1625,7 @@ static void setupEncoderCounters() {
   int unitsUsed = 0;
   for (int i = 0; i < MAX_TRIGGERS; i++) {
     const SensorConfig& s = config.sensors[i];
-    if (!s.enabled || s.source == SRC_TIME || s.type != SENSOR_ENCODER) continue;
+    if (!s.enabled || s.source == SRC_TIME || s.source == SRC_OSC || s.type != SENSOR_ENCODER) continue;
     if (unitsUsed >= 2) {
       addLog("Encoder PCNT limit reached. Extra encoder uses fallback polling.");
       continue;
@@ -1569,7 +1655,7 @@ static void setupEncoderCounters() {
 
 static bool hasPinConflict(int index) {
   if (!config.sensors[index].enabled) return false;
-  if (config.sensors[index].source == SRC_TIME) return false;
+  if (config.sensors[index].source == SRC_TIME || config.sensors[index].source == SRC_OSC) return false;
   int pinsA[3];
   int countA = 0;
   const SensorConfig& a = config.sensors[index];
@@ -1588,6 +1674,7 @@ static bool hasPinConflict(int index) {
     int pinsB[3];
     int countB = 0;
     const SensorConfig& b = config.sensors[i];
+    if (b.source == SRC_TIME || b.source == SRC_OSC) continue;
     if (b.type == SENSOR_ENCODER) {
       pinsB[countB++] = b.encClkPin;
       pinsB[countB++] = b.encDtPin;
@@ -1617,12 +1704,12 @@ static bool hasPinConflict(int index) {
 
 static bool hasSharedClickPattern(int index) {
   const SensorConfig& a = config.sensors[index];
-  if (!a.enabled || a.source == SRC_TIME) return false;
+  if (!a.enabled || a.source == SRC_TIME || a.source == SRC_OSC) return false;
   if (a.type != SENSOR_BUTTON) return false;
   for (int i = 0; i < MAX_TRIGGERS; i++) {
     if (i == index) continue;
     const SensorConfig& b = config.sensors[i];
-    if (!b.enabled || b.source == SRC_TIME) continue;
+    if (!b.enabled || b.source == SRC_TIME || b.source == SRC_OSC) continue;
     if (!isClickPatternType(b.type)) continue;
     if (b.pin == a.pin && b.activeHigh == a.activeHigh && b.pullup == a.pullup) {
       return true;
@@ -1635,6 +1722,9 @@ static void loadConfig() {
   prefs.begin("osc", true);
   config.hostname = sanitizeHostname(prefs.getString("hostname", DEFAULT_HOSTNAME));
   config.netMode = sanitizeNetworkMode(prefs.getInt("net_mode", DEFAULT_NET_MODE));
+  config.oscInEnabled = prefs.getBool("osci_en", DEFAULT_OSC_IN_ENABLED);
+  config.oscInPort = static_cast<uint16_t>(prefs.getUInt("osci_port", DEFAULT_OSC_IN_PORT));
+  if (config.oscInPort == 0) config.oscInPort = DEFAULT_OSC_IN_PORT;
 #if !USE_ETHERNET
   config.netMode = NET_WIFI;
 #endif
@@ -1782,7 +1872,18 @@ static void loadConfig() {
     s.enabled = prefs.getBool(sensorKey(i, "en").c_str(), s.enabled);
     s.name = prefs.getString(sensorKey(i, "name").c_str(), s.name);
     s.source = static_cast<SensorSource>(prefs.getInt(sensorKey(i, "src").c_str(), s.source));
-    if (s.source != SRC_TIME) s.source = SRC_SENSORS;
+    if (s.source != SRC_TIME && s.source != SRC_OSC) s.source = SRC_SENSORS;
+    s.oscInAddress = prefs.getString(sensorKey(i, "osia").c_str(), s.oscInAddress);
+    s.oscInArgType = static_cast<uint8_t>(prefs.getUInt(sensorKey(i, "osit").c_str(), s.oscInArgType));
+    if (s.oscInArgType > OSC_IN_ARG_STRING) s.oscInArgType = OSC_IN_ARG_ANY;
+    s.oscInMatchMode = static_cast<uint8_t>(prefs.getUInt(sensorKey(i, "osim").c_str(), s.oscInMatchMode));
+    if (s.oscInMatchMode > OSC_IN_MATCH_RANGE) s.oscInMatchMode = OSC_IN_MATCH_ANY;
+    s.oscInValue = prefs.getFloat(sensorKey(i, "osiv").c_str(), s.oscInValue);
+    s.oscInMin = prefs.getFloat(sensorKey(i, "osmn").c_str(), s.oscInMin);
+    s.oscInMax = prefs.getFloat(sensorKey(i, "osmx").c_str(), s.oscInMax);
+    s.oscInString = prefs.getString(sensorKey(i, "osis").c_str(), s.oscInString);
+    if (s.oscInAddress.length() == 0) s.oscInAddress = "/trigger/*";
+    if (s.oscInString.length() == 0) s.oscInString = "go";
     s.type = sanitizeSensorType(prefs.getInt(sensorKey(i, "type").c_str(), s.type));
     s.pin = prefs.getInt(sensorKey(i, "pin").c_str(), s.pin);
     s.encClkPin = prefs.getInt(sensorKey(i, "clk").c_str(), s.encClkPin);
@@ -1797,16 +1898,18 @@ static void loadConfig() {
     s.hcMaxCm = prefs.getFloat(sensorKey(i, "hcmax").c_str(), s.hcMaxCm);
     if (s.hcMaxCm == s.hcMinCm) s.hcMaxCm = s.hcMinCm + 1.0f;
     s.encSteps = DEFAULT_ENC_STEPS;
-    if (s.type == SENSOR_ANALOG) {
+    if (s.source == SRC_SENSORS && s.type == SENSOR_ANALOG) {
       if (!isAllowedAnalogPin(s.pin)) s.pin = defaultSensorPin(i);
-    } else {
+    } else if (s.source == SRC_SENSORS) {
       if (!isAllowedDigitalPin(s.pin)) s.pin = defaultSensorPin(i);
     }
-    if (!isAllowedDigitalPin(s.encClkPin)) s.encClkPin = 13;
-    if (!isAllowedDigitalPin(s.encDtPin)) s.encDtPin = 16;
-    if (!isAllowedDigitalPin(s.encSwPin)) s.encSwPin = 33;
-    if (!isAllowedDigitalPin(s.hcTrigPin)) s.hcTrigPin = 13;
-    if (!isAllowedDigitalPin(s.hcEchoPin)) s.hcEchoPin = 16;
+    if (s.source == SRC_SENSORS) {
+      if (!isAllowedDigitalPin(s.encClkPin)) s.encClkPin = 13;
+      if (!isAllowedDigitalPin(s.encDtPin)) s.encDtPin = 16;
+      if (!isAllowedDigitalPin(s.encSwPin)) s.encSwPin = 33;
+      if (!isAllowedDigitalPin(s.hcTrigPin)) s.hcTrigPin = 13;
+      if (!isAllowedDigitalPin(s.hcEchoPin)) s.hcEchoPin = 16;
+    }
     s.invert = prefs.getBool(sensorKey(i, "inv").c_str(), s.invert);
     s.activeHigh = prefs.getBool(sensorKey(i, "ah").c_str(), s.activeHigh);
     s.pullup = prefs.getBool(sensorKey(i, "pu").c_str(), s.pullup);
@@ -1971,6 +2074,8 @@ static void saveConfig() {
   prefs.begin("osc", false);
   prefs.putString("hostname", config.hostname);
   prefs.putInt("net_mode", config.netMode);
+  prefs.putBool("osci_en", config.oscInEnabled);
+  prefs.putUInt("osci_port", config.oscInPort);
   prefs.putString("client_ip", ipToString(config.clientIp));
   prefs.putInt("client_port", config.clientPort);
   prefs.putBool("use_static", config.useStatic);
@@ -2051,6 +2156,13 @@ static void saveConfig() {
     prefs.putBool(sensorKey(i, "en").c_str(), s.enabled);
     prefs.putString(sensorKey(i, "name").c_str(), s.name);
     prefs.putInt(sensorKey(i, "src").c_str(), s.source);
+    prefs.putString(sensorKey(i, "osia").c_str(), s.oscInAddress);
+    prefs.putUInt(sensorKey(i, "osit").c_str(), s.oscInArgType);
+    prefs.putUInt(sensorKey(i, "osim").c_str(), s.oscInMatchMode);
+    prefs.putFloat(sensorKey(i, "osiv").c_str(), s.oscInValue);
+    prefs.putFloat(sensorKey(i, "osmn").c_str(), s.oscInMin);
+    prefs.putFloat(sensorKey(i, "osmx").c_str(), s.oscInMax);
+    prefs.putString(sensorKey(i, "osis").c_str(), s.oscInString);
     prefs.putInt(sensorKey(i, "type").c_str(), s.type);
     prefs.putInt(sensorKey(i, "pin").c_str(), s.pin);
     prefs.putInt(sensorKey(i, "clk").c_str(), s.encClkPin);
@@ -2389,6 +2501,9 @@ static void sendUdpRawTo(const IPAddress& ip, uint16_t port, const String& paylo
 }
 
 static String buildHttpValue(const SensorConfig::OutputConfig& out, float norm) {
+  if (oscInputTokenOverrideActive) {
+    return oscInputTokenValue;
+  }
   if (out.outMode == OUT_STRING) {
     return (norm >= 0.5f) ? out.onString : out.offString;
   }
@@ -2413,10 +2528,18 @@ static String replaceTokens(const String& input, const String& value, const Stri
 
 static String replaceValueTokens(const String& input, const String& value, float norm, bool state) {
   String out = input;
-  String normText = String(norm, 3);
-  String stateText = state ? "1" : "0";
-  if (out.indexOf("{value}") >= 0) out.replace("{value}", value);
-  if (out.indexOf("{VALUE}") >= 0) out.replace("{VALUE}", value);
+  String effectiveValue = value;
+  float effectiveNorm = norm;
+  bool effectiveState = state;
+  if (oscInputTokenOverrideActive) {
+    effectiveValue = oscInputTokenValue;
+    effectiveNorm = oscInputTokenNorm;
+    effectiveState = oscInputTokenState;
+  }
+  String normText = String(effectiveNorm, 3);
+  String stateText = effectiveState ? "1" : "0";
+  if (out.indexOf("{value}") >= 0) out.replace("{value}", effectiveValue);
+  if (out.indexOf("{VALUE}") >= 0) out.replace("{VALUE}", effectiveValue);
   if (out.indexOf("{norm}") >= 0) out.replace("{norm}", normText);
   if (out.indexOf("{NORM}") >= 0) out.replace("{NORM}", normText);
   if (out.indexOf("{state}") >= 0) out.replace("{state}", stateText);
@@ -2610,7 +2733,7 @@ static void applyGpioOutputsNow() {
   for (int i = 0; i < MAX_TRIGGERS; i++) {
     const SensorConfig& s = config.sensors[i];
     if (!s.enabled) continue;
-    if (s.source == SRC_TIME) continue;
+    if (s.source == SRC_TIME || s.source == SRC_OSC) continue;
     if (hasPinConflict(i)) continue;
     float norm = 0.0f;
     if (s.type == SENSOR_ANALOG) {
@@ -2797,6 +2920,269 @@ static void sendOutputNow(const SensorConfig& sensor, const SensorConfig::Output
   }
 }
 
+static void configureUdpListener() {
+  uint16_t desiredPort = LOCAL_PORT;
+  if (config.oscInEnabled) {
+    desiredPort = (config.oscInPort > 0) ? config.oscInPort : DEFAULT_OSC_IN_PORT;
+  }
+  if (udpListenPort == desiredPort) return;
+
+  udp.stop();
+  if (udp.begin(desiredPort)) {
+    udpListenPort = desiredPort;
+    addLog(String("UDP listener on port ") + String(desiredPort));
+  } else {
+    udpListenPort = 0;
+    addLog(String("UDP listener failed on port ") + String(desiredPort));
+  }
+}
+
+static bool matchOscAddressPattern(const String& pattern, const String& value) {
+  String p = normalizeOscAddress(pattern);
+  String v = normalizeOscAddress(value);
+
+  int pi = 0;
+  int vi = 0;
+  int star = -1;
+  int match = 0;
+  int plen = p.length();
+  int vlen = v.length();
+
+  while (vi < vlen) {
+    if (pi < plen && p[pi] == v[vi]) {
+      pi++;
+      vi++;
+      continue;
+    }
+    if (pi < plen && p[pi] == '*') {
+      star = pi++;
+      match = vi;
+      continue;
+    }
+    if (star != -1) {
+      pi = star + 1;
+      vi = ++match;
+      continue;
+    }
+    return false;
+  }
+  while (pi < plen && p[pi] == '*') pi++;
+  return pi == plen;
+}
+
+static bool parseOscPaddedString(const uint8_t* data, size_t len, size_t& pos, String& out) {
+  if (pos >= len) return false;
+  size_t start = pos;
+  while (pos < len && data[pos] != 0) pos++;
+  if (pos >= len) return false;
+
+  out = "";
+  out.reserve(pos - start);
+  for (size_t i = start; i < pos; i++) {
+    out += static_cast<char>(data[i]);
+  }
+
+  pos++;  // skip null terminator
+  while ((pos & 0x03u) != 0u) {
+    if (pos >= len) return false;
+    pos++;
+  }
+  return true;
+}
+
+static bool parseOscInPacket(const uint8_t* data, size_t len, OscInMessage& msg) {
+  if (data == nullptr || len < 8) return false;
+  if (len >= 7 && memcmp(data, "#bundle", 7) == 0) return false;
+
+  size_t pos = 0;
+  String address;
+  if (!parseOscPaddedString(data, len, pos, address)) return false;
+  if (address.length() == 0 || address[0] != '/') return false;
+
+  String types;
+  if (!parseOscPaddedString(data, len, pos, types)) return false;
+  if (types.length() == 0 || types[0] != ',') return false;
+
+  msg.address = address;
+  msg.hasArg = false;
+  msg.argType = OSC_IN_ARG_ANY;
+  msg.intValue = 0;
+  msg.floatValue = 0.0f;
+  msg.stringValue = "";
+
+  if (types.length() < 2) {
+    return true;
+  }
+
+  char t = types[1];
+  msg.hasArg = true;
+
+  if (t == 'i') {
+    if (pos + 4 > len) return false;
+    uint32_t raw = (static_cast<uint32_t>(data[pos]) << 24) |
+                   (static_cast<uint32_t>(data[pos + 1]) << 16) |
+                   (static_cast<uint32_t>(data[pos + 2]) << 8) |
+                   static_cast<uint32_t>(data[pos + 3]);
+    msg.argType = OSC_IN_ARG_INT;
+    msg.intValue = static_cast<int32_t>(raw);
+    msg.floatValue = static_cast<float>(msg.intValue);
+    pos += 4;
+    return true;
+  }
+
+  if (t == 'f') {
+    if (pos + 4 > len) return false;
+    uint32_t bits = (static_cast<uint32_t>(data[pos]) << 24) |
+                    (static_cast<uint32_t>(data[pos + 1]) << 16) |
+                    (static_cast<uint32_t>(data[pos + 2]) << 8) |
+                    static_cast<uint32_t>(data[pos + 3]);
+    float f = 0.0f;
+    memcpy(&f, &bits, sizeof(float));
+    msg.argType = OSC_IN_ARG_FLOAT;
+    msg.floatValue = f;
+    msg.intValue = static_cast<int32_t>(lroundf(f));
+    pos += 4;
+    return true;
+  }
+
+  if (t == 's') {
+    String sval;
+    if (!parseOscPaddedString(data, len, pos, sval)) return false;
+    msg.argType = OSC_IN_ARG_STRING;
+    msg.stringValue = sval;
+    return true;
+  }
+
+  // Unsupported first argument type for now.
+  return false;
+}
+
+static bool matchOscInTrigger(const SensorConfig& s, const OscInMessage& msg, float& normOut, String& valueOut) {
+  if (!matchOscAddressPattern(s.oscInAddress, msg.address)) return false;
+
+  normOut = 1.0f;
+  valueOut = "1";
+
+  if (!msg.hasArg) {
+    if (s.oscInArgType != OSC_IN_ARG_ANY) return false;
+    if (s.oscInMatchMode != OSC_IN_MATCH_ANY) return false;
+    return true;
+  }
+
+  if (s.oscInArgType != OSC_IN_ARG_ANY && s.oscInArgType != msg.argType) return false;
+
+  bool numeric = (msg.argType == OSC_IN_ARG_INT || msg.argType == OSC_IN_ARG_FLOAT);
+  float rawNumeric = numeric ? msg.floatValue : 0.0f;
+
+  if (msg.argType == OSC_IN_ARG_STRING) {
+    valueOut = msg.stringValue;
+    String low = msg.stringValue;
+    low.toLowerCase();
+    normOut = (low == "0" || low == "off" || low == "false") ? 0.0f : 1.0f;
+  } else if (msg.argType == OSC_IN_ARG_INT) {
+    valueOut = String(msg.intValue);
+    if (rawNumeric >= 0.0f && rawNumeric <= 1.0f) {
+      normOut = rawNumeric;
+    }
+  } else if (msg.argType == OSC_IN_ARG_FLOAT) {
+    valueOut = String(rawNumeric, 3);
+    if (rawNumeric >= 0.0f && rawNumeric <= 1.0f) {
+      normOut = rawNumeric;
+    }
+  }
+
+  if (s.oscInMatchMode == OSC_IN_MATCH_ANY) {
+    return true;
+  }
+
+  if (s.oscInMatchMode == OSC_IN_MATCH_EQUAL) {
+    if (msg.argType == OSC_IN_ARG_STRING) {
+      return msg.stringValue == s.oscInString;
+    }
+    if (!numeric) return false;
+    return fabsf(rawNumeric - s.oscInValue) <= 0.0005f;
+  }
+
+  if (s.oscInMatchMode == OSC_IN_MATCH_RANGE) {
+    if (!numeric) return false;
+    float minV = s.oscInMin;
+    float maxV = s.oscInMax;
+    bool inverted = false;
+    if (maxV < minV) {
+      float t = minV;
+      minV = maxV;
+      maxV = t;
+      inverted = true;
+    }
+    if (rawNumeric < minV || rawNumeric > maxV) return false;
+    float span = maxV - minV;
+    if (span <= 0.000001f) {
+      normOut = 1.0f;
+    } else {
+      normOut = (rawNumeric - minV) / span;
+    }
+    if (inverted) normOut = 1.0f - normOut;
+    normOut = clampFloat(normOut, 0.0f, 1.0f);
+    return true;
+  }
+
+  return false;
+}
+
+static void processOscInput() {
+  if (!config.oscInEnabled) return;
+
+  uint8_t packet[512];
+  int packetSize = udp.parsePacket();
+  while (packetSize > 0) {
+    int readLen = packetSize;
+    if (readLen > static_cast<int>(sizeof(packet))) readLen = sizeof(packet);
+    int len = udp.read(packet, readLen);
+    if (len > 0) {
+      OscInMessage msg;
+      if (parseOscInPacket(packet, static_cast<size_t>(len), msg)) {
+        String argText = "";
+        if (msg.hasArg) {
+          if (msg.argType == OSC_IN_ARG_INT) argText = String(msg.intValue);
+          else if (msg.argType == OSC_IN_ARG_FLOAT) argText = String(msg.floatValue, 3);
+          else if (msg.argType == OSC_IN_ARG_STRING) argText = msg.stringValue;
+        }
+        addLog(String("OSC In ") + msg.address + (msg.hasArg ? (" " + argText) : ""));
+
+        bool anyMatched = false;
+        for (int i = 0; i < MAX_TRIGGERS; i++) {
+          const SensorConfig& s = config.sensors[i];
+          if (!s.enabled || s.source != SRC_OSC) continue;
+
+          float norm = 1.0f;
+          String value = "1";
+          if (!matchOscInTrigger(s, msg, norm, value)) continue;
+          anyMatched = true;
+
+          oscInputTokenOverrideActive = true;
+          oscInputTokenValue = value;
+          oscInputTokenNorm = clampFloat(norm, 0.0f, 1.0f);
+          oscInputTokenState = (oscInputTokenNorm >= 0.5f);
+          for (int o = 0; o < s.outputCount; o++) {
+            const SensorConfig::OutputConfig& out = s.outputs[o];
+            float sendNorm = out.sendMinOnRelease ? oscInputTokenNorm : 1.0f;
+            sendOutputNow(s, out, out.oscAddress, sendNorm);
+          }
+          oscInputTokenOverrideActive = false;
+          addLog(String("OSC In matched trigger: ") + s.name);
+        }
+
+        if (!anyMatched) {
+          addLog(String("OSC In no match: ") + msg.address);
+        }
+      } else {
+        addLog("OSC In parse skipped.");
+      }
+    }
+    packetSize = udp.parsePacket();
+  }
+}
+
 static void processClickPattern(int index, const SensorConfig& sensor, bool pressed, int targetClicks, bool longPress) {
   unsigned long now = millis();
 
@@ -2965,6 +3351,7 @@ static void handleTriggers() {
     html += "Source: <select name='s" + idx + "_src' id='s" + idx + "_src'>";
     html += "<option value='0' " + String(s.source == SRC_SENSORS ? "selected" : "") + ">Sensors</option>";
     html += "<option value='1' " + String(s.source == SRC_TIME ? "selected" : "") + ">Time</option>";
+    html += "<option value='2' " + String(s.source == SRC_OSC ? "selected" : "") + ">OSC In</option>";
     html += "</select><br>";
     html += "<div id='s" + idx + "_type_block'>Type: <select name='s" + idx + "_type' id='s" + idx + "_type'>";
     html += "<option value='1' " + String(s.type == SENSOR_BUTTON ? "selected" : "") + ">Button (momentary)</option>";
@@ -3012,6 +3399,26 @@ static void handleTriggers() {
     html += "Insert +/- as 1st arg: <input name='s" + idx + "_enc_arg' type='checkbox' " + String(s.encSignArg ? "checked" : "") + "><br>";
     html += "Invert direction: <input name='s" + idx + "_enc_inv' type='checkbox' " + String(s.encInvert ? "checked" : "") + "><br>";
     html += "<small>Encoder step sends relative changes. Use options above for QLab/Resolume.</small><br>";
+    html += "</div>";
+
+    html += "<div id='s" + idx + "_oscin'>";
+    html += "<b>OSC In</b><br>";
+    html += "Address pattern: <input name='s" + idx + "_osia' type='text' value='" + s.oscInAddress + "' placeholder='/trigger/*'><br>";
+    html += "Argument type: <select name='s" + idx + "_osit' id='s" + idx + "_osit'>";
+    html += "<option value='0' " + String(s.oscInArgType == OSC_IN_ARG_ANY ? "selected" : "") + ">Any / none</option>";
+    html += "<option value='1' " + String(s.oscInArgType == OSC_IN_ARG_INT ? "selected" : "") + ">Int</option>";
+    html += "<option value='2' " + String(s.oscInArgType == OSC_IN_ARG_FLOAT ? "selected" : "") + ">Float</option>";
+    html += "<option value='3' " + String(s.oscInArgType == OSC_IN_ARG_STRING ? "selected" : "") + ">String</option>";
+    html += "</select><br>";
+    html += "Match mode: <select name='s" + idx + "_osim' id='s" + idx + "_osim'>";
+    html += "<option value='0' " + String(s.oscInMatchMode == OSC_IN_MATCH_ANY ? "selected" : "") + ">Any value</option>";
+    html += "<option value='1' " + String(s.oscInMatchMode == OSC_IN_MATCH_EQUAL ? "selected" : "") + ">Equals</option>";
+    html += "<option value='2' " + String(s.oscInMatchMode == OSC_IN_MATCH_RANGE ? "selected" : "") + ">Range</option>";
+    html += "</select><br>";
+    html += "<div id='s" + idx + "_osiv_row'>Value: <input name='s" + idx + "_osiv' type='number' step='0.001' value='" + String(s.oscInValue, 3) + "'><br></div>";
+    html += "<div id='s" + idx + "_osir_row'>Min: <input name='s" + idx + "_osmn' type='number' step='0.001' value='" + String(s.oscInMin, 3) + "'><br>Max: <input name='s" + idx + "_osmx' type='number' step='0.001' value='" + String(s.oscInMax, 3) + "'><br></div>";
+    html += "<div id='s" + idx + "_osis_row'>String: <input name='s" + idx + "_osis' type='text' value='" + s.oscInString + "'><br></div>";
+    html += "<small>Wildcard '*' supported. Examples: /go, /qlab/*</small><br>";
     html += "</div>";
 
     html += "<div id='s" + idx + "_time_block'>";
@@ -3189,6 +3596,12 @@ static void handleTriggers() {
   html += "const srcSel=document.getElementById('s'+i+'_src');";
   html += "const tSel=document.getElementById('s'+i+'_type');";
   html += "const typeBlock=document.getElementById('s'+i+'_type_block');";
+  html += "const oscinBlock=document.getElementById('s'+i+'_oscin');";
+  html += "const ositSel=document.getElementById('s'+i+'_osit');";
+  html += "const osimSel=document.getElementById('s'+i+'_osim');";
+  html += "const osivRow=document.getElementById('s'+i+'_osiv_row');";
+  html += "const osirRow=document.getElementById('s'+i+'_osir_row');";
+  html += "const osisRow=document.getElementById('s'+i+'_osis_row');";
   html += "const ttSel=document.getElementById('s'+i+'_tt');";
   html += "const src=srcSel?srcSel.value:'0';";
   html += "const t=tSel? tSel.value : '0';";
@@ -3203,9 +3616,20 @@ static void handleTriggers() {
   html += "const timeDaily=document.getElementById('s'+i+'_time_daily');";
   html += "const timeWeekly=document.getElementById('s'+i+'_time_weekly');";
   html += "const timeInterval=document.getElementById('s'+i+'_time_interval');";
+  html += "const isSensor=(src==='0');";
   html += "const isTime=(src==='1');";
-  html += "const isEnc=(t==='4');";
-  html += "if(typeBlock){typeBlock.style.display=isTime?'none':'block';}";
+  html += "const isOscIn=(src==='2');";
+  html += "const isEnc=(isSensor && t==='4');";
+  html += "if(typeBlock){typeBlock.style.display=isSensor?'block':'none';}";
+  html += "if(oscinBlock){oscinBlock.style.display=isOscIn?'block':'none';}";
+  html += "if(isOscIn){";
+  html += "let mt=osimSel?osimSel.value:'0';";
+  html += "const at=ositSel?ositSel.value:'0';";
+  html += "if(at==='3' && mt==='2' && osimSel){osimSel.value='1';mt='1';}";
+  html += "if(osivRow){osivRow.style.display=(mt==='1' && at!=='3')?'block':'none';}";
+  html += "if(osirRow){osirRow.style.display=(mt==='2' && at!=='3')?'block':'none';}";
+  html += "if(osisRow){osisRow.style.display=(mt==='1' && at==='3')?'block':'none';}";
+  html += "}";
   html += "if(timeBlock){timeBlock.style.display=isTime?'block':'none';}";
   html += "if(ttSel){";
   html += "const tt=ttSel.value;";
@@ -3214,12 +3638,12 @@ static void handleTriggers() {
   html += "if(timeWeekly) timeWeekly.style.display=(tt==='2')?'block':'none';";
   html += "if(timeInterval) timeInterval.style.display=(tt==='3')?'block':'none';";
   html += "}";
-  html += "if(a){a.style.display=(!isTime && t==='0')?'block':'none';}";
-  html += "if(d){d.style.display=(!isTime && t!=='0'&&!isEnc)?'block':'none';}";
-  html += "if(pin){pin.style.display=(isEnc||isTime||t==='9')?'none':'block';}";
-  html += "if(enc){enc.style.display=isEnc?'block':'none';}";
-  html += "if(hc){hc.style.display=(t==='9')?'block':'none';}";
-  html += "if(cd){cd.style.display=(!isTime && (t==='1' || t==='8'))?'block':'none';}";
+  html += "if(a){a.style.display=(isSensor && t==='0')?'block':'none';}";
+  html += "if(d){d.style.display=(isSensor && t!=='0'&&!isEnc)?'block':'none';}";
+  html += "if(pin){pin.style.display=(isSensor && !isEnc && t!=='9')?'block':'none';}";
+  html += "if(enc){enc.style.display=(isSensor && isEnc)?'block':'none';}";
+  html += "if(hc){hc.style.display=(isSensor && t==='9')?'block':'none';}";
+  html += "if(cd){cd.style.display=(isSensor && (t==='1' || t==='8'))?'block':'none';}";
   html += "for(let o=0;o<" + String(MAX_OUTPUTS_PER_TRIGGER) + ";o++){";
   html += "const tgt=document.getElementById('s'+i+'_o'+o+'_tgt');";
   html += "if(!tgt) continue;";
@@ -3305,7 +3729,7 @@ static void handleTriggers() {
   html += "else if(isEnc){";
   html += "opt.disabled=true;";
   html += "if(om.value==='2'){om.value='1';}";
-  html += "}else if(!isTime && t==='0'){";
+  html += "}else if(isSensor && t==='0'){";
   html += "opt.disabled=true;";
   html += "if(om.value==='2'){om.value='1';}";
   html += "}else{";
@@ -3323,7 +3747,7 @@ static void handleTriggers() {
   html += "if(btnAddr){btnAddr.style.display=(isOsc && isEnc)?'block':'none';}";
   html += "if(btnBlock){btnBlock.style.display=(isOsc && isEnc)?'block':'none';}";
   html += "if(minRel){";
-  html += "if(isOsc||isHttp||isMqtt){minRel.style.display=(isEnc||t!=='0')?'block':'none';}";
+  html += "if(isOsc||isHttp||isMqtt){minRel.style.display=(isEnc||!isSensor||t!=='0')?'block':'none';}";
   html += "else{minRel.style.display='none';}";
   html += "}";
   html += "if(minRow&&smin&&om){";
@@ -3353,9 +3777,13 @@ static void handleTriggers() {
   html += "const tSel=document.getElementById('s'+i+'_type');";
   html += "const srcSel=document.getElementById('s'+i+'_src');";
   html += "const ttSel=document.getElementById('s'+i+'_tt');";
+  html += "const ositSel=document.getElementById('s'+i+'_osit');";
+  html += "const osimSel=document.getElementById('s'+i+'_osim');";
   html += "if(tSel){tSel.addEventListener('change',()=>updateTrigger(i));}";
   html += "if(srcSel){srcSel.addEventListener('change',()=>updateTrigger(i));}";
   html += "if(ttSel){ttSel.addEventListener('change',()=>updateTrigger(i));}";
+  html += "if(ositSel){ositSel.addEventListener('change',()=>updateTrigger(i));}";
+  html += "if(osimSel){osimSel.addEventListener('change',()=>updateTrigger(i));}";
   html += "for(let o=0;o<" + String(MAX_OUTPUTS_PER_TRIGGER) + ";o++){";
   html += "const om=document.getElementById('s'+i+'_o'+o+'_omode');";
   html += "if(om){om.addEventListener('change',()=>updateTrigger(i));}";
@@ -3490,7 +3918,9 @@ static void handleSaveTriggers() {
     }
     if (server.hasArg("s" + idx + "_src")) {
       int src = server.arg("s" + idx + "_src").toInt();
-      s.source = (src == 1) ? SRC_TIME : SRC_SENSORS;
+      if (src == 1) s.source = SRC_TIME;
+      else if (src == 2) s.source = SRC_OSC;
+      else s.source = SRC_SENSORS;
     }
     if (server.hasArg("s" + idx + "_type")) {
       s.type = sanitizeSensorType(server.arg("s" + idx + "_type").toInt());
@@ -3549,6 +3979,36 @@ static void handleSaveTriggers() {
         s.intervalSeconds = val * 60;
       }
     }
+    if (server.hasArg("s" + idx + "_osia")) {
+      String addr = server.arg("s" + idx + "_osia");
+      addr.trim();
+      s.oscInAddress = normalizeOscAddress(addr);
+    }
+    if (server.hasArg("s" + idx + "_osit")) {
+      int at = server.arg("s" + idx + "_osit").toInt();
+      if (at < OSC_IN_ARG_ANY || at > OSC_IN_ARG_STRING) at = OSC_IN_ARG_ANY;
+      s.oscInArgType = static_cast<uint8_t>(at);
+    }
+    if (server.hasArg("s" + idx + "_osim")) {
+      int mm = server.arg("s" + idx + "_osim").toInt();
+      if (mm < OSC_IN_MATCH_ANY || mm > OSC_IN_MATCH_RANGE) mm = OSC_IN_MATCH_ANY;
+      s.oscInMatchMode = static_cast<uint8_t>(mm);
+    }
+    if (server.hasArg("s" + idx + "_osiv")) {
+      s.oscInValue = server.arg("s" + idx + "_osiv").toFloat();
+    }
+    if (server.hasArg("s" + idx + "_osmn")) {
+      s.oscInMin = server.arg("s" + idx + "_osmn").toFloat();
+    }
+    if (server.hasArg("s" + idx + "_osmx")) {
+      s.oscInMax = server.arg("s" + idx + "_osmx").toFloat();
+    }
+    if (server.hasArg("s" + idx + "_osis")) {
+      s.oscInString = server.arg("s" + idx + "_osis");
+      s.oscInString.trim();
+      if (s.oscInString.length() == 0) s.oscInString = "go";
+    }
+    if (s.oscInAddress.length() == 0) s.oscInAddress = "/trigger/*";
     int outCount = 0;
     for (int o = 0; o < MAX_OUTPUTS_PER_TRIGGER; o++) {
       String oidx = String(o);
@@ -3705,7 +4165,7 @@ static void handleSaveTriggers() {
       if (ms > 0) s.cooldownMs = ms;
     }
 
-    if (s.source != SRC_TIME) {
+    if (s.source == SRC_SENSORS) {
       if (server.hasArg("s" + idx + "_pin")) {
         int pin = server.arg("s" + idx + "_pin").toInt();
         if (pin >= 0 && pin <= 39 && !isReservedPin(pin)) {
@@ -3893,6 +4353,12 @@ static void handleSettings() {
   html += "DNS2: <input name='dns2' type='text' value='" + ipToString(config.dns2) + "'><br>";
   html += "</div>";
   html += "<small>Static IP changes may require reboot.</small><br>";
+  html += "</div>";
+
+  html += "<div class='card'><b>OSC Input</b><br>";
+  html += "Enable OSC input triggers: <input name='osci_en' type='checkbox' " + String(config.oscInEnabled ? "checked" : "") + "><br>";
+  html += "Listen port: <input name='osci_port' type='number' min='1' max='65535' value='" + String(config.oscInPort) + "' style='max-width:140px;'><br>";
+  html += "<small>Trigger-level OSC matching is configured on the Triggers page (Source = OSC In).</small><br>";
   html += "</div>";
 
   html += "<div class='card'><b>Network Clients (OSC / UDP / MQTT / HTTP Webhook)</b><br>";
@@ -4238,6 +4704,13 @@ static void handleSaveSettings() {
 #if !USE_ETHERNET
   config.netMode = NET_WIFI;
 #endif
+
+  config.oscInEnabled = server.hasArg("osci_en");
+  if (server.hasArg("osci_port")) {
+    int p = server.arg("osci_port").toInt();
+    if (p > 0 && p <= 65535) config.oscInPort = static_cast<uint16_t>(p);
+  }
+  if (config.oscInPort == 0) config.oscInPort = DEFAULT_OSC_IN_PORT;
 
   String wifiSsid = "";
   if (server.hasArg("wifi_ssid")) {
@@ -4818,13 +5291,14 @@ void setup() {
     Serial.print("Network OK. ESP32 IP: ");
     Serial.println(getLocalIp());
     addLog(String("Network OK. IP ") + getLocalIp().toString());
-    udp.begin(LOCAL_PORT);
+    configureUdpListener();
     startMdns();
     applyTimeConfig();
   } else {
     Serial.println("Network failed to connect.");
     addLog("Network failed. Starting AP.");
     startWifiAp();
+    configureUdpListener();
   }
 
   server.on("/", HTTP_GET, handleTriggers);
@@ -4903,6 +5377,8 @@ void loop() {
     }
   }
 
+  processOscInput();
+
   for (int i = 0; i < MAX_TRIGGERS; i++) {
     SensorConfig& s = config.sensors[i];
     if (!s.enabled) continue;
@@ -4910,6 +5386,7 @@ void loop() {
       handleTimeTrigger(i, s);
       continue;
     }
+    if (s.source == SRC_OSC) continue;
     if (hasPinConflict(i)) continue;
 
     float norm = 0.0f;
@@ -5421,6 +5898,7 @@ void loop() {
   if (pendingNetApply && millis() - pendingApplyAt > 250) {
     pendingNetApply = false;
     applyNetworkConfig();
+    configureUdpListener();
     wifiReconnectStarted = (config.netMode == NET_WIFI) ? millis() : 0;
     if (pendingMdnsRestart) {
       pendingMdnsRestart = false;
@@ -5448,6 +5926,7 @@ void loop() {
         wifiApMode = false;
         dnsServer.stop();
       }
+      configureUdpListener();
       startMdns();
       Serial.print("WiFi connected. IP: ");
       Serial.println(getLocalIp());
@@ -5462,10 +5941,12 @@ void loop() {
     bool netOk = ETH.linkUp() && isValidIp(ETH.localIP());
     if (!netOk && !wifiApMode) {
       startWifiAp();
+      configureUdpListener();
     } else if (netOk && wifiApMode) {
       WiFi.softAPdisconnect(true);
       wifiApMode = false;
       dnsServer.stop();
+      configureUdpListener();
     }
   }
 #endif
@@ -5474,10 +5955,12 @@ void loop() {
     bool netOk = (WiFi.status() == WL_CONNECTED) && isValidIp(WiFi.localIP());
     if (!netOk && !wifiApMode) {
       startWifiAp();
+      configureUdpListener();
     } else if (netOk && wifiApMode) {
       WiFi.softAPdisconnect(true);
       wifiApMode = false;
       dnsServer.stop();
+      configureUdpListener();
     }
   }
 
