@@ -42,13 +42,17 @@ const IPAddress DEFAULT_DNS2(8, 8, 8, 8);
 const char* DEFAULT_WIFI_SSID = "";
 const char* DEFAULT_WIFI_PASS = "";
 const char* DEFAULT_USERNAME = "admin";
-const char* FIRMWARE_VERSION = "0.10.0";
+const char* FIRMWARE_VERSION = "0.13.0";
 const char* DEFAULT_NTP_SERVER = "pool.ntp.org";
 const uint8_t DEFAULT_TIME_MODE = 0; // 0 = NTP, 1 = Manual
 const char* DEFAULT_TIMEZONE = "PST8PDT,M3.2.0/2,M11.1.0/2";
 const bool DEFAULT_TIME_DISPLAY_24H = false;
 const bool DEFAULT_OSC_IN_ENABLED = true;
 const uint16_t DEFAULT_OSC_IN_PORT = 9001;
+const bool DEFAULT_ARTNET_ENABLED = true;
+const bool DEFAULT_SACN_ENABLED = true;
+const bool DEFAULT_DMX_IN_ARTNET_ENABLED = false;
+const bool DEFAULT_DMX_IN_SACN_ENABLED = false;
 const bool DEFAULT_MQTT_ENABLED = false;
 const char* DEFAULT_MQTT_HOST = "";
 const uint16_t DEFAULT_MQTT_PORT = 1883;
@@ -61,6 +65,9 @@ const uint8_t DEFAULT_MQTT_DEVICE = 0;
 const int MAX_TRIGGERS = 20;
 const int MAX_OSC_DEVICES = 8;
 const int MAX_OUTPUTS_PER_TRIGGER = 5;
+const int MAX_DMX_PRESETS = 100;
+const int MAX_DMX_PRESET_POINTS = 4096;
+const int MAX_DMX_PRESET_UNIVERSE = 40;
 const uint8_t MQTT_DEVICE_CUSTOM = 255;
 
 enum NetMode {
@@ -125,7 +132,25 @@ enum OutputTarget {
   OUT_TARGET_UDP = 3,
   OUT_TARGET_GPIO = 4,
   OUT_TARGET_HTTP = 5,
-  OUT_TARGET_MQTT = 6
+  OUT_TARGET_MQTT = 6,
+  OUT_TARGET_DMX = 7,
+  OUT_TARGET_DMX_PRESET = 8
+};
+
+enum DmxProtocol {
+  DMX_PROTO_ARTNET = 0,
+  DMX_PROTO_SACN = 1
+};
+
+enum DmxDestinationMode {
+  DMX_DEST_AUTO = 0,
+  DMX_DEST_UNICAST = 1
+};
+
+enum DmxInputSourceMode {
+  DMX_IN_SOURCE_RECENT = 0,
+  DMX_IN_SOURCE_PREFER_ARTNET = 1,
+  DMX_IN_SOURCE_PREFER_SACN = 2
 };
 
 enum GpioOutMode {
@@ -245,6 +270,15 @@ struct SensorConfig {
     String mqttTopic;
     String mqttPayload;
     bool mqttRetain;
+    uint8_t dmxProtocol;
+    uint8_t dmxDest;
+    uint8_t dmxArtNet;
+    uint8_t dmxArtSubnet;
+    uint8_t dmxArtUniverse;
+    uint16_t dmxUniverse;
+    String dmxChannels;
+    uint8_t dmxPreset;
+    uint32_t dmxFadeMs;
     String onString;
     String offString;
     String buttonOnString;
@@ -266,6 +300,11 @@ struct Config {
   NetMode netMode;
   bool oscInEnabled;
   uint16_t oscInPort;
+  bool artnetEnabled;
+  bool sacnEnabled;
+  bool dmxInArtNetEnabled;
+  bool dmxInSacnEnabled;
+  uint8_t dmxInSourceMode;
   IPAddress clientIp;
   uint16_t clientPort;
   bool useStatic;
@@ -306,6 +345,7 @@ struct Config {
 };
 
 Config config;
+String dmxPresetText[MAX_DMX_PRESETS];
 
 float ema[MAX_TRIGGERS];     // smoothed ADC per sensor
 int lastInt[MAX_TRIGGERS][MAX_OUTPUTS_PER_TRIGGER];   // last sent int value per output
@@ -333,8 +373,34 @@ uint32_t gpioPulseUntilByPin[40];
 int8_t gpioPwmChannelByPin[40];
 uint8_t nextGpioPwmChannel = 0;
 int8_t gpioPulseEndLevelByPin[40];
+
+const uint16_t ARTNET_PORT = 6454;
+const uint16_t SACN_PORT = 5568;
+const int MAX_DMX_STREAMS = 24;
+struct DmxStreamState {
+  bool used;
+  uint8_t protocol;
+  uint8_t device;
+  uint16_t universe;
+  uint8_t sequence;
+  uint8_t data[512];
+};
+DmxStreamState dmxStreams[MAX_DMX_STREAMS];
+uint8_t sacnCid[16];
+bool sacnCidReady = false;
+uint8_t* dmxInData = nullptr;
+uint8_t dmxInSource[MAX_DMX_PRESET_UNIVERSE];
+uint32_t dmxInSeenMs[MAX_DMX_PRESET_UNIVERSE];
+uint32_t dmxInArtSeenMs[MAX_DMX_PRESET_UNIVERSE];
+uint32_t dmxInSacnSeenMs[MAX_DMX_PRESET_UNIVERSE];
+
 WiFiUDP udp;
-uint16_t udpListenPort = 0;
+WiFiUDP oscUdp;
+WiFiUDP artnetInUdp;
+WiFiUDP sacnInUdp;
+uint16_t oscListenPort = 0;
+bool artnetListenActive = false;
+bool sacnListenActive = false;
 WiFiClient mqttNetClient;
 PubSubClient mqttClient(mqttNetClient);
 WebServer server(80);
@@ -363,6 +429,29 @@ String oscInputTokenValue = "";
 float oscInputTokenNorm = 1.0f;
 bool oscInputTokenState = true;
 
+struct DmxFadePoint {
+  uint16_t universe;
+  uint16_t channel;
+  uint8_t fromValue;
+  uint8_t toValue;
+};
+
+struct DmxFadeState {
+  bool active;
+  uint8_t protocol;
+  uint8_t dest;
+  uint8_t device;
+  uint32_t startMs;
+  uint32_t durationMs;
+  uint32_t lastFrameMs;
+  uint16_t pointCount;
+  uint8_t usedUniverseCount;
+  uint16_t usedUniverses[MAX_DMX_PRESET_UNIVERSE];
+  DmxFadePoint points[MAX_DMX_PRESET_POINTS];
+};
+
+DmxFadeState dmxFadeState;
+
 struct OscInMessage {
   String address;
   bool hasArg;
@@ -375,6 +464,17 @@ struct OscInMessage {
 static String ipToString(const IPAddress& ip);
 static bool parseIpString(const String& s, IPAddress& out);
 static bool isValidIp(const IPAddress& ip);
+static uint8_t sanitizeDmxProtocol(int value);
+static uint8_t sanitizeDmxDest(int value);
+static uint8_t sanitizeDmxArtNet(int value);
+static uint8_t sanitizeDmxArtSubnet(int value);
+static uint8_t sanitizeDmxArtUniverse(int value);
+static uint8_t sanitizeDmxPresetId(int value);
+static uint32_t sanitizeDmxFadeMs(int value);
+static uint8_t sanitizeDmxInputSourceMode(int value);
+static OutputTarget sanitizeOutputTarget(int value);
+static uint16_t encodeArtNetPortAddressOneBased(uint8_t net, uint8_t subnet, uint8_t universe);
+static void decodeArtNetPortAddressOneBased(uint16_t oneBased, uint8_t& net, uint8_t& subnet, uint8_t& universe);
 static String buildApSsid();
 static void startWifiAp();
 static void addLog(const String& msg);
@@ -413,10 +513,25 @@ static void configureMqttClient();
 static bool ensureMqttConnected();
 static bool sendMqttMessage(const String& topic, const String& payload, bool retain);
 static void configureUdpListener();
+static bool decodeArtNetDmxPacket(const uint8_t* data, size_t len, uint16_t& universeOneBased, uint8_t* dmxData, uint16_t& dmxLen);
+static bool decodeSacnDmxPacket(const uint8_t* data, size_t len, uint16_t& universeOneBased, uint8_t* dmxData, uint16_t& dmxLen);
+static uint8_t* getDmxInputUniverseBuffer(int index);
+static void updateDmxInputUniverse(uint8_t protocol, uint16_t universeOneBased, const uint8_t* dmxData, uint16_t dmxLen);
+static bool getLiveDmxUniverseValues(uint16_t universeOneBased, uint8_t viewMode, uint8_t outData[512], uint8_t& selectedSource, uint32_t& selectedAgeMs);
+static int parseDmxPresetText(const String& text, DmxFadePoint* points, int maxPoints, String* normalizedOut, String& err);
+static bool parseDmxPresetRow(const String& line, int& universe, String& channelsExpr, int& value);
+static void fillDmxUniverseValues(const String& text, int universe, int16_t values[512]);
+static String removeDmxUniverseRows(const String& text, int universe);
+static String serializeDmxUniverseRows(int universe, const int16_t values[512]);
+static int totalDmxPresetPointsExcluding(int excludeIndex);
+static bool triggerDmxPreset(const SensorConfig::OutputConfig& out);
+static void tickDmxPresetFade();
+static void handleDmxPresetEditor();
 static bool matchOscAddressPattern(const String& pattern, const String& value);
 static bool parseOscInPacket(const uint8_t* data, size_t len, OscInMessage& msg);
 static bool matchOscInTrigger(const SensorConfig& s, const OscInMessage& msg, float& normOut, String& valueOut);
 static void processOscInput();
+static void processDmxInput();
 
 static int readAveragedADC(int pin) {
   uint32_t acc = 0;
@@ -734,7 +849,7 @@ static int compareVersion(const String& a, const String& b) {
 }
 
 static String exportConfigJson() {
-  DynamicJsonDocument doc(32768);
+  DynamicJsonDocument doc(98304);
   doc["version"] = FIRMWARE_VERSION;
   JsonObject c = doc.createNestedObject("config");
   c["username"] = config.username;
@@ -750,6 +865,11 @@ static String exportConfigJson() {
   c["timeDisplay24h"] = config.timeDisplay24h;
   c["oscInEnabled"] = config.oscInEnabled;
   c["oscInPort"] = config.oscInPort;
+  c["artnetEnabled"] = config.artnetEnabled;
+  c["sacnEnabled"] = config.sacnEnabled;
+  c["dmxInArtNetEnabled"] = config.dmxInArtNetEnabled;
+  c["dmxInSacnEnabled"] = config.dmxInSacnEnabled;
+  c["dmxInSourceMode"] = config.dmxInSourceMode;
   c["mqttEnabled"] = config.mqttEnabled;
   c["mqttDevice"] = config.mqttDevice;
   c["mqttHost"] = config.mqttHost;
@@ -845,6 +965,15 @@ static String exportConfigJson() {
       oo["mqttTopic"] = out.mqttTopic;
       oo["mqttPayload"] = out.mqttPayload;
       oo["mqttRetain"] = out.mqttRetain;
+      oo["dmxProtocol"] = out.dmxProtocol;
+      oo["dmxDest"] = out.dmxDest;
+      oo["dmxArtNet"] = out.dmxArtNet;
+      oo["dmxArtSubnet"] = out.dmxArtSubnet;
+      oo["dmxArtUniverse"] = out.dmxArtUniverse;
+      oo["dmxUniverse"] = out.dmxUniverse;
+      oo["dmxChannels"] = out.dmxChannels;
+      oo["dmxPreset"] = out.dmxPreset;
+      oo["dmxFadeMs"] = out.dmxFadeMs;
       oo["onString"] = out.onString;
       oo["offString"] = out.offString;
       oo["buttonOnString"] = out.buttonOnString;
@@ -859,6 +988,14 @@ static String exportConfigJson() {
     so["timeSecond"] = s.timeSecond;
     so["weeklyMask"] = s.weeklyMask;
     so["intervalSeconds"] = s.intervalSeconds;
+  }
+
+  JsonArray dmxPresets = c.createNestedArray("dmxPresets");
+  for (int i = 0; i < MAX_DMX_PRESETS; i++) {
+    if (dmxPresetText[i].length() == 0) continue;
+    JsonObject po = dmxPresets.createNestedObject();
+    po["index"] = i;
+    po["text"] = dmxPresetText[i];
   }
 
   String out;
@@ -894,6 +1031,11 @@ static bool applyConfigFromJson(const JsonObject& cfg, String& err) {
     uint16_t p = cfg["oscInPort"];
     if (p > 0) config.oscInPort = p;
   }
+  if (cfg.containsKey("artnetEnabled")) config.artnetEnabled = cfg["artnetEnabled"];
+  if (cfg.containsKey("sacnEnabled")) config.sacnEnabled = cfg["sacnEnabled"];
+  if (cfg.containsKey("dmxInArtNetEnabled")) config.dmxInArtNetEnabled = cfg["dmxInArtNetEnabled"];
+  if (cfg.containsKey("dmxInSacnEnabled")) config.dmxInSacnEnabled = cfg["dmxInSacnEnabled"];
+  if (cfg.containsKey("dmxInSourceMode")) config.dmxInSourceMode = sanitizeDmxInputSourceMode(cfg["dmxInSourceMode"]);
   if (cfg.containsKey("mqttEnabled")) config.mqttEnabled = cfg["mqttEnabled"];
   if (cfg.containsKey("mqttDevice")) {
     int d = cfg["mqttDevice"];
@@ -1005,13 +1147,15 @@ static bool applyConfigFromJson(const JsonObject& cfg, String& err) {
         if (oc > MAX_OUTPUTS_PER_TRIGGER) oc = MAX_OUTPUTS_PER_TRIGGER;
         s.outputCount = static_cast<uint8_t>(oc);
       }
+      bool importedArtAddr[MAX_OUTPUTS_PER_TRIGGER];
+      for (int ai = 0; ai < MAX_OUTPUTS_PER_TRIGGER; ai++) importedArtAddr[ai] = false;
       JsonArray outs = so["outputs"].as<JsonArray>();
       if (!outs.isNull()) {
         for (JsonObject oo : outs) {
           int oidx = oo["index"] | -1;
           if (oidx < 0 || oidx >= MAX_OUTPUTS_PER_TRIGGER) continue;
           SensorConfig::OutputConfig out = s.outputs[oidx];
-          if (oo.containsKey("target")) out.target = static_cast<OutputTarget>(oo["target"].as<int>());
+          if (oo.containsKey("target")) out.target = sanitizeOutputTarget(oo["target"].as<int>());
           if (oo.containsKey("device")) out.device = oo["device"];
           if (oo.containsKey("oscAddress")) out.oscAddress = String(oo["oscAddress"].as<const char*>());
           if (oo.containsKey("buttonAddress")) out.buttonAddress = String(oo["buttonAddress"].as<const char*>());
@@ -1036,10 +1180,24 @@ static bool applyConfigFromJson(const JsonObject& cfg, String& err) {
           if (oo.containsKey("mqttTopic")) out.mqttTopic = String(oo["mqttTopic"].as<const char*>());
           if (oo.containsKey("mqttPayload")) out.mqttPayload = String(oo["mqttPayload"].as<const char*>());
           if (oo.containsKey("mqttRetain")) out.mqttRetain = oo["mqttRetain"];
+          if (oo.containsKey("dmxProtocol")) out.dmxProtocol = sanitizeDmxProtocol(oo["dmxProtocol"].as<int>());
+          if (oo.containsKey("dmxDest")) out.dmxDest = sanitizeDmxDest(oo["dmxDest"].as<int>());
+          if (oo.containsKey("dmxArtNet")) out.dmxArtNet = sanitizeDmxArtNet(oo["dmxArtNet"].as<int>());
+          if (oo.containsKey("dmxArtSubnet")) out.dmxArtSubnet = sanitizeDmxArtSubnet(oo["dmxArtSubnet"].as<int>());
+          if (oo.containsKey("dmxArtUniverse")) out.dmxArtUniverse = sanitizeDmxArtUniverse(oo["dmxArtUniverse"].as<int>());
+          importedArtAddr[oidx] = oo.containsKey("dmxArtNet") || oo.containsKey("dmxArtSubnet") || oo.containsKey("dmxArtUniverse");
+          if (oo.containsKey("dmxUniverse")) {
+            uint16_t u = oo["dmxUniverse"];
+            if (u > 0) out.dmxUniverse = u;
+          }
+          if (oo.containsKey("dmxChannels")) out.dmxChannels = String(oo["dmxChannels"].as<const char*>());
+          if (oo.containsKey("dmxPreset")) out.dmxPreset = sanitizeDmxPresetId(oo["dmxPreset"].as<int>());
+          if (oo.containsKey("dmxFadeMs")) out.dmxFadeMs = sanitizeDmxFadeMs(oo["dmxFadeMs"].as<int>());
           if (oo.containsKey("onString")) out.onString = String(oo["onString"].as<const char*>());
           if (oo.containsKey("offString")) out.offString = String(oo["offString"].as<const char*>());
           if (oo.containsKey("buttonOnString")) out.buttonOnString = String(oo["buttonOnString"].as<const char*>());
           if (oo.containsKey("buttonOffString")) out.buttonOffString = String(oo["buttonOffString"].as<const char*>());
+          if ((out.target == OUT_TARGET_DMX || out.target == OUT_TARGET_DMX_PRESET) && out.outMode == OUT_STRING) out.outMode = OUT_INT;
           s.outputs[oidx] = out;
         }
       }
@@ -1065,7 +1223,38 @@ static bool applyConfigFromJson(const JsonObject& cfg, String& err) {
       if (s.oscInArgType > OSC_IN_ARG_STRING) s.oscInArgType = OSC_IN_ARG_ANY;
       if (s.oscInMatchMode > OSC_IN_MATCH_RANGE) s.oscInMatchMode = OSC_IN_MATCH_ANY;
       if (s.oscInString.length() == 0) s.oscInString = "go";
+      for (int o = 0; o < s.outputCount; o++) {
+        if (s.outputs[o].dmxUniverse == 0) s.outputs[o].dmxUniverse = 1;
+        if (importedArtAddr[o] && s.outputs[o].dmxProtocol == DMX_PROTO_ARTNET) {
+          s.outputs[o].dmxUniverse = encodeArtNetPortAddressOneBased(
+              s.outputs[o].dmxArtNet, s.outputs[o].dmxArtSubnet, s.outputs[o].dmxArtUniverse);
+        }
+        if (!importedArtAddr[o]) {
+          decodeArtNetPortAddressOneBased(s.outputs[o].dmxUniverse,
+                                          s.outputs[o].dmxArtNet,
+                                          s.outputs[o].dmxArtSubnet,
+                                          s.outputs[o].dmxArtUniverse);
+        }
+        s.outputs[o].dmxArtNet = sanitizeDmxArtNet(s.outputs[o].dmxArtNet);
+        s.outputs[o].dmxArtSubnet = sanitizeDmxArtSubnet(s.outputs[o].dmxArtSubnet);
+        s.outputs[o].dmxArtUniverse = sanitizeDmxArtUniverse(s.outputs[o].dmxArtUniverse);
+        if (s.outputs[o].dmxChannels.length() == 0) s.outputs[o].dmxChannels = "1";
+        s.outputs[o].dmxPreset = sanitizeDmxPresetId(s.outputs[o].dmxPreset);
+        s.outputs[o].dmxFadeMs = sanitizeDmxFadeMs(s.outputs[o].dmxFadeMs);
+      }
       config.sensors[idx] = s;
+    }
+  }
+
+  for (int i = 0; i < MAX_DMX_PRESETS; i++) dmxPresetText[i] = "";
+  JsonArray dmxPresets = cfg["dmxPresets"].as<JsonArray>();
+  if (!dmxPresets.isNull()) {
+    for (JsonObject po : dmxPresets) {
+      int idx = po["index"] | -1;
+      if (idx < 0 || idx >= MAX_DMX_PRESETS) continue;
+      if (!po.containsKey("text")) continue;
+      dmxPresetText[idx] = String(po["text"].as<const char*>());
+      dmxPresetText[idx].trim();
     }
   }
 
@@ -1133,8 +1322,53 @@ static OutputMode sanitizeOutputMode(int value) {
 }
 
 static OutputTarget sanitizeOutputTarget(int value) {
-  if (value < OUT_TARGET_OSC || value > OUT_TARGET_MQTT) return OUT_TARGET_OSC;
+  if (value < OUT_TARGET_OSC || value > OUT_TARGET_DMX_PRESET) return OUT_TARGET_OSC;
   return static_cast<OutputTarget>(value);
+}
+
+static uint8_t sanitizeDmxProtocol(int value) {
+  if (value < DMX_PROTO_ARTNET || value > DMX_PROTO_SACN) return DMX_PROTO_ARTNET;
+  return static_cast<uint8_t>(value);
+}
+
+static uint8_t sanitizeDmxDest(int value) {
+  if (value < DMX_DEST_AUTO || value > DMX_DEST_UNICAST) return DMX_DEST_AUTO;
+  return static_cast<uint8_t>(value);
+}
+
+static uint8_t sanitizeDmxArtNet(int value) {
+  if (value < 0) return 0;
+  if (value > 127) return 127;
+  return static_cast<uint8_t>(value);
+}
+
+static uint8_t sanitizeDmxArtSubnet(int value) {
+  if (value < 0) return 0;
+  if (value > 15) return 15;
+  return static_cast<uint8_t>(value);
+}
+
+static uint8_t sanitizeDmxArtUniverse(int value) {
+  if (value < 0) return 0;
+  if (value > 15) return 15;
+  return static_cast<uint8_t>(value);
+}
+
+static uint8_t sanitizeDmxPresetId(int value) {
+  if (value < 1) return 1;
+  if (value > MAX_DMX_PRESETS) return MAX_DMX_PRESETS;
+  return static_cast<uint8_t>(value);
+}
+
+static uint32_t sanitizeDmxFadeMs(int value) {
+  if (value < 0) return 0;
+  if (value > 600000) return 600000;
+  return static_cast<uint32_t>(value);
+}
+
+static uint8_t sanitizeDmxInputSourceMode(int value) {
+  if (value < DMX_IN_SOURCE_RECENT || value > DMX_IN_SOURCE_PREFER_SACN) return DMX_IN_SOURCE_RECENT;
+  return static_cast<uint8_t>(value);
 }
 
 static NetMode sanitizeNetworkMode(int value) {
@@ -1269,6 +1503,15 @@ static SensorConfig defaultSensorConfig(int index) {
     s.outputs[o].mqttTopic = buildDefaultMqttTopic(s, index, o);
     s.outputs[o].mqttPayload = "{value}";
     s.outputs[o].mqttRetain = false;
+    s.outputs[o].dmxProtocol = DMX_PROTO_ARTNET;
+    s.outputs[o].dmxDest = DMX_DEST_AUTO;
+    s.outputs[o].dmxArtNet = 0;
+    s.outputs[o].dmxArtSubnet = 0;
+    s.outputs[o].dmxArtUniverse = 0;
+    s.outputs[o].dmxUniverse = 1;
+    s.outputs[o].dmxChannels = "1";
+    s.outputs[o].dmxPreset = 1;
+    s.outputs[o].dmxFadeMs = 1000;
     s.outputs[o].onString = DEFAULT_ON_STRING;
     s.outputs[o].offString = DEFAULT_OFF_STRING;
     s.outputs[o].buttonOnString = DEFAULT_ON_STRING;
@@ -1481,6 +1724,31 @@ static void resetRuntimeState(bool keepOutputState = false) {
     gpioPwmChannelByPin[pin] = -1;
     gpioPulseEndLevelByPin[pin] = 0;
   }
+  for (int i = 0; i < MAX_DMX_STREAMS; i++) {
+    dmxStreams[i].used = false;
+    dmxStreams[i].protocol = DMX_PROTO_ARTNET;
+    dmxStreams[i].device = 0;
+    dmxStreams[i].universe = 1;
+    dmxStreams[i].sequence = 0;
+    memset(dmxStreams[i].data, 0, sizeof(dmxStreams[i].data));
+  }
+  dmxFadeState.active = false;
+  dmxFadeState.protocol = DMX_PROTO_ARTNET;
+  dmxFadeState.dest = DMX_DEST_AUTO;
+  dmxFadeState.device = 0;
+  dmxFadeState.startMs = 0;
+  dmxFadeState.durationMs = 0;
+  dmxFadeState.lastFrameMs = 0;
+  dmxFadeState.pointCount = 0;
+  dmxFadeState.usedUniverseCount = 0;
+  for (int u = 0; u < MAX_DMX_PRESET_UNIVERSE; u++) {
+    dmxInSource[u] = 0;
+    dmxInSeenMs[u] = 0;
+    dmxInArtSeenMs[u] = 0;
+    dmxInSacnSeenMs[u] = 0;
+    uint8_t* uni = getDmxInputUniverseBuffer(u);
+    if (uni != nullptr) memset(uni, 0, 512);
+  }
   nextGpioPwmChannel = 0;
   lastHeartbeatSentMs = 0;
 }
@@ -1569,6 +1837,15 @@ static void clearSensorKeys(int index) {
     removeIfExists(outputKey(index, o, "mt"));
     removeIfExists(outputKey(index, o, "mp"));
     removeIfExists(outputKey(index, o, "mr"));
+    removeIfExists(outputKey(index, o, "dmxp"));
+    removeIfExists(outputKey(index, o, "dmxd"));
+    removeIfExists(outputKey(index, o, "dmxn"));
+    removeIfExists(outputKey(index, o, "dmxs"));
+    removeIfExists(outputKey(index, o, "dmxa"));
+    removeIfExists(outputKey(index, o, "dmxu"));
+    removeIfExists(outputKey(index, o, "dmxc"));
+    removeIfExists(outputKey(index, o, "dmxpr"));
+    removeIfExists(outputKey(index, o, "dmxfd"));
     removeIfExists(outputKey(index, o, "on"));
     removeIfExists(outputKey(index, o, "off"));
   }
@@ -1725,6 +2002,11 @@ static void loadConfig() {
   config.oscInEnabled = prefs.getBool("osci_en", DEFAULT_OSC_IN_ENABLED);
   config.oscInPort = static_cast<uint16_t>(prefs.getUInt("osci_port", DEFAULT_OSC_IN_PORT));
   if (config.oscInPort == 0) config.oscInPort = DEFAULT_OSC_IN_PORT;
+  config.artnetEnabled = prefs.getBool("art_en", DEFAULT_ARTNET_ENABLED);
+  config.sacnEnabled = prefs.getBool("sacn_en", DEFAULT_SACN_ENABLED);
+  config.dmxInArtNetEnabled = prefs.getBool("dmi_art", DEFAULT_DMX_IN_ARTNET_ENABLED);
+  config.dmxInSacnEnabled = prefs.getBool("dmi_sac", DEFAULT_DMX_IN_SACN_ENABLED);
+  config.dmxInSourceMode = sanitizeDmxInputSourceMode(prefs.getInt("dmi_src", DMX_IN_SOURCE_RECENT));
 #if !USE_ETHERNET
   config.netMode = NET_WIFI;
 #endif
@@ -2021,6 +2303,43 @@ static void loadConfig() {
         if (hasOutputCount) {
           s.outputs[o].mqttRetain = prefs.getBool(baseMqttRetain.c_str(), s.outputs[o].mqttRetain);
         }
+        String baseDmxProto = hasOutputCount ? outputKey(i, o, "dmxp") : String();
+        if (hasOutputCount) {
+          s.outputs[o].dmxProtocol = sanitizeDmxProtocol(prefs.getUInt(baseDmxProto.c_str(), s.outputs[o].dmxProtocol));
+        }
+        String baseDmxDest = hasOutputCount ? outputKey(i, o, "dmxd") : String();
+        if (hasOutputCount) {
+          s.outputs[o].dmxDest = sanitizeDmxDest(prefs.getUInt(baseDmxDest.c_str(), s.outputs[o].dmxDest));
+        }
+        String baseDmxNet = hasOutputCount ? outputKey(i, o, "dmxn") : String();
+        if (hasOutputCount) {
+          s.outputs[o].dmxArtNet = sanitizeDmxArtNet(prefs.getUInt(baseDmxNet.c_str(), s.outputs[o].dmxArtNet));
+        }
+        String baseDmxSubnet = hasOutputCount ? outputKey(i, o, "dmxs") : String();
+        if (hasOutputCount) {
+          s.outputs[o].dmxArtSubnet = sanitizeDmxArtSubnet(prefs.getUInt(baseDmxSubnet.c_str(), s.outputs[o].dmxArtSubnet));
+        }
+        String baseDmxUni = hasOutputCount ? outputKey(i, o, "dmxa") : String();
+        if (hasOutputCount) {
+          s.outputs[o].dmxArtUniverse = sanitizeDmxArtUniverse(prefs.getUInt(baseDmxUni.c_str(), s.outputs[o].dmxArtUniverse));
+        }
+        String baseDmxUniverse = hasOutputCount ? outputKey(i, o, "dmxu") : String();
+        if (hasOutputCount) {
+          uint16_t u = static_cast<uint16_t>(prefs.getUInt(baseDmxUniverse.c_str(), s.outputs[o].dmxUniverse));
+          if (u > 0) s.outputs[o].dmxUniverse = u;
+        }
+        String baseDmxChannels = hasOutputCount ? outputKey(i, o, "dmxc") : String();
+        if (hasOutputCount) {
+          s.outputs[o].dmxChannels = prefs.getString(baseDmxChannels.c_str(), s.outputs[o].dmxChannels);
+        }
+        String baseDmxPreset = hasOutputCount ? outputKey(i, o, "dmxpr") : String();
+        if (hasOutputCount) {
+          s.outputs[o].dmxPreset = sanitizeDmxPresetId(prefs.getUInt(baseDmxPreset.c_str(), s.outputs[o].dmxPreset));
+        }
+        String baseDmxFade = hasOutputCount ? outputKey(i, o, "dmxfd") : String();
+        if (hasOutputCount) {
+          s.outputs[o].dmxFadeMs = sanitizeDmxFadeMs(prefs.getUInt(baseDmxFade.c_str(), s.outputs[o].dmxFadeMs));
+        }
         s.outputs[o].onString = prefs.getString(baseOn.c_str(), s.outputs[o].onString);
         s.outputs[o].offString = prefs.getString(baseOff.c_str(), s.outputs[o].offString);
         s.outputs[o].buttonOnString = prefs.getString(baseBon.c_str(), s.outputs[o].buttonOnString);
@@ -2028,10 +2347,32 @@ static void loadConfig() {
       }
       if (s.outputs[o].oscAddress.length() == 0) s.outputs[o].oscAddress = defaultOscAddress(i);
       if (s.outputs[o].buttonAddress.length() == 0) s.outputs[o].buttonAddress = "/button";
+      if (s.outputs[o].dmxUniverse == 0) s.outputs[o].dmxUniverse = 1;
+      if (hasOutputCount) {
+        bool hasArtNetKeys = prefs.isKey(outputKey(i, o, "dmxn").c_str()) ||
+                             prefs.isKey(outputKey(i, o, "dmxs").c_str()) ||
+                             prefs.isKey(outputKey(i, o, "dmxa").c_str());
+        if (!hasArtNetKeys) {
+          decodeArtNetPortAddressOneBased(s.outputs[o].dmxUniverse,
+                                          s.outputs[o].dmxArtNet,
+                                          s.outputs[o].dmxArtSubnet,
+                                          s.outputs[o].dmxArtUniverse);
+        } else if (s.outputs[o].dmxProtocol == DMX_PROTO_ARTNET) {
+          s.outputs[o].dmxUniverse = encodeArtNetPortAddressOneBased(
+              s.outputs[o].dmxArtNet, s.outputs[o].dmxArtSubnet, s.outputs[o].dmxArtUniverse);
+        }
+      }
+      s.outputs[o].dmxArtNet = sanitizeDmxArtNet(s.outputs[o].dmxArtNet);
+      s.outputs[o].dmxArtSubnet = sanitizeDmxArtSubnet(s.outputs[o].dmxArtSubnet);
+      s.outputs[o].dmxArtUniverse = sanitizeDmxArtUniverse(s.outputs[o].dmxArtUniverse);
+      if (s.outputs[o].dmxChannels.length() == 0) s.outputs[o].dmxChannels = "1";
+      s.outputs[o].dmxPreset = sanitizeDmxPresetId(s.outputs[o].dmxPreset);
+      s.outputs[o].dmxFadeMs = sanitizeDmxFadeMs(s.outputs[o].dmxFadeMs);
       if (isAutoMqttTopic(s.outputs[o].mqttTopic, s, s, i, o)) {
         s.outputs[o].mqttTopic = buildDefaultMqttTopic(s, i, o);
       }
       if (s.type == SENSOR_ANALOG && s.outputs[o].outMode == OUT_STRING) s.outputs[o].outMode = OUT_FLOAT;
+      if ((s.outputs[o].target == OUT_TARGET_DMX || s.outputs[o].target == OUT_TARGET_DMX_PRESET) && s.outputs[o].outMode == OUT_STRING) s.outputs[o].outMode = OUT_INT;
     }
     s.timeType = static_cast<TimeTriggerType>(prefs.getInt(sensorKey(i, "tt").c_str(), s.timeType));
     if (s.timeType > TIME_INTERVAL) s.timeType = TIME_DAILY;
@@ -2067,6 +2408,12 @@ static void loadConfig() {
     config.sensors[0] = s0;
   }
 
+  for (int i = 0; i < MAX_DMX_PRESETS; i++) {
+    String key = String("dmxp_") + String(i);
+    dmxPresetText[i] = prefs.getString(key.c_str(), "");
+    dmxPresetText[i].trim();
+  }
+
   prefs.end();
 }
 
@@ -2076,6 +2423,11 @@ static void saveConfig() {
   prefs.putInt("net_mode", config.netMode);
   prefs.putBool("osci_en", config.oscInEnabled);
   prefs.putUInt("osci_port", config.oscInPort);
+  prefs.putBool("art_en", config.artnetEnabled);
+  prefs.putBool("sacn_en", config.sacnEnabled);
+  prefs.putBool("dmi_art", config.dmxInArtNetEnabled);
+  prefs.putBool("dmi_sac", config.dmxInSacnEnabled);
+  prefs.putUInt("dmi_src", config.dmxInSourceMode);
   prefs.putString("client_ip", ipToString(config.clientIp));
   prefs.putInt("client_port", config.clientPort);
   prefs.putBool("use_static", config.useStatic);
@@ -2208,6 +2560,15 @@ static void saveConfig() {
       prefs.putString(outputKey(i, o, "mt").c_str(), out.mqttTopic);
       prefs.putString(outputKey(i, o, "mp").c_str(), out.mqttPayload);
       prefs.putBool(outputKey(i, o, "mr").c_str(), out.mqttRetain);
+      prefs.putUInt(outputKey(i, o, "dmxp").c_str(), out.dmxProtocol);
+      prefs.putUInt(outputKey(i, o, "dmxd").c_str(), out.dmxDest);
+      prefs.putUInt(outputKey(i, o, "dmxn").c_str(), out.dmxArtNet);
+      prefs.putUInt(outputKey(i, o, "dmxs").c_str(), out.dmxArtSubnet);
+      prefs.putUInt(outputKey(i, o, "dmxa").c_str(), out.dmxArtUniverse);
+      prefs.putUInt(outputKey(i, o, "dmxu").c_str(), out.dmxUniverse);
+      prefs.putString(outputKey(i, o, "dmxc").c_str(), out.dmxChannels);
+      prefs.putUInt(outputKey(i, o, "dmxpr").c_str(), out.dmxPreset);
+      prefs.putUInt(outputKey(i, o, "dmxfd").c_str(), out.dmxFadeMs);
       prefs.putString(outputKey(i, o, "on").c_str(), out.onString);
       prefs.putString(outputKey(i, o, "off").c_str(), out.offString);
       prefs.putString(outputKey(i, o, "bon").c_str(), out.buttonOnString);
@@ -2222,6 +2583,17 @@ static void saveConfig() {
     prefs.putInt(sensorKey(i, "tsec").c_str(), s.timeSecond);
     prefs.putInt(sensorKey(i, "twm").c_str(), s.weeklyMask);
     prefs.putUInt(sensorKey(i, "tint").c_str(), s.intervalSeconds);
+  }
+
+  for (int i = 0; i < MAX_DMX_PRESETS; i++) {
+    String key = String("dmxp_") + String(i);
+    String text = dmxPresetText[i];
+    text.trim();
+    if (text.length() == 0) {
+      removeIfExists(key);
+    } else {
+      prefs.putString(key.c_str(), text);
+    }
   }
 
   prefs.end();
@@ -2498,6 +2870,649 @@ static void sendUdpRawTo(const IPAddress& ip, uint16_t port, const String& paylo
   udp.write(reinterpret_cast<const uint8_t*>(payload.c_str()), payload.length());
   udp.endPacket();
   addLog(String("UDP raw ") + ipToString(ip) + ":" + String(port) + " " + payload);
+}
+
+static void initSacnCid() {
+  if (sacnCidReady) return;
+  memset(sacnCid, 0, sizeof(sacnCid));
+  uint64_t mac = ESP.getEfuseMac();
+  sacnCid[0] = 0x53;
+  sacnCid[1] = 0x74;
+  sacnCid[2] = 0x61;
+  sacnCid[3] = 0x67;
+  sacnCid[4] = 0x65;
+  sacnCid[5] = 0x4d;
+  sacnCid[6] = 0x6f;
+  sacnCid[7] = 0x64;
+  for (int i = 0; i < 8; i++) {
+    sacnCid[8 + i] = static_cast<uint8_t>((mac >> ((7 - i) * 8)) & 0xFF);
+  }
+  sacnCidReady = true;
+}
+
+static int parseDmxChannels(const String& specRaw, uint16_t* channels, int maxChannels) {
+  if (channels == nullptr || maxChannels <= 0) return 0;
+  bool used[513];
+  for (int i = 0; i <= 512; i++) used[i] = false;
+  int count = 0;
+  String spec = specRaw;
+  spec.trim();
+  if (spec.length() == 0) spec = "1";
+  int start = 0;
+  while (start < static_cast<int>(spec.length())) {
+    int comma = spec.indexOf(',', start);
+    if (comma < 0) comma = spec.length();
+    String part = spec.substring(start, comma);
+    part.trim();
+    if (part.length() > 0) {
+      int dash = part.indexOf('-');
+      int from = 0;
+      int to = 0;
+      if (dash >= 0) {
+        String lhs = part.substring(0, dash);
+        String rhs = part.substring(dash + 1);
+        lhs.trim();
+        rhs.trim();
+        from = lhs.toInt();
+        to = rhs.toInt();
+      } else {
+        from = part.toInt();
+        to = from;
+      }
+      if (from > to) {
+        int tmp = from;
+        from = to;
+        to = tmp;
+      }
+      if (from < 1) from = 1;
+      if (to > 512) to = 512;
+      for (int c = from; c <= to; c++) {
+        if (!used[c]) {
+          used[c] = true;
+          if (count < maxChannels) channels[count++] = static_cast<uint16_t>(c);
+        }
+      }
+    }
+    start = comma + 1;
+  }
+  if (count == 0) {
+    channels[0] = 1;
+    return 1;
+  }
+  return count;
+}
+
+static int parseDmxPresetText(const String& text, DmxFadePoint* points, int maxPoints, String* normalizedOut, String& err) {
+  if (normalizedOut != nullptr) *normalizedOut = "";
+  err = "";
+  int total = 0;
+  int start = 0;
+  while (start <= static_cast<int>(text.length())) {
+    int nl = text.indexOf('\n', start);
+    if (nl < 0) nl = text.length();
+    String line = text.substring(start, nl);
+    line.trim();
+    start = nl + 1;
+    if (line.length() == 0) continue;
+    if (line.startsWith("#")) continue;
+
+    int c1 = line.indexOf(',');
+    int c2 = (c1 >= 0) ? line.indexOf(',', c1 + 1) : -1;
+    if (c1 <= 0 || c2 <= c1 + 1 || c2 >= static_cast<int>(line.length()) - 1) {
+      err = String("Invalid preset row: ") + line;
+      return -1;
+    }
+    String uniStr = line.substring(0, c1);
+    String chStr = line.substring(c1 + 1, c2);
+    String valStr = line.substring(c2 + 1);
+    uniStr.trim();
+    chStr.trim();
+    valStr.trim();
+
+    int universe = uniStr.toInt();
+    if (universe < 1 || universe > MAX_DMX_PRESET_UNIVERSE) {
+      err = String("Universe out of range (1-") + String(MAX_DMX_PRESET_UNIVERSE) + "): " + uniStr;
+      return -1;
+    }
+
+    int value = valStr.toInt();
+    if (value < 0 || value > 255) {
+      err = String("Value out of range (0-255): ") + valStr;
+      return -1;
+    }
+
+    uint16_t channels[512];
+    int channelCount = parseDmxChannels(chStr, channels, 512);
+    if (channelCount <= 0) {
+      err = String("No channels in row: ") + line;
+      return -1;
+    }
+
+    if (normalizedOut != nullptr) {
+      if (normalizedOut->length() > 0) *normalizedOut += "\n";
+      *normalizedOut += String(universe) + "," + chStr + "," + String(value);
+    }
+
+    for (int i = 0; i < channelCount; i++) {
+      if (total >= maxPoints) {
+        err = String("Preset exceeds point limit (") + String(maxPoints) + ").";
+        return -1;
+      }
+      if (points != nullptr) {
+        points[total].universe = static_cast<uint16_t>(universe);
+        points[total].channel = channels[i];
+        points[total].fromValue = 0;
+        points[total].toValue = static_cast<uint8_t>(value);
+      }
+      total++;
+    }
+  }
+  return total;
+}
+
+static bool parseDmxPresetRow(const String& line, int& universe, String& channelsExpr, int& value) {
+  String row = line;
+  row.trim();
+  if (row.length() == 0 || row.startsWith("#")) return false;
+  int c1 = row.indexOf(',');
+  int c2 = (c1 >= 0) ? row.indexOf(',', c1 + 1) : -1;
+  if (c1 <= 0 || c2 <= c1 + 1 || c2 >= static_cast<int>(row.length()) - 1) return false;
+
+  String uniStr = row.substring(0, c1);
+  channelsExpr = row.substring(c1 + 1, c2);
+  String valStr = row.substring(c2 + 1);
+  uniStr.trim();
+  channelsExpr.trim();
+  valStr.trim();
+
+  universe = uniStr.toInt();
+  value = valStr.toInt();
+  if (universe < 1 || universe > MAX_DMX_PRESET_UNIVERSE) return false;
+  if (value < 0 || value > 255) return false;
+  return channelsExpr.length() > 0;
+}
+
+static void fillDmxUniverseValues(const String& text, int universe, int16_t values[512]) {
+  for (int i = 0; i < 512; i++) values[i] = -1;
+  int start = 0;
+  while (start <= static_cast<int>(text.length())) {
+    int nl = text.indexOf('\n', start);
+    if (nl < 0) nl = text.length();
+    String line = text.substring(start, nl);
+    start = nl + 1;
+
+    int rowUni = 0;
+    int rowVal = 0;
+    String rowChannels;
+    if (!parseDmxPresetRow(line, rowUni, rowChannels, rowVal)) continue;
+    if (rowUni != universe) continue;
+
+    uint16_t channels[512];
+    int channelCount = parseDmxChannels(rowChannels, channels, 512);
+    for (int i = 0; i < channelCount; i++) {
+      int ch = channels[i];
+      if (ch >= 1 && ch <= 512) values[ch - 1] = static_cast<int16_t>(rowVal);
+    }
+  }
+}
+
+static String removeDmxUniverseRows(const String& text, int universe) {
+  String out;
+  int start = 0;
+  while (start <= static_cast<int>(text.length())) {
+    int nl = text.indexOf('\n', start);
+    if (nl < 0) nl = text.length();
+    String line = text.substring(start, nl);
+    start = nl + 1;
+    line.trim();
+    if (line.length() == 0) continue;
+
+    int rowUni = 0;
+    int rowVal = 0;
+    String rowChannels;
+    bool isRow = parseDmxPresetRow(line, rowUni, rowChannels, rowVal);
+    if (isRow && rowUni == universe) continue;
+
+    if (out.length() > 0) out += "\n";
+    out += line;
+  }
+  return out;
+}
+
+static String serializeDmxUniverseRows(int universe, const int16_t values[512]) {
+  String out;
+  for (int ch = 1; ch <= 512; ) {
+    int16_t value = values[ch - 1];
+    if (value < 0) {
+      ch++;
+      continue;
+    }
+    int start = ch;
+    int end = ch;
+    while (end + 1 <= 512 && values[end] == value) end++;
+
+    if (out.length() > 0) out += "\n";
+    out += String(universe) + ",";
+    if (start == end) {
+      out += String(start);
+    } else {
+      out += String(start) + "-" + String(end);
+    }
+    out += "," + String(value);
+    ch = end + 1;
+  }
+  return out;
+}
+
+static int totalDmxPresetPointsExcluding(int excludeIndex) {
+  int total = 0;
+  for (int i = 0; i < MAX_DMX_PRESETS; i++) {
+    if (i == excludeIndex) continue;
+    const String& text = dmxPresetText[i];
+    if (text.length() == 0) continue;
+    String err;
+    int count = parseDmxPresetText(text, nullptr, MAX_DMX_PRESET_POINTS, nullptr, err);
+    if (count > 0) total += count;
+  }
+  return total;
+}
+
+static uint16_t encodeArtNetPortAddressOneBased(uint8_t net, uint8_t subnet, uint8_t universe) {
+  uint16_t abs = (static_cast<uint16_t>(net) << 8) |
+                 (static_cast<uint16_t>(subnet) << 4) |
+                 static_cast<uint16_t>(universe);
+  return abs + 1;
+}
+
+static void decodeArtNetPortAddressOneBased(uint16_t oneBased, uint8_t& net, uint8_t& subnet, uint8_t& universe) {
+  uint16_t abs = (oneBased > 0) ? static_cast<uint16_t>(oneBased - 1) : 0;
+  net = static_cast<uint8_t>((abs >> 8) & 0x7F);
+  subnet = static_cast<uint8_t>((abs >> 4) & 0x0F);
+  universe = static_cast<uint8_t>(abs & 0x0F);
+}
+
+static uint16_t getArtNetUniverseOneBased(const SensorConfig::OutputConfig& out) {
+  uint8_t net = sanitizeDmxArtNet(out.dmxArtNet);
+  uint8_t subnet = sanitizeDmxArtSubnet(out.dmxArtSubnet);
+  uint8_t universe = sanitizeDmxArtUniverse(out.dmxArtUniverse);
+  return encodeArtNetPortAddressOneBased(net, subnet, universe);
+}
+
+static DmxStreamState* getDmxStream(uint8_t protocol, uint8_t device, uint16_t universe) {
+  DmxStreamState* freeSlot = nullptr;
+  for (int i = 0; i < MAX_DMX_STREAMS; i++) {
+    DmxStreamState& st = dmxStreams[i];
+    if (!st.used) {
+      if (freeSlot == nullptr) freeSlot = &st;
+      continue;
+    }
+    if (st.protocol == protocol && st.device == device && st.universe == universe) {
+      return &st;
+    }
+  }
+  if (freeSlot != nullptr) {
+    freeSlot->used = true;
+    freeSlot->protocol = protocol;
+    freeSlot->device = device;
+    freeSlot->universe = universe;
+    freeSlot->sequence = 0;
+    memset(freeSlot->data, 0, sizeof(freeSlot->data));
+    return freeSlot;
+  }
+  return nullptr;
+}
+
+static uint8_t toDmxValue(const SensorConfig::OutputConfig& out, float norm) {
+  float outputValue = mapOutput(out, norm);
+  outputValue = snapOutput(out, outputValue);
+  if (out.outMode == OUT_STRING) {
+    return norm >= 0.5f ? 255 : 0;
+  }
+  int v = lroundf(outputValue);
+  if (v < 0) v = 0;
+  if (v > 255) v = 255;
+  return static_cast<uint8_t>(v);
+}
+
+static void sendArtNetDmx(const IPAddress& ip, uint16_t universeOneBased, const uint8_t* dmxData, uint16_t channels, uint8_t sequence) {
+  if (!isValidIp(ip) || dmxData == nullptr) return;
+  if (channels == 0) channels = 2;
+  if (channels > 512) channels = 512;
+  if (channels & 1) channels++;
+  if (channels > 512) channels = 512;
+
+  uint8_t packet[18 + 512];
+  memset(packet, 0, sizeof(packet));
+  memcpy(packet, "Art-Net", 7);
+  packet[7] = 0x00;
+  packet[8] = 0x00;   // OpCode low byte
+  packet[9] = 0x50;   // OpCode high byte (ArtDMX)
+  packet[10] = 0x00;  // ProtVerHi
+  packet[11] = 14;    // ProtVerLo
+  packet[12] = sequence;
+  packet[13] = 0x00;  // Physical
+  uint16_t universe = (universeOneBased > 0) ? static_cast<uint16_t>(universeOneBased - 1) : 0;
+  packet[14] = static_cast<uint8_t>(universe & 0xFF);
+  packet[15] = static_cast<uint8_t>((universe >> 8) & 0xFF);
+  packet[16] = static_cast<uint8_t>((channels >> 8) & 0xFF);
+  packet[17] = static_cast<uint8_t>(channels & 0xFF);
+  memcpy(packet + 18, dmxData, channels);
+  udp.beginPacket(ip, ARTNET_PORT);
+  udp.write(packet, 18 + channels);
+  udp.endPacket();
+}
+
+static void putFlagsLength(uint8_t* p, uint16_t length) {
+  p[0] = static_cast<uint8_t>(0x70 | ((length >> 8) & 0x0F));
+  p[1] = static_cast<uint8_t>(length & 0xFF);
+}
+
+static void sendSacnDmx(const IPAddress& ip, uint16_t universeOneBased, const uint8_t* dmxData, uint8_t sequence) {
+  if (!isValidIp(ip) || dmxData == nullptr) return;
+  initSacnCid();
+
+  uint8_t packet[638];
+  memset(packet, 0, sizeof(packet));
+
+  packet[0] = 0x00; packet[1] = 0x10; // Preamble Size
+  packet[2] = 0x00; packet[3] = 0x00; // Post-amble Size
+  const uint8_t acnId[12] = {0x41,0x53,0x43,0x2d,0x45,0x31,0x2e,0x31,0x37,0x00,0x00,0x00};
+  memcpy(packet + 4, acnId, 12);
+
+  putFlagsLength(packet + 16, 0x026e); // Root length
+  packet[18] = 0x00; packet[19] = 0x00; packet[20] = 0x00; packet[21] = 0x04; // Root vector
+  memcpy(packet + 22, sacnCid, 16);
+
+  putFlagsLength(packet + 38, 0x0258); // Framing length
+  packet[40] = 0x00; packet[41] = 0x00; packet[42] = 0x00; packet[43] = 0x02; // Framing vector
+  String sourceName = "StageMod";
+  if (config.hostname.length() > 0) sourceName = config.hostname;
+  if (sourceName.length() > 63) sourceName = sourceName.substring(0, 63);
+  memcpy(packet + 44, sourceName.c_str(), sourceName.length());
+  packet[108] = 100; // priority
+  packet[109] = 0x00; packet[110] = 0x00; // sync address
+  packet[111] = sequence;
+  packet[112] = 0x00; // options
+  uint16_t universe = (universeOneBased > 0) ? universeOneBased : 1;
+  packet[113] = static_cast<uint8_t>((universe >> 8) & 0xFF);
+  packet[114] = static_cast<uint8_t>(universe & 0xFF);
+
+  putFlagsLength(packet + 115, 0x020b); // DMP length
+  packet[117] = 0x02; // DMP vector
+  packet[118] = 0xa1; // address and data type
+  packet[119] = 0x00; packet[120] = 0x00; // first property address
+  packet[121] = 0x00; packet[122] = 0x01; // address increment
+  packet[123] = 0x02; packet[124] = 0x01; // property value count (513)
+  packet[125] = 0x00; // START Code
+  memcpy(packet + 126, dmxData, 512);
+
+  udp.beginPacket(ip, SACN_PORT);
+  udp.write(packet, sizeof(packet));
+  udp.endPacket();
+}
+
+static IPAddress getArtNetBroadcastAddress() {
+  IPAddress local = getLocalIp();
+  if (!isValidIp(local)) return IPAddress(255, 255, 255, 255);
+
+  IPAddress mask(255, 255, 255, 0);
+#if USE_ETHERNET
+  if (config.netMode == NET_ETHERNET && ETH.linkUp()) {
+    IPAddress m = ETH.subnetMask();
+    if (m[0] != 0) mask = m;
+  } else
+#endif
+  if (WiFi.status() == WL_CONNECTED) {
+    IPAddress m = WiFi.subnetMask();
+    if (m[0] != 0) mask = m;
+  }
+
+  IPAddress out;
+  for (int i = 0; i < 4; i++) {
+    out[i] = static_cast<uint8_t>((local[i] & mask[i]) | (~mask[i]));
+  }
+  return out;
+}
+
+static IPAddress getSacnMulticastAddress(uint16_t universeOneBased) {
+  uint16_t u = (universeOneBased > 0) ? universeOneBased : 1;
+  if (u > 63999) u = 63999;
+  return IPAddress(239, 255, static_cast<uint8_t>((u >> 8) & 0xFF), static_cast<uint8_t>(u & 0xFF));
+}
+
+static bool resolveDmxDestinationRaw(uint8_t dmxDest, uint8_t device, uint8_t proto, uint16_t universe, IPAddress& ip) {
+  if (sanitizeDmxDest(dmxDest) == DMX_DEST_UNICAST) {
+    uint16_t ignoredPort;
+    return getOscTarget(device, ip, ignoredPort);
+  }
+  if (proto == DMX_PROTO_ARTNET) {
+    ip = getArtNetBroadcastAddress();
+  } else {
+    ip = getSacnMulticastAddress(universe);
+  }
+  return true;
+}
+
+static bool resolveDmxDestination(const SensorConfig::OutputConfig& out, uint8_t proto, uint16_t universe, IPAddress& ip) {
+  return resolveDmxDestinationRaw(out.dmxDest, out.device, proto, universe, ip);
+}
+
+static bool sendDmxStreamFrame(uint8_t proto, uint8_t dmxDest, uint8_t device, uint16_t universe, DmxStreamState* stream) {
+  if (stream == nullptr) return false;
+  IPAddress ip;
+  if (!resolveDmxDestinationRaw(dmxDest, device, proto, universe, ip)) return false;
+  uint8_t sequence = ++stream->sequence;
+  if (sequence == 0) sequence = ++stream->sequence;
+  if (proto == DMX_PROTO_ARTNET) {
+    sendArtNetDmx(ip, universe, stream->data, 512, sequence);
+  } else {
+    sendSacnDmx(ip, universe, stream->data, sequence);
+  }
+  return true;
+}
+
+static bool triggerDmxPreset(const SensorConfig::OutputConfig& out) {
+  uint8_t proto = sanitizeDmxProtocol(out.dmxProtocol);
+  if (proto == DMX_PROTO_ARTNET && !config.artnetEnabled) return false;
+  if (proto == DMX_PROTO_SACN && !config.sacnEnabled) return false;
+
+  uint8_t preset = sanitizeDmxPresetId(out.dmxPreset);
+  int presetIndex = static_cast<int>(preset) - 1;
+  if (presetIndex < 0 || presetIndex >= MAX_DMX_PRESETS) return false;
+  String text = dmxPresetText[presetIndex];
+  text.trim();
+  if (text.length() == 0) {
+    addLog(String("DMX preset ") + String(preset) + " is empty.");
+    return false;
+  }
+
+  String parseErr;
+  int pointCount = parseDmxPresetText(text, dmxFadeState.points, MAX_DMX_PRESET_POINTS, nullptr, parseErr);
+  if (pointCount <= 0) {
+    addLog(String("DMX preset parse failed: ") + parseErr);
+    return false;
+  }
+
+  uint8_t dmxDest = sanitizeDmxDest(out.dmxDest);
+  uint8_t streamDevice = (dmxDest == DMX_DEST_UNICAST) ? out.device : 255;
+  const int DMX_CHANNEL_BYTES = 64; // 512 bits
+  uint8_t targeted[MAX_DMX_PRESET_UNIVERSE][DMX_CHANNEL_BYTES];
+  memset(targeted, 0, sizeof(targeted));
+  auto setTargeted = [&](uint16_t universe, uint16_t channel) {
+    if (universe < 1 || universe > MAX_DMX_PRESET_UNIVERSE) return;
+    if (channel < 1 || channel > 512) return;
+    int u = static_cast<int>(universe - 1);
+    int c = static_cast<int>(channel - 1);
+    targeted[u][c >> 3] |= static_cast<uint8_t>(1 << (c & 7));
+  };
+  auto isTargeted = [&](uint16_t universe, uint16_t channel) -> bool {
+    if (universe < 1 || universe > MAX_DMX_PRESET_UNIVERSE) return false;
+    if (channel < 1 || channel > 512) return false;
+    int u = static_cast<int>(universe - 1);
+    int c = static_cast<int>(channel - 1);
+    return (targeted[u][c >> 3] & static_cast<uint8_t>(1 << (c & 7))) != 0;
+  };
+
+  dmxFadeState.active = true;
+  dmxFadeState.protocol = proto;
+  dmxFadeState.dest = dmxDest;
+  dmxFadeState.device = out.device;
+  dmxFadeState.startMs = millis();
+  dmxFadeState.durationMs = sanitizeDmxFadeMs(out.dmxFadeMs);
+  dmxFadeState.lastFrameMs = 0;
+  dmxFadeState.pointCount = 0;
+  dmxFadeState.usedUniverseCount = 0;
+  auto addUsedUniverse = [&](uint16_t universe) {
+    for (int u = 0; u < dmxFadeState.usedUniverseCount; u++) {
+      if (dmxFadeState.usedUniverses[u] == universe) return;
+    }
+    if (dmxFadeState.usedUniverseCount < MAX_DMX_PRESET_UNIVERSE) {
+      dmxFadeState.usedUniverses[dmxFadeState.usedUniverseCount++] = universe;
+    }
+  };
+
+  for (int i = 0; i < pointCount; i++) {
+    DmxFadePoint& p = dmxFadeState.points[i];
+    uint16_t universe = p.universe;
+    uint16_t channel = p.channel;
+    if (channel < 1 || channel > 512) continue;
+    DmxStreamState* stream = getDmxStream(proto, streamDevice, universe);
+    if (stream == nullptr) {
+      addLog("DMX preset failed: stream capacity reached.");
+      dmxFadeState.active = false;
+      return false;
+    }
+    p.fromValue = stream->data[channel - 1];
+    setTargeted(universe, channel);
+    addUsedUniverse(universe);
+  }
+  dmxFadeState.pointCount = static_cast<uint16_t>(pointCount);
+
+  // Crossfade-down: any currently active DMX level that is not in the new preset
+  // is faded to 0 so transitions between looks are smooth in both directions.
+  bool pointLimitHit = false;
+  for (int si = 0; si < MAX_DMX_STREAMS && !pointLimitHit; si++) {
+    DmxStreamState& st = dmxStreams[si];
+    if (!st.used) continue;
+    if (st.protocol != proto) continue;
+    if (st.device != streamDevice) continue;
+    if (st.universe < 1 || st.universe > MAX_DMX_PRESET_UNIVERSE) continue;
+
+    for (int ch = 1; ch <= 512; ch++) {
+      uint8_t current = st.data[ch - 1];
+      if (current == 0) continue;
+      if (isTargeted(st.universe, static_cast<uint16_t>(ch))) continue;
+      if (pointCount >= MAX_DMX_PRESET_POINTS) {
+        pointLimitHit = true;
+        break;
+      }
+      DmxFadePoint& p = dmxFadeState.points[pointCount++];
+      p.universe = st.universe;
+      p.channel = static_cast<uint16_t>(ch);
+      p.fromValue = current;
+      p.toValue = 0;
+      setTargeted(st.universe, static_cast<uint16_t>(ch));
+      addUsedUniverse(st.universe);
+    }
+  }
+  dmxFadeState.pointCount = static_cast<uint16_t>(pointCount);
+  if (pointLimitHit) {
+    addLog(String("DMX preset ") + String(preset) + ": crossfade limited by point cap (" + String(MAX_DMX_PRESET_POINTS) + ").");
+  }
+
+  addLog(String("DMX preset ") + String(preset) + " fade " + String(dmxFadeState.durationMs) + "ms (" + String(pointCount) + " points)");
+  tickDmxPresetFade();
+  return true;
+}
+
+static void tickDmxPresetFade() {
+  if (!dmxFadeState.active) return;
+
+  uint32_t now = millis();
+  if (dmxFadeState.lastFrameMs > 0 && (now - dmxFadeState.lastFrameMs) < 33 && dmxFadeState.durationMs > 0) {
+    return;
+  }
+
+  float progress = 1.0f;
+  if (dmxFadeState.durationMs > 0) {
+    uint32_t elapsed = now - dmxFadeState.startMs;
+    progress = static_cast<float>(elapsed) / static_cast<float>(dmxFadeState.durationMs);
+    if (progress > 1.0f) progress = 1.0f;
+    if (progress < 0.0f) progress = 0.0f;
+  }
+  bool done = (progress >= 1.0f) || (dmxFadeState.durationMs == 0);
+  uint8_t streamDevice = (dmxFadeState.dest == DMX_DEST_UNICAST) ? dmxFadeState.device : 255;
+
+  for (int i = 0; i < dmxFadeState.pointCount; i++) {
+    const DmxFadePoint& p = dmxFadeState.points[i];
+    if (p.channel < 1 || p.channel > 512) continue;
+    DmxStreamState* stream = getDmxStream(dmxFadeState.protocol, streamDevice, p.universe);
+    if (stream == nullptr) continue;
+    int value = p.toValue;
+    if (!done) {
+      float delta = static_cast<float>(static_cast<int>(p.toValue) - static_cast<int>(p.fromValue));
+      value = static_cast<int>(lroundf(static_cast<float>(p.fromValue) + (delta * progress)));
+    }
+    if (value < 0) value = 0;
+    if (value > 255) value = 255;
+    stream->data[p.channel - 1] = static_cast<uint8_t>(value);
+  }
+
+  for (int i = 0; i < dmxFadeState.usedUniverseCount; i++) {
+    uint16_t universe = dmxFadeState.usedUniverses[i];
+    DmxStreamState* stream = getDmxStream(dmxFadeState.protocol, streamDevice, universe);
+    if (stream == nullptr) continue;
+    sendDmxStreamFrame(dmxFadeState.protocol, dmxFadeState.dest, dmxFadeState.device, universe, stream);
+  }
+
+  dmxFadeState.lastFrameMs = now;
+  if (done) {
+    dmxFadeState.active = false;
+  }
+}
+
+static bool sendDmxOutput(const SensorConfig::OutputConfig& out, float norm) {
+  uint8_t proto = sanitizeDmxProtocol(out.dmxProtocol);
+  if (proto == DMX_PROTO_ARTNET && !config.artnetEnabled) return false;
+  if (proto == DMX_PROTO_SACN && !config.sacnEnabled) return false;
+
+  uint16_t universe = (proto == DMX_PROTO_ARTNET) ? getArtNetUniverseOneBased(out) : (out.dmxUniverse > 0 ? out.dmxUniverse : 1);
+  IPAddress ip;
+  if (!resolveDmxDestination(out, proto, universe, ip)) return false;
+
+  uint16_t channels[512];
+  int channelCount = parseDmxChannels(out.dmxChannels, channels, 512);
+  if (channelCount <= 0) return false;
+
+  uint8_t value = toDmxValue(out, norm);
+  uint8_t streamDevice = (sanitizeDmxDest(out.dmxDest) == DMX_DEST_UNICAST) ? out.device : 255;
+  DmxStreamState* stream = getDmxStream(proto, streamDevice, universe);
+  uint8_t tempData[512];
+  uint8_t* frame = tempData;
+  uint8_t sequence = 0;
+  if (stream != nullptr) {
+    frame = stream->data;
+    sequence = ++stream->sequence;
+    if (sequence == 0) sequence = ++stream->sequence;
+  } else {
+    memset(tempData, 0, sizeof(tempData));
+  }
+  for (int i = 0; i < channelCount; i++) {
+    uint16_t ch = channels[i];
+    if (ch >= 1 && ch <= 512) frame[ch - 1] = value;
+  }
+
+  if (proto == DMX_PROTO_ARTNET) {
+    sendArtNetDmx(ip, universe, frame, 512, sequence);
+    uint8_t net = 0, subnet = 0, portUni = 0;
+    decodeArtNetPortAddressOneBased(universe, net, subnet, portUni);
+    addLog(String("Art-Net N") + String(net) + " S" + String(subnet) + " U" + String(portUni) +
+           " ch " + out.dmxChannels + " = " + String(value) + " -> " + ip.toString());
+  } else {
+    sendSacnDmx(ip, universe, frame, sequence);
+    addLog(String("sACN u") + String(universe) + " ch " + out.dmxChannels + " = " + String(value) + " -> " + ip.toString());
+  }
+  return true;
 }
 
 static String buildHttpValue(const SensorConfig::OutputConfig& out, float norm) {
@@ -2896,6 +3911,14 @@ static void sendOutputNow(const SensorConfig& sensor, const SensorConfig::Output
     sendMqttOutput(out, norm, &sensor, triggerIndex, outputIndex);
     return;
   }
+  if (out.target == OUT_TARGET_DMX) {
+    sendDmxOutput(out, norm);
+    return;
+  }
+  if (out.target == OUT_TARGET_DMX_PRESET) {
+    triggerDmxPreset(out);
+    return;
+  }
   IPAddress ip;
   uint16_t port;
   if (!getOscTarget(out.device, ip, port)) return;
@@ -2921,20 +3944,140 @@ static void sendOutputNow(const SensorConfig& sensor, const SensorConfig::Output
 }
 
 static void configureUdpListener() {
-  uint16_t desiredPort = LOCAL_PORT;
+  uint16_t desiredOscPort = 0;
   if (config.oscInEnabled) {
-    desiredPort = (config.oscInPort > 0) ? config.oscInPort : DEFAULT_OSC_IN_PORT;
+    desiredOscPort = (config.oscInPort > 0) ? config.oscInPort : DEFAULT_OSC_IN_PORT;
   }
-  if (udpListenPort == desiredPort) return;
+  if (oscListenPort != desiredOscPort) {
+    oscUdp.stop();
+    if (desiredOscPort > 0) {
+      if (oscUdp.begin(desiredOscPort)) {
+        oscListenPort = desiredOscPort;
+        addLog(String("OSC UDP listener on port ") + String(desiredOscPort));
+      } else {
+        oscListenPort = 0;
+        addLog(String("OSC UDP listener failed on port ") + String(desiredOscPort));
+      }
+    } else {
+      oscListenPort = 0;
+    }
+  }
 
-  udp.stop();
-  if (udp.begin(desiredPort)) {
-    udpListenPort = desiredPort;
-    addLog(String("UDP listener on port ") + String(desiredPort));
-  } else {
-    udpListenPort = 0;
-    addLog(String("UDP listener failed on port ") + String(desiredPort));
+  bool wantArtNetIn = config.dmxInArtNetEnabled;
+  if (artnetListenActive != wantArtNetIn) {
+    artnetInUdp.stop();
+    artnetListenActive = false;
+    if (wantArtNetIn) {
+      if (artnetInUdp.begin(ARTNET_PORT)) {
+        artnetListenActive = true;
+        addLog(String("Art-Net input listener on port ") + String(ARTNET_PORT));
+      } else {
+        addLog(String("Art-Net input listener failed on port ") + String(ARTNET_PORT));
+      }
+    }
   }
+
+  bool wantSacnIn = config.dmxInSacnEnabled;
+  if (sacnListenActive != wantSacnIn) {
+    sacnInUdp.stop();
+    sacnListenActive = false;
+    if (wantSacnIn) {
+      if (sacnInUdp.begin(SACN_PORT)) {
+        sacnListenActive = true;
+        addLog(String("sACN input listener on port ") + String(SACN_PORT));
+      } else {
+        addLog(String("sACN input listener failed on port ") + String(SACN_PORT));
+      }
+    }
+  }
+}
+
+static bool decodeArtNetDmxPacket(const uint8_t* data, size_t len, uint16_t& universeOneBased, uint8_t* dmxData, uint16_t& dmxLen) {
+  if (data == nullptr || dmxData == nullptr || len < 18) return false;
+  if (memcmp(data, "Art-Net", 7) != 0 || data[7] != 0x00) return false;
+  if (data[8] != 0x00 || data[9] != 0x50) return false; // OpDmx (little-endian)
+
+  uint16_t fieldUniverse = static_cast<uint16_t>(data[14]) | (static_cast<uint16_t>(data[15]) << 8);
+  uint16_t dlen = (static_cast<uint16_t>(data[16]) << 8) | static_cast<uint16_t>(data[17]);
+  if (dlen == 0) return false;
+  if (dlen > 512) dlen = 512;
+  if (18 + dlen > len) dlen = static_cast<uint16_t>(len - 18);
+  if (dlen == 0) return false;
+
+  memset(dmxData, 0, 512);
+  memcpy(dmxData, data + 18, dlen);
+  universeOneBased = static_cast<uint16_t>(fieldUniverse + 1);
+  dmxLen = dlen;
+  return true;
+}
+
+static bool decodeSacnDmxPacket(const uint8_t* data, size_t len, uint16_t& universeOneBased, uint8_t* dmxData, uint16_t& dmxLen) {
+  static const uint8_t kAcnPreamble[12] = {0x41, 0x53, 0x43, 0x2D, 0x45, 0x31, 0x2E, 0x31, 0x37, 0x00, 0x00, 0x00};
+  if (data == nullptr || dmxData == nullptr || len < 126) return false;
+  if (data[0] != 0x00 || data[1] != 0x10) return false;
+  if (memcmp(data + 4, kAcnPreamble, sizeof(kAcnPreamble)) != 0) return false;
+  if (data[117] != 0x02) return false; // DMP set property message
+
+  uint16_t propValCount = (static_cast<uint16_t>(data[123]) << 8) | static_cast<uint16_t>(data[124]);
+  if (propValCount < 1) return false;
+  size_t payloadBytes = static_cast<size_t>(propValCount);
+  if (125 + payloadBytes > len) {
+    payloadBytes = (len > 125) ? (len - 125) : 0;
+  }
+  if (payloadBytes < 1) return false;
+
+  size_t slotCount = payloadBytes - 1; // first byte is start code
+  if (slotCount > 512) slotCount = 512;
+  if (slotCount == 0) return false;
+
+  memset(dmxData, 0, 512);
+  memcpy(dmxData, data + 126, slotCount);
+  universeOneBased = (static_cast<uint16_t>(data[113]) << 8) | static_cast<uint16_t>(data[114]);
+  dmxLen = static_cast<uint16_t>(slotCount);
+  return universeOneBased > 0;
+}
+
+static uint8_t* getDmxInputUniverseBuffer(int index) {
+  if (dmxInData == nullptr) return nullptr;
+  if (index < 0 || index >= MAX_DMX_PRESET_UNIVERSE) return nullptr;
+  return dmxInData + (index * 512);
+}
+
+static void updateDmxInputUniverse(uint8_t protocol, uint16_t universeOneBased, const uint8_t* dmxData, uint16_t dmxLen) {
+  if (dmxData == nullptr || dmxLen == 0) return;
+  if (universeOneBased < 1 || universeOneBased > MAX_DMX_PRESET_UNIVERSE) return;
+  int idx = static_cast<int>(universeOneBased - 1);
+  uint8_t* uni = getDmxInputUniverseBuffer(idx);
+  if (uni == nullptr) return;
+  uint32_t now = millis();
+  memcpy(uni, dmxData, 512);
+  dmxInSource[idx] = protocol;
+  dmxInSeenMs[idx] = now;
+  if (protocol == DMX_PROTO_ARTNET) dmxInArtSeenMs[idx] = now;
+  if (protocol == DMX_PROTO_SACN) dmxInSacnSeenMs[idx] = now;
+}
+
+static bool getLiveDmxUniverseValues(uint16_t universeOneBased, uint8_t viewMode, uint8_t outData[512], uint8_t& selectedSource, uint32_t& selectedAgeMs) {
+  if (outData == nullptr) return false;
+  if (universeOneBased < 1 || universeOneBased > MAX_DMX_PRESET_UNIVERSE) return false;
+  int idx = static_cast<int>(universeOneBased - 1);
+
+  uint8_t mode = sanitizeDmxInputSourceMode(viewMode);
+  if (mode == DMX_IN_SOURCE_RECENT) mode = sanitizeDmxInputSourceMode(config.dmxInSourceMode);
+  bool hasLive = dmxInSeenMs[idx] > 0;
+  if (!hasLive) return false;
+  uint8_t* uni = getDmxInputUniverseBuffer(idx);
+  if (uni == nullptr) return false;
+
+  uint8_t src = dmxInSource[idx];
+  if (mode == DMX_IN_SOURCE_PREFER_ARTNET && src != DMX_PROTO_ARTNET) return false;
+  if (mode == DMX_IN_SOURCE_PREFER_SACN && src != DMX_PROTO_SACN) return false;
+
+  memcpy(outData, uni, 512);
+  selectedSource = src;
+  uint32_t now = millis();
+  selectedAgeMs = now - dmxInSeenMs[idx];
+  return true;
 }
 
 static bool matchOscAddressPattern(const String& pattern, const String& value) {
@@ -3130,14 +4273,14 @@ static bool matchOscInTrigger(const SensorConfig& s, const OscInMessage& msg, fl
 }
 
 static void processOscInput() {
-  if (!config.oscInEnabled) return;
+  if (!config.oscInEnabled || oscListenPort == 0) return;
 
   uint8_t packet[512];
-  int packetSize = udp.parsePacket();
+  int packetSize = oscUdp.parsePacket();
   while (packetSize > 0) {
     int readLen = packetSize;
     if (readLen > static_cast<int>(sizeof(packet))) readLen = sizeof(packet);
-    int len = udp.read(packet, readLen);
+    int len = oscUdp.read(packet, readLen);
     if (len > 0) {
       OscInMessage msg;
       if (parseOscInPacket(packet, static_cast<size_t>(len), msg)) {
@@ -3179,7 +4322,46 @@ static void processOscInput() {
         addLog("OSC In parse skipped.");
       }
     }
-    packetSize = udp.parsePacket();
+    packetSize = oscUdp.parsePacket();
+  }
+}
+
+static void processDmxInput() {
+  uint8_t packet[640];
+  uint8_t dmxData[512];
+
+  if (artnetListenActive) {
+    int packetSize = artnetInUdp.parsePacket();
+    while (packetSize > 0) {
+      int readLen = packetSize;
+      if (readLen > static_cast<int>(sizeof(packet))) readLen = sizeof(packet);
+      int len = artnetInUdp.read(packet, readLen);
+      if (len > 0) {
+        uint16_t universe = 0;
+        uint16_t dmxLen = 0;
+        if (decodeArtNetDmxPacket(packet, static_cast<size_t>(len), universe, dmxData, dmxLen)) {
+          updateDmxInputUniverse(DMX_PROTO_ARTNET, universe, dmxData, dmxLen);
+        }
+      }
+      packetSize = artnetInUdp.parsePacket();
+    }
+  }
+
+  if (sacnListenActive) {
+    int packetSize = sacnInUdp.parsePacket();
+    while (packetSize > 0) {
+      int readLen = packetSize;
+      if (readLen > static_cast<int>(sizeof(packet))) readLen = sizeof(packet);
+      int len = sacnInUdp.read(packet, readLen);
+      if (len > 0) {
+        uint16_t universe = 0;
+        uint16_t dmxLen = 0;
+        if (decodeSacnDmxPacket(packet, static_cast<size_t>(len), universe, dmxData, dmxLen)) {
+          updateDmxInputUniverse(DMX_PROTO_SACN, universe, dmxData, dmxLen);
+        }
+      }
+      packetSize = sacnInUdp.parsePacket();
+    }
   }
 }
 
@@ -3477,6 +4659,8 @@ static void handleTriggers() {
       html += "<option value='0' " + String(out.target == OUT_TARGET_OSC ? "selected" : "") + ">OSC Out</option>";
       html += "<option value='3' " + String(out.target == OUT_TARGET_UDP ? "selected" : "") + ">UDP Raw</option>";
       html += "<option value='4' " + String(out.target == OUT_TARGET_GPIO ? "selected" : "") + ">GPIO Out</option>";
+      html += "<option value='7' " + String(out.target == OUT_TARGET_DMX ? "selected" : "") + ">DMX Net Out</option>";
+      html += "<option value='8' " + String(out.target == OUT_TARGET_DMX_PRESET ? "selected" : "") + ">DMX Preset</option>";
       html += "<option value='5' " + String(out.target == OUT_TARGET_HTTP ? "selected" : "") + ">HTTP Webhook</option>";
       html += "<option value='6' " + String(out.target == OUT_TARGET_MQTT ? "selected" : "") + ">MQTT Out</option>";
       html += "<option value='2' " + String(out.target == OUT_TARGET_RESET_COOLDOWNS ? "selected" : "") + ">Reset Cooldowns</option>";
@@ -3540,6 +4724,32 @@ static void handleTriggers() {
       html += "</div>";
       html += "<div id='s" + idx + "_o" + oidx + "_udp_block'>";
       html += "UDP payload: <input name='s" + idx + "_o" + oidx + "_udp' type='text' value='" + out.udpPayload + "'><button type='button' class='icon-btn' data-idx='" + idx + "' data-oidx='" + oidx + "' data-test='udp' onclick='sendOutputTest(" + idx + "," + oidx + ",\"udp\");return false;'>Test</button><br>";
+      html += "</div>";
+      html += "<div id='s" + idx + "_o" + oidx + "_dmx_block'>";
+      html += "Protocol: <select name='s" + idx + "_o" + oidx + "_dmxp' id='s" + idx + "_o" + oidx + "_dmxp'>";
+      html += "<option value='0' " + String(out.dmxProtocol == DMX_PROTO_ARTNET ? "selected" : "") + ">Art-Net</option>";
+      html += "<option value='1' " + String(out.dmxProtocol == DMX_PROTO_SACN ? "selected" : "") + ">sACN (E1.31)</option>";
+      html += "</select><br>";
+      html += "Destination: <select name='s" + idx + "_o" + oidx + "_dmxd' id='s" + idx + "_o" + oidx + "_dmxd'>";
+      html += "<option value='0' " + String(out.dmxDest == DMX_DEST_AUTO ? "selected" : "") + ">Auto (Broadcast/Multicast)</option>";
+      html += "<option value='1' " + String(out.dmxDest == DMX_DEST_UNICAST ? "selected" : "") + ">Unicast (use Network client)</option>";
+      html += "</select><br>";
+      html += "<div id='s" + idx + "_o" + oidx + "_dmx_artnet'>";
+      html += "Net: <input name='s" + idx + "_o" + oidx + "_dmxn' type='number' min='0' max='127' value='" + String(out.dmxArtNet) + "' style='max-width:90px;'><br>";
+      html += "Subnet: <input name='s" + idx + "_o" + oidx + "_dmxs' type='number' min='0' max='15' value='" + String(out.dmxArtSubnet) + "' style='max-width:90px;'><br>";
+      html += "Universe: <input name='s" + idx + "_o" + oidx + "_dmxa' type='number' min='0' max='15' value='" + String(out.dmxArtUniverse) + "' style='max-width:90px;'><br>";
+      html += "</div>";
+      html += "<div id='s" + idx + "_o" + oidx + "_dmx_sacn'>";
+      html += "Universe: <input name='s" + idx + "_o" + oidx + "_dmxu' type='number' min='1' max='63999' value='" + String(out.dmxUniverse) + "' style='max-width:120px;'><br>";
+      html += "</div>";
+      html += "<div id='s" + idx + "_o" + oidx + "_dmx_channels'>";
+      html += "Channels: <input name='s" + idx + "_o" + oidx + "_dmxc' type='text' value='" + out.dmxChannels + "' placeholder='1,5,10-20'><br>";
+      html += "</div>";
+      html += "<div id='s" + idx + "_o" + oidx + "_dmx_preset'>";
+      html += "Preset: <input name='s" + idx + "_o" + oidx + "_dmxpr' type='number' min='1' max='" + String(MAX_DMX_PRESETS) + "' value='" + String(out.dmxPreset) + "' style='max-width:120px;'><br>";
+      html += "Fade ms: <input name='s" + idx + "_o" + oidx + "_dmxfd' type='number' min='0' max='600000' value='" + String(out.dmxFadeMs) + "' style='max-width:140px;'><button type='button' class='icon-btn' data-idx='" + idx + "' data-oidx='" + oidx + "' data-test='dmxpreset' onclick='sendOutputTest(" + idx + "," + oidx + ",\"dmxpreset\");return false;'>Test</button><br>";
+      html += "</div>";
+      html += "<div class='helper'>Art-Net uses Net/Subnet/Universe (0-based). sACN uses Universe (1-based). Preset editor supports universes 1-" + String(MAX_DMX_PRESET_UNIVERSE) + ".</div>";
       html += "</div>";
       html += "<div id='s" + idx + "_o" + oidx + "_http_block'>";
       html += "Method: <select name='s" + idx + "_o" + oidx + "_hm'>";
@@ -3651,6 +4861,13 @@ static void handleTriggers() {
   html += "const devBlock=document.getElementById('s'+i+'_o'+o+'_dev_block');";
   html += "const udpBlock=document.getElementById('s'+i+'_o'+o+'_udp_block');";
   html += "const gpioBlock=document.getElementById('s'+i+'_o'+o+'_gpio_block');";
+  html += "const dmxBlock=document.getElementById('s'+i+'_o'+o+'_dmx_block');";
+  html += "const dmxProto=document.getElementById('s'+i+'_o'+o+'_dmxp');";
+  html += "const dmxDest=document.getElementById('s'+i+'_o'+o+'_dmxd');";
+  html += "const dmxArt=document.getElementById('s'+i+'_o'+o+'_dmx_artnet');";
+  html += "const dmxSacn=document.getElementById('s'+i+'_o'+o+'_dmx_sacn');";
+  html += "const dmxChannels=document.getElementById('s'+i+'_o'+o+'_dmx_channels');";
+  html += "const dmxPreset=document.getElementById('s'+i+'_o'+o+'_dmx_preset');";
   html += "const httpBlock=document.getElementById('s'+i+'_o'+o+'_http_block');";
   html += "const mqttBlock=document.getElementById('s'+i+'_o'+o+'_mqtt_block');";
   html += "const httpBody=document.getElementById('s'+i+'_o'+o+'_http_body');";
@@ -3686,12 +4903,22 @@ static void handleTriggers() {
   html += "const isOsc=(tgt.value==='0');";
   html += "const isUdp=(tgt.value==='3');";
   html += "const isGpio=(tgt.value==='4');";
+  html += "const isDmx=(tgt.value==='7');";
+  html += "const isDmxPreset=(tgt.value==='8');";
+  html += "const isDmxLike=(isDmx||isDmxPreset);";
+  html += "const dmxIsSacn=(isDmxLike && dmxProto && dmxProto.value==='1');";
+  html += "const dmxUnicast=(isDmxLike && dmxDest && dmxDest.value==='1');";
   html += "const isHttp=(tgt.value==='5');";
   html += "const isMqtt=(tgt.value==='6');";
-  html += "if(oscOut){oscOut.style.display=(isOsc||isHttp||isMqtt)?'block':'none';}";
-  html += "if(devBlock){devBlock.style.display=(isOsc||isUdp)?'block':'none';}";
+  html += "if(oscOut){oscOut.style.display=(isOsc||isHttp||isMqtt||isDmx)?'block':'none';}";
+  html += "if(devBlock){devBlock.style.display=(isOsc||isUdp||dmxUnicast)?'block':'none';}";
   html += "if(udpBlock){udpBlock.style.display=isUdp?'block':'none';}";
   html += "if(gpioBlock){gpioBlock.style.display=isGpio?'block':'none';}";
+  html += "if(dmxBlock){dmxBlock.style.display=isDmxLike?'block':'none';}";
+  html += "if(dmxArt){dmxArt.style.display=(isDmxLike && !dmxIsSacn)?'block':'none';}";
+  html += "if(dmxSacn){dmxSacn.style.display=(isDmxLike && dmxIsSacn)?'block':'none';}";
+  html += "if(dmxChannels){dmxChannels.style.display=isDmx?'block':'none';}";
+  html += "if(dmxPreset){dmxPreset.style.display=isDmxPreset?'block':'none';}";
   html += "if(httpBlock){httpBlock.style.display=isHttp?'block':'none';}";
   html += "if(mqttBlock){mqttBlock.style.display=isMqtt?'block':'none';}";
   html += "if(omaxLabel){omaxLabel.textContent=isEnc?'Output':'Output max';}";
@@ -3723,12 +4950,15 @@ static void handleTriggers() {
   html += "if(omax<=100){omaxInput.value='255';}";
   html += "if(omin<0||isNaN(omin)){ominInput.value='0';}";
   html += "}";
-  html += "if(om){om.disabled=!(isOsc||isHttp||isMqtt);}";
+  html += "if(om){om.disabled=!(isOsc||isHttp||isMqtt||isDmx);}";
   html += "if(om&&opt){";
-  html += "if(!(isOsc||isHttp||isMqtt)){opt.disabled=true;}";
+  html += "if(!(isOsc||isHttp||isMqtt||isDmx)){opt.disabled=true;}";
   html += "else if(isEnc){";
   html += "opt.disabled=true;";
   html += "if(om.value==='2'){om.value='1';}";
+  html += "}else if(isDmx){";
+  html += "opt.disabled=true;";
+  html += "if(om.value==='2'){om.value='0';}";
   html += "}else if(isSensor && t==='0'){";
   html += "opt.disabled=true;";
   html += "if(om.value==='2'){om.value='1';}";
@@ -3737,21 +4967,21 @@ static void handleTriggers() {
   html += "}";
   html += "}";
   html += "if(str&&om){";
-  html += "const showStr=((isOsc||isHttp||isMqtt) && !isEnc && om.value==='2');";
+  html += "const showStr=((isOsc||isHttp||isMqtt||isDmx) && !isEnc && om.value==='2');";
   html += "str.style.display=showStr?'block':'none';";
   html += "if(offRow){offRow.style.display=(showStr && smin && smin.checked)?'none':'block';}";
   html += "}";
-  html += "if(range&&om){range.style.display=((isOsc||isHttp||isMqtt) && om.value!=='2')?'block':(isGpio && gmode && gmode.value==='3' ? 'block' : 'none');}";
+  html += "if(range&&om){range.style.display=((isOsc||isHttp||isMqtt||isDmx) && om.value!=='2')?'block':(isGpio && gmode && gmode.value==='3' ? 'block' : 'none');}";
   html += "if(addrBlock){addrBlock.style.display=(isOsc && !isEnc)?'block':'none';}";
   html += "if(encAddr){encAddr.style.display=(isOsc && isEnc)?'block':'none';}";
   html += "if(btnAddr){btnAddr.style.display=(isOsc && isEnc)?'block':'none';}";
   html += "if(btnBlock){btnBlock.style.display=(isOsc && isEnc)?'block':'none';}";
   html += "if(minRel){";
-  html += "if(isOsc||isHttp||isMqtt){minRel.style.display=(isEnc||!isSensor||t!=='0')?'block':'none';}";
+  html += "if(isOsc||isHttp||isMqtt||isDmx){minRel.style.display=(isEnc||!isSensor||t!=='0')?'block':'none';}";
   html += "else{minRel.style.display='none';}";
   html += "}";
   html += "if(minRow&&smin&&om){";
-  html += "if(isOsc||isHttp||isMqtt){";
+  html += "if(isOsc||isHttp||isMqtt||isDmx){";
   html += "if(isEnc){minRow.style.display='none';}";
   html += "else if(om.value==='2'){minRow.style.display='none';}";
   html += "else{minRow.style.display=smin.checked?'none':'block';}";
@@ -3795,6 +5025,10 @@ static void handleTriggers() {
   html += "if(smin){smin.addEventListener('change',()=>updateTrigger(i));}";
   html += "const gm=document.getElementById('s'+i+'_o'+o+'_gmode');";
   html += "if(gm){gm.addEventListener('change',()=>updateTrigger(i));}";
+  html += "const dd=document.getElementById('s'+i+'_o'+o+'_dmxd');";
+  html += "if(dd){dd.addEventListener('change',()=>updateTrigger(i));}";
+  html += "const dp=document.getElementById('s'+i+'_o'+o+'_dmxp');";
+  html += "if(dp){dp.addEventListener('change',()=>updateTrigger(i));}";
   html += "const hm=document.querySelector(\"select[name='s\"+i+\"_o\"+o+\"_hm']\");";
   html += "if(hm){hm.addEventListener('change',()=>updateTrigger(i));}";
   html += "const hd=document.getElementById('s'+i+'_o'+o+'_hdev');";
@@ -4108,6 +5342,44 @@ static void handleSaveTriggers() {
         out.mqttPayload = server.arg("s" + idx + "_o" + oidx + "_mp");
       }
       out.mqttRetain = server.hasArg("s" + idx + "_o" + oidx + "_mr");
+      if (server.hasArg("s" + idx + "_o" + oidx + "_dmxp")) {
+        out.dmxProtocol = sanitizeDmxProtocol(server.arg("s" + idx + "_o" + oidx + "_dmxp").toInt());
+      }
+      if (server.hasArg("s" + idx + "_o" + oidx + "_dmxd")) {
+        out.dmxDest = sanitizeDmxDest(server.arg("s" + idx + "_o" + oidx + "_dmxd").toInt());
+      }
+      if (server.hasArg("s" + idx + "_o" + oidx + "_dmxn")) {
+        out.dmxArtNet = sanitizeDmxArtNet(server.arg("s" + idx + "_o" + oidx + "_dmxn").toInt());
+      }
+      if (server.hasArg("s" + idx + "_o" + oidx + "_dmxs")) {
+        out.dmxArtSubnet = sanitizeDmxArtSubnet(server.arg("s" + idx + "_o" + oidx + "_dmxs").toInt());
+      }
+      if (server.hasArg("s" + idx + "_o" + oidx + "_dmxa")) {
+        out.dmxArtUniverse = sanitizeDmxArtUniverse(server.arg("s" + idx + "_o" + oidx + "_dmxa").toInt());
+      }
+      if (server.hasArg("s" + idx + "_o" + oidx + "_dmxu")) {
+        uint16_t u = static_cast<uint16_t>(server.arg("s" + idx + "_o" + oidx + "_dmxu").toInt());
+        if (u > 0) out.dmxUniverse = u;
+      }
+      if (server.hasArg("s" + idx + "_o" + oidx + "_dmxc")) {
+        out.dmxChannels = server.arg("s" + idx + "_o" + oidx + "_dmxc");
+        out.dmxChannels.trim();
+      }
+      if (server.hasArg("s" + idx + "_o" + oidx + "_dmxpr")) {
+        out.dmxPreset = sanitizeDmxPresetId(server.arg("s" + idx + "_o" + oidx + "_dmxpr").toInt());
+      }
+      if (server.hasArg("s" + idx + "_o" + oidx + "_dmxfd")) {
+        out.dmxFadeMs = sanitizeDmxFadeMs(server.arg("s" + idx + "_o" + oidx + "_dmxfd").toInt());
+      }
+      if (out.dmxProtocol == DMX_PROTO_ARTNET) {
+        out.dmxUniverse = encodeArtNetPortAddressOneBased(out.dmxArtNet, out.dmxArtSubnet, out.dmxArtUniverse);
+      } else {
+        decodeArtNetPortAddressOneBased(out.dmxUniverse, out.dmxArtNet, out.dmxArtSubnet, out.dmxArtUniverse);
+      }
+      if (out.dmxUniverse == 0) out.dmxUniverse = 1;
+      if (out.dmxChannels.length() == 0) out.dmxChannels = "1";
+      out.dmxPreset = sanitizeDmxPresetId(out.dmxPreset);
+      out.dmxFadeMs = sanitizeDmxFadeMs(out.dmxFadeMs);
 
       if (out.gpioMode == GPIO_OUT_PWM) {
         if (out.outMin < 0.0f) out.outMin = 0.0f;
@@ -4144,6 +5416,7 @@ static void handleSaveTriggers() {
       if (out.oscAddress.length() == 0) out.oscAddress = defaultOscAddress(i);
       if (out.buttonAddress.length() == 0) out.buttonAddress = "/button";
       if ((s.type == SENSOR_ANALOG || s.type == SENSOR_ENCODER) && out.outMode == OUT_STRING) out.outMode = OUT_FLOAT;
+      if ((out.target == OUT_TARGET_DMX || out.target == OUT_TARGET_DMX_PRESET) && out.outMode == OUT_STRING) out.outMode = OUT_INT;
       if (out.buttonOutMode == OUT_STRING) {
         if (out.buttonOnString.length() == 0) out.buttonOnString = DEFAULT_ON_STRING;
         if (out.buttonOffString.length() == 0) out.buttonOffString = DEFAULT_OFF_STRING;
@@ -4359,6 +5632,30 @@ static void handleSettings() {
   html += "Enable OSC input triggers: <input name='osci_en' type='checkbox' " + String(config.oscInEnabled ? "checked" : "") + "><br>";
   html += "Listen port: <input name='osci_port' type='number' min='1' max='65535' value='" + String(config.oscInPort) + "' style='max-width:140px;'><br>";
   html += "<small>Trigger-level OSC matching is configured on the Triggers page (Source = OSC In).</small><br>";
+  html += "</div>";
+
+  html += "<div class='card'><b>DMX Net Output</b><br>";
+  html += "Enable Art-Net out: <input name='artnet_en' type='checkbox' " + String(config.artnetEnabled ? "checked" : "") + "><br>";
+  html += "Enable sACN out: <input name='sacn_en' type='checkbox' " + String(config.sacnEnabled ? "checked" : "") + "><br>";
+  html += "<small>These toggles gate DMX Net Out and DMX Preset playback protocols.</small><br>";
+  html += "</div>";
+
+  html += "<div class='card'><b>DMX Input</b><br>";
+  html += "Enable Art-Net in: <input name='dmxi_art' type='checkbox' " + String(config.dmxInArtNetEnabled ? "checked" : "") + "><br>";
+  html += "Enable sACN in: <input name='dmxi_sac' type='checkbox' " + String(config.dmxInSacnEnabled ? "checked" : "") + "><br>";
+  html += "Auto source mode: <select name='dmxi_src'>";
+  html += "<option value='0' " + String(config.dmxInSourceMode == DMX_IN_SOURCE_RECENT ? "selected" : "") + ">Most recent wins</option>";
+  html += "<option value='1' " + String(config.dmxInSourceMode == DMX_IN_SOURCE_PREFER_ARTNET ? "selected" : "") + ">Prefer Art-Net</option>";
+  html += "<option value='2' " + String(config.dmxInSourceMode == DMX_IN_SOURCE_PREFER_SACN ? "selected" : "") + ">Prefer sACN</option>";
+  html += "</select><br>";
+  html += "<small>Used by DMX preset snapshots in the preset editor when source view is set to Auto.</small><br>";
+  html += "</div>";
+
+  int dmxPresetPointsUsed = totalDmxPresetPointsExcluding(-1);
+  html += "<div class='card'><b>DMX Presets</b><br>";
+  html += "<div>Stored points: <b>" + String(dmxPresetPointsUsed) + "</b> / " + String(MAX_DMX_PRESET_POINTS) + "</div>";
+  html += "<small>Presets can span universes 1-" + String(MAX_DMX_PRESET_UNIVERSE) + " and are recalled by DMX Preset outputs.</small><br>";
+  html += "<a href='/dmx_presets' class='nav-primary' style='display:inline-block;margin-top:8px;'>Open DMX Preset Editor</a>";
   html += "</div>";
 
   html += "<div class='card'><b>Network Clients (OSC / UDP / MQTT / HTTP Webhook)</b><br>";
@@ -4622,6 +5919,50 @@ static void handleSettings() {
   html += "fetch('/send_gpio_test',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data.toString(),credentials:'same-origin'}).then(r=>r.text()).then(t=>console.log('gpio test',t)).catch(e=>console.warn('gpio test failed',e));";
   html += "return;";
   html += "}";
+  html += "if(tgt && tgt.value==='6'){";
+  html += "const topic=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_mt']\");";
+  html += "const payload=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_mp']\");";
+  html += "const retain=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_mr']\");";
+  html += "const data=new URLSearchParams();";
+  html += "data.set('topic',topic?topic.value:'');";
+  html += "data.set('payload',payload?payload.value:'');";
+  html += "if(retain&&retain.checked){data.set('retain','1');}";
+  html += "fetch('/send_mqtt_test',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data.toString(),credentials:'same-origin'}).then(r=>r.text()).then(t=>console.log('mqtt test',t)).catch(e=>console.warn('mqtt test failed',e));";
+  html += "return;";
+  html += "}";
+  html += "if(tgt && (tgt.value==='7' || tgt.value==='8')){";
+  html += "const dev=document.getElementById('s'+idx+'_o'+oidx+'_dev');";
+  html += "const dmxp=document.querySelector(\"select[name='s\"+idx+\"_o\"+oidx+\"_dmxp']\");";
+  html += "const dmxd=document.getElementById('s'+idx+'_o'+oidx+'_dmxd');";
+  html += "const dmxn=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_dmxn']\");";
+  html += "const dmxs=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_dmxs']\");";
+  html += "const dmxa=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_dmxa']\");";
+  html += "const dmxu=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_dmxu']\");";
+  html += "const dmxc=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_dmxc']\");";
+  html += "const dmxpr=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_dmxpr']\");";
+  html += "const dmxfd=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_dmxfd']\");";
+  html += "const om=document.getElementById('s'+idx+'_o'+oidx+'_omode');";
+  html += "const omin=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_omin']\");";
+  html += "const omax=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_omax']\");";
+  html += "const data=new URLSearchParams();";
+  html += "data.set('target',tgt.value);";
+  html += "if(dev){data.set('test_dev',dev.value);}";
+  html += "data.set('dmxp',dmxp?dmxp.value:'0');";
+  html += "data.set('dmxd',dmxd?dmxd.value:'0');";
+  html += "data.set('dmxn',dmxn?dmxn.value:'0');";
+  html += "data.set('dmxs',dmxs?dmxs.value:'0');";
+  html += "data.set('dmxa',dmxa?dmxa.value:'0');";
+  html += "data.set('dmxu',dmxu?dmxu.value:'1');";
+  html += "data.set('dmxc',dmxc?dmxc.value:'1');";
+  html += "data.set('dmxpr',dmxpr?dmxpr.value:'1');";
+  html += "data.set('dmxfd',dmxfd?dmxfd.value:'0');";
+  html += "data.set('omode',om?om.value:'0');";
+  html += "data.set('kind',kind||'max');";
+  html += "data.set('omin',omin?omin.value:'0');";
+  html += "data.set('omax',omax?omax.value:'100');";
+  html += "fetch('/send_dmx_test',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data.toString(),credentials:'same-origin'}).then(r=>r.text()).then(t=>console.log('dmx test',t)).catch(e=>console.warn('dmx test failed',e));";
+  html += "return;";
+  html += "}";
   html += "if(tgt && tgt.value!=='0'){return;}";
   html += "const addrInput=document.getElementById('s'+idx+'_o'+oidx+'_addr');";
   html += "const encAddrInput=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_enc_addr']\");";
@@ -4711,6 +6052,13 @@ static void handleSaveSettings() {
     if (p > 0 && p <= 65535) config.oscInPort = static_cast<uint16_t>(p);
   }
   if (config.oscInPort == 0) config.oscInPort = DEFAULT_OSC_IN_PORT;
+  config.artnetEnabled = server.hasArg("artnet_en");
+  config.sacnEnabled = server.hasArg("sacn_en");
+  config.dmxInArtNetEnabled = server.hasArg("dmxi_art");
+  config.dmxInSacnEnabled = server.hasArg("dmxi_sac");
+  if (server.hasArg("dmxi_src")) {
+    config.dmxInSourceMode = sanitizeDmxInputSourceMode(server.arg("dmxi_src").toInt());
+  }
 
   String wifiSsid = "";
   if (server.hasArg("wifi_ssid")) {
@@ -4993,7 +6341,7 @@ static void handleImportConfig() {
     return;
   }
 
-  DynamicJsonDocument doc(32768);
+  DynamicJsonDocument doc(98304);
   DeserializationError err = deserializeJson(doc, importPayload);
   if (err) {
     server.send(400, "text/plain", String("Import failed: invalid JSON (") + err.c_str() + ").");
@@ -5030,6 +6378,341 @@ static void handleImportConfig() {
   msg += "<p><a href='/settings'>Back to settings</a></p></body></html>";
   server.send(200, "text/html", msg);
   importPayload = "";
+}
+
+static void handleDmxPresetEditor() {
+  if (!ensureAuthenticated()) return;
+
+  int preset = server.hasArg("preset") ? server.arg("preset").toInt() : 1;
+  if (preset < 1) preset = 1;
+  if (preset > MAX_DMX_PRESETS) preset = MAX_DMX_PRESETS;
+  int presetIndex = preset - 1;
+  int universe = server.hasArg("u") ? server.arg("u").toInt() : 1;
+  if (universe < 1) universe = 1;
+  if (universe > MAX_DMX_PRESET_UNIVERSE) universe = MAX_DMX_PRESET_UNIVERSE;
+  int liveSourceMode = server.hasArg("live_src") ? server.arg("live_src").toInt() : DMX_IN_SOURCE_RECENT;
+  liveSourceMode = sanitizeDmxInputSourceMode(liveSourceMode);
+  int liveFrom = server.hasArg("lu_from") ? server.arg("lu_from").toInt() : universe;
+  int liveTo = server.hasArg("lu_to") ? server.arg("lu_to").toInt() : universe;
+  if (liveFrom < 1) liveFrom = 1;
+  if (liveFrom > MAX_DMX_PRESET_UNIVERSE) liveFrom = MAX_DMX_PRESET_UNIVERSE;
+  if (liveTo < 1) liveTo = 1;
+  if (liveTo > MAX_DMX_PRESET_UNIVERSE) liveTo = MAX_DMX_PRESET_UNIVERSE;
+  if (liveTo < liveFrom) {
+    int t = liveFrom;
+    liveFrom = liveTo;
+    liveTo = t;
+  }
+  bool hasLiveArgs = server.hasArg("live_src") || server.hasArg("lu_from") || server.hasArg("lu_to") || server.hasArg("live_nonzero");
+  bool liveNonZeroOnly = hasLiveArgs ? server.hasArg("live_nonzero") : true;
+
+  String notice = "";
+  String error = "";
+
+  if (server.method() == HTTP_POST) {
+    String action = server.hasArg("action") ? server.arg("action") : "save_grid";
+    if (action == "clear") {
+      dmxPresetText[presetIndex] = "";
+      saveConfig();
+      notice = String("Preset ") + String(preset) + " cleared.";
+    } else if (action == "clear_universe") {
+      String merged = removeDmxUniverseRows(dmxPresetText[presetIndex], universe);
+      String normalized;
+      String parseErr;
+      int pointCount = parseDmxPresetText(merged, nullptr, MAX_DMX_PRESET_POINTS, &normalized, parseErr);
+      if (pointCount < 0) {
+        error = parseErr;
+      } else {
+        int otherPoints = totalDmxPresetPointsExcluding(presetIndex);
+        if (otherPoints + pointCount > MAX_DMX_PRESET_POINTS) {
+          error = String("Point budget exceeded. Used by other presets: ") + String(otherPoints) +
+                  ". Remaining: " + String(MAX_DMX_PRESET_POINTS - otherPoints) + ".";
+        } else {
+          dmxPresetText[presetIndex] = normalized;
+          saveConfig();
+          notice = String("Preset ") + String(preset) + ": cleared universe " + String(universe) + ".";
+        }
+      }
+    } else if (action == "snapshot_live") {
+      String merged = dmxPresetText[presetIndex];
+      int snapshotPoints = 0;
+      int snapshotUniverses = 0;
+      uint8_t liveData[512];
+      uint8_t selectedSource = DMX_PROTO_ARTNET;
+      uint32_t selectedAgeMs = 0;
+      for (int u = liveFrom; u <= liveTo; u++) {
+        uint16_t uni = static_cast<uint16_t>(u);
+        if (!getLiveDmxUniverseValues(uni, static_cast<uint8_t>(liveSourceMode), liveData, selectedSource, selectedAgeMs)) continue;
+
+        int16_t values[512];
+        for (int ch = 0; ch < 512; ch++) {
+          uint8_t v = liveData[ch];
+          if (liveNonZeroOnly && v == 0) {
+            values[ch] = -1;
+          } else {
+            values[ch] = static_cast<int16_t>(v);
+            snapshotPoints++;
+          }
+        }
+
+        merged = removeDmxUniverseRows(merged, uni);
+        String uniRows = serializeDmxUniverseRows(uni, values);
+        if (uniRows.length() > 0) {
+          if (merged.length() > 0) merged += "\n";
+          merged += uniRows;
+        }
+        snapshotUniverses++;
+      }
+
+      if (snapshotUniverses == 0) {
+        error = "No DMX input data found in selected universe range.";
+      } else {
+        String normalized;
+        String parseErr;
+        int pointCount = parseDmxPresetText(merged, nullptr, MAX_DMX_PRESET_POINTS, &normalized, parseErr);
+        if (pointCount < 0) {
+          error = parseErr;
+        } else {
+          int otherPoints = totalDmxPresetPointsExcluding(presetIndex);
+          if (otherPoints + pointCount > MAX_DMX_PRESET_POINTS) {
+            error = String("Point budget exceeded. Used by other presets: ") + String(otherPoints) +
+                    ". Remaining: " + String(MAX_DMX_PRESET_POINTS - otherPoints) + ".";
+          } else {
+            dmxPresetText[presetIndex] = normalized;
+            saveConfig();
+            notice = String("Preset ") + String(preset) + ": snapshot saved from universes " + String(liveFrom) + "-" + String(liveTo) +
+                     " (" + String(snapshotPoints) + " points).";
+          }
+        }
+      }
+    } else if (action == "save_grid") {
+      int16_t values[512];
+      for (int i = 0; i < 512; i++) values[i] = -1;
+      for (int ch = 1; ch <= 512; ch++) {
+        String key = "ch" + String(ch);
+        if (!server.hasArg(key)) continue;
+        String raw = server.arg(key);
+        raw.trim();
+        if (raw.length() == 0) continue;
+        int v = raw.toInt();
+        if (v < 0) v = 0;
+        if (v > 255) v = 255;
+        values[ch - 1] = static_cast<int16_t>(v);
+      }
+
+      String merged = removeDmxUniverseRows(dmxPresetText[presetIndex], universe);
+      String uniRows = serializeDmxUniverseRows(universe, values);
+      if (uniRows.length() > 0) {
+        if (merged.length() > 0) merged += "\n";
+        merged += uniRows;
+      }
+
+      String normalized;
+      String parseErr;
+      int pointCount = parseDmxPresetText(merged, nullptr, MAX_DMX_PRESET_POINTS, &normalized, parseErr);
+      if (pointCount < 0) {
+        error = parseErr;
+      } else {
+        int otherPoints = totalDmxPresetPointsExcluding(presetIndex);
+        if (otherPoints + pointCount > MAX_DMX_PRESET_POINTS) {
+          error = String("Point budget exceeded. Used by other presets: ") + String(otherPoints) +
+                  ". Remaining: " + String(MAX_DMX_PRESET_POINTS - otherPoints) + ".";
+        } else {
+          dmxPresetText[presetIndex] = normalized;
+          saveConfig();
+          notice = String("Preset ") + String(preset) + ": saved universe " + String(universe) + " grid.";
+        }
+      }
+    } else {
+      String raw = server.hasArg("preset_text") ? server.arg("preset_text") : "";
+      String normalized;
+      String parseErr;
+      int pointCount = parseDmxPresetText(raw, nullptr, MAX_DMX_PRESET_POINTS, &normalized, parseErr);
+      if (pointCount < 0) {
+        error = parseErr;
+      } else {
+        int otherPoints = totalDmxPresetPointsExcluding(presetIndex);
+        if (otherPoints + pointCount > MAX_DMX_PRESET_POINTS) {
+          error = String("Point budget exceeded. Used by other presets: ") + String(otherPoints) +
+                  ". Remaining: " + String(MAX_DMX_PRESET_POINTS - otherPoints) + ".";
+        } else {
+          dmxPresetText[presetIndex] = normalized;
+          saveConfig();
+          notice = String("Preset ") + String(preset) + " saved (" + String(pointCount) + " points).";
+        }
+      }
+    }
+  }
+
+  String currentText = dmxPresetText[presetIndex];
+  String parseErr;
+  int currentPoints = parseDmxPresetText(currentText, nullptr, MAX_DMX_PRESET_POINTS, nullptr, parseErr);
+  if (currentPoints < 0) currentPoints = 0;
+  int totalPoints = totalDmxPresetPointsExcluding(-1);
+  int16_t universeValues[512];
+  fillDmxUniverseValues(currentText, universe, universeValues);
+  int activeChannels = 0;
+  for (int i = 0; i < 512; i++) {
+    if (universeValues[i] >= 0) activeChannels++;
+  }
+
+  int liveIndex = universe - 1;
+  uint32_t artSeenMs = dmxInArtSeenMs[liveIndex];
+  uint32_t sacSeenMs = dmxInSacnSeenMs[liveIndex];
+  bool hasArtLive = artSeenMs > 0;
+  bool hasSacLive = sacSeenMs > 0;
+  uint8_t livePreviewData[512];
+  uint8_t livePreviewSource = DMX_PROTO_ARTNET;
+  uint32_t livePreviewAgeMs = 0;
+  bool hasLivePreview = getLiveDmxUniverseValues(static_cast<uint16_t>(universe), static_cast<uint8_t>(liveSourceMode), livePreviewData, livePreviewSource, livePreviewAgeMs);
+  int livePreviewActiveChannels = 0;
+  if (hasLivePreview) {
+    for (int ch = 0; ch < 512; ch++) {
+      if (livePreviewData[ch] > 0) livePreviewActiveChannels++;
+    }
+  }
+
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html", "");
+  String html;
+  html.reserve(4096);
+  auto flushHtml = [&]() {
+    if (html.length() > 0) {
+      server.sendContent(html);
+      html = "";
+    }
+  };
+  auto appendHtml = [&](const String& s) {
+    html += s;
+    if (html.length() > 3000) flushHtml();
+  };
+  auto appendHtmlRaw = [&](const char* s) {
+    html += s;
+    if (html.length() > 3000) flushHtml();
+  };
+
+  appendHtmlRaw("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>");
+  appendHtmlRaw("<title>DMX Preset Editor</title>");
+  appendHtmlRaw("<style>");
+  appendHtmlRaw("body{margin:0;font-family:'Avenir Next','Trebuchet MS','Segoe UI',sans-serif;background:linear-gradient(135deg,#f4f1ea 0%,#e7f0ef 100%);color:#1a1a1a;}");
+  appendHtmlRaw(".page{max-width:920px;margin:0 auto;padding:20px 16px 40px;}");
+  appendHtmlRaw(".card{background:#fff;border:1px solid #e2e2e2;border-radius:12px;padding:12px;margin:10px 0;}");
+  appendHtmlRaw("input,select,textarea{width:100%;max-width:860px;padding:6px 8px;margin:2px 0 8px;border:1px solid #cfcfcf;border-radius:6px;background:#fff;}");
+  appendHtmlRaw("textarea{min-height:220px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}");
+  appendHtmlRaw("button{border:1px solid #b9b9b9;background:#fff;color:#222;padding:6px 10px;border-radius:8px;cursor:pointer;}");
+  appendHtmlRaw("button.primary{background:#0b6b6f;color:#fff;border-color:#0b6b6f;}");
+  appendHtmlRaw(".top{display:flex;gap:10px;align-items:center;flex-wrap:wrap;justify-content:space-between;}");
+  appendHtmlRaw(".notice{color:#0b6b6f;font-weight:600;}");
+  appendHtmlRaw(".error{color:#a02a2a;font-weight:600;}");
+  appendHtmlRaw(".grid-wrap{overflow:auto;border:1px solid #ddd;border-radius:10px;background:#fbfbfb;max-height:70vh;}");
+  appendHtmlRaw("table.grid{border-collapse:collapse;min-width:980px;font-size:12px;}");
+  appendHtmlRaw("table.grid th,table.grid td{border:1px solid #e6e6e6;padding:2px;text-align:center;}");
+  appendHtmlRaw("table.grid th{position:sticky;top:0;background:#f6f6f6;z-index:1;}");
+  appendHtmlRaw("table.grid td.rowh{background:#f8f8f8;font-weight:600;position:sticky;left:0;z-index:2;}");
+  appendHtmlRaw("table.grid .cell{display:flex;flex-direction:column;align-items:stretch;gap:2px;}");
+  appendHtmlRaw("table.grid .ch{font-size:10px;line-height:1;color:#555;}");
+  appendHtmlRaw("table.grid input{width:52px;max-width:none;margin:0;padding:4px 4px;font-size:12px;text-align:center;}");
+  appendHtmlRaw("a{color:#0b6b6f;}");
+  appendHtmlRaw("</style></head><body><div class='page'>");
+
+  appendHtmlRaw("<div class='top'><h2 style='margin:0;'>DMX Preset Editor</h2><a href='/settings'>Back to settings</a></div>");
+  appendHtmlRaw("<div class='card'>");
+  appendHtml(String("<div>Point budget: <b>") + String(totalPoints) + "</b> / " + String(MAX_DMX_PRESET_POINTS) + "</div>");
+  appendHtml(String("<div>Universe range: 1-") + String(MAX_DMX_PRESET_UNIVERSE) + "</div>");
+  if (notice.length() > 0) appendHtml(String("<div class='notice'>") + notice + "</div>");
+  if (error.length() > 0) appendHtml(String("<div class='error'>") + error + "</div>");
+  appendHtmlRaw("<form method='GET' action='/dmx_presets'>");
+  appendHtmlRaw("Preset: <select name='preset' onchange='this.form.submit()'>");
+  for (int i = 1; i <= MAX_DMX_PRESETS; i++) {
+    appendHtml(String("<option value='") + String(i) + "' " + String(i == preset ? "selected" : "") + ">Preset " + String(i) + "</option>");
+  }
+  appendHtmlRaw("</select>");
+  appendHtmlRaw("Universe: <select name='u' onchange='this.form.submit()'>");
+  for (int i = 1; i <= MAX_DMX_PRESET_UNIVERSE; i++) {
+    appendHtml(String("<option value='") + String(i) + "' " + String(i == universe ? "selected" : "") + ">Universe " + String(i) + "</option>");
+  }
+  appendHtmlRaw("</select>");
+  appendHtmlRaw("Live source: <select name='live_src' onchange='this.form.submit()'>");
+  appendHtml(String("<option value='0' ") + String(liveSourceMode == DMX_IN_SOURCE_RECENT ? "selected" : "") + ">Auto</option>");
+  appendHtml(String("<option value='1' ") + String(liveSourceMode == DMX_IN_SOURCE_PREFER_ARTNET ? "selected" : "") + ">Art-Net</option>");
+  appendHtml(String("<option value='2' ") + String(liveSourceMode == DMX_IN_SOURCE_PREFER_SACN ? "selected" : "") + ">sACN</option>");
+  appendHtmlRaw("</select>");
+  appendHtml(String("Snapshot range: <input name='lu_from' type='number' min='1' max='") + String(MAX_DMX_PRESET_UNIVERSE) + "' value='" + String(liveFrom) + "' style='max-width:110px;' onchange='this.form.submit()'>");
+  appendHtml(String("<input name='lu_to' type='number' min='1' max='") + String(MAX_DMX_PRESET_UNIVERSE) + "' value='" + String(liveTo) + "' style='max-width:110px;' onchange='this.form.submit()'>");
+  appendHtml(String("<label style='display:inline-flex;align-items:center;gap:6px;max-width:none;'><input name='live_nonzero' type='checkbox' value='1' ") + String(liveNonZeroOnly ? "checked" : "") + " onchange='this.form.submit()'>Store non-zero only</label>");
+  appendHtmlRaw("</form>");
+  appendHtml(String("<div>Current preset points: <b>") + String(currentPoints) + "</b></div>");
+  appendHtml(String("<div>Universe ") + String(universe) + " active channels: <b>" + String(activeChannels) + "</b></div>");
+  appendHtml(String("<div>Live input (U") + String(universe) + "): Art-Net " + String(hasArtLive ? ("seen " + String(millis() - artSeenMs) + "ms ago") : "not seen") +
+             ", sACN " + String(hasSacLive ? ("seen " + String(millis() - sacSeenMs) + "ms ago") : "not seen") + "</div>");
+  if (hasLivePreview) {
+    appendHtml(String("<div>Live preview source: <b>") + String(livePreviewSource == DMX_PROTO_ARTNET ? "Art-Net" : "sACN") +
+               "</b> (" + String(livePreviewAgeMs) + "ms ago), active channels: <b>" + String(livePreviewActiveChannels) + "</b></div>");
+  } else {
+    appendHtmlRaw("<div>Live preview source: <b>none</b></div>");
+  }
+  appendHtmlRaw("</div>");
+
+  appendHtmlRaw("<div class='card'><b>Live DMX Snapshot</b><br>");
+  appendHtmlRaw("<small>Capture current DMX input values into this preset for one universe or a range.</small><br>");
+  appendHtmlRaw("<form method='POST' action='/dmx_presets'>");
+  appendHtml(String("<input type='hidden' name='preset' value='") + String(preset) + "'>");
+  appendHtml(String("<input type='hidden' name='u' value='") + String(universe) + "'>");
+  appendHtml(String("<input type='hidden' name='live_src' value='") + String(liveSourceMode) + "'>");
+  appendHtml(String("<input type='hidden' name='lu_from' value='") + String(liveFrom) + "'>");
+  appendHtml(String("<input type='hidden' name='lu_to' value='") + String(liveTo) + "'>");
+  if (liveNonZeroOnly) appendHtmlRaw("<input type='hidden' name='live_nonzero' value='1'>");
+  appendHtmlRaw("<button type='submit' name='action' value='snapshot_live' class='primary'>Get Current Values Snapshot</button>");
+  appendHtmlRaw("</form>");
+  appendHtmlRaw("</div>");
+
+  appendHtmlRaw("<div class='card'><b>Universe Grid</b><br>");
+  appendHtmlRaw("<small>Set DMX values per channel. Blank cell means channel is not stored in this preset/universe.</small>");
+  appendHtmlRaw("<form method='POST' action='/dmx_presets'>");
+  appendHtml(String("<input type='hidden' name='preset' value='") + String(preset) + "'>");
+  appendHtml(String("<input type='hidden' name='u' value='") + String(universe) + "'>");
+  appendHtml(String("<input type='hidden' name='live_src' value='") + String(liveSourceMode) + "'>");
+  appendHtml(String("<input type='hidden' name='lu_from' value='") + String(liveFrom) + "'>");
+  appendHtml(String("<input type='hidden' name='lu_to' value='") + String(liveTo) + "'>");
+  if (liveNonZeroOnly) appendHtmlRaw("<input type='hidden' name='live_nonzero' value='1'>");
+  appendHtmlRaw("<div class='grid-wrap'><table class='grid'><tr><th>Channels</th>");
+  for (int c = 1; c <= 16; c++) appendHtml(String("<th>") + String(c) + "</th>");
+  appendHtmlRaw("</tr>");
+  for (int row = 0; row < 32; row++) {
+    int rowStart = row * 16 + 1;
+    int rowEnd = rowStart + 15;
+    appendHtml(String("<tr><td class='rowh'>") + String(rowStart) + "-" + String(rowEnd) + "</td>");
+    for (int col = 0; col < 16; col++) {
+      int ch = rowStart + col;
+      String v = universeValues[ch - 1] >= 0 ? String(universeValues[ch - 1]) : "";
+      appendHtml(String("<td><div class='cell'><div class='ch'>") + String(ch) + "</div><input type='number' min='0' max='255' name='ch" + String(ch) + "' value='" + v + "' placeholder='-'></div></td>");
+    }
+    appendHtmlRaw("</tr>");
+  }
+  appendHtmlRaw("</table></div><br>");
+  appendHtmlRaw("<button type='submit' name='action' value='save_grid' class='primary'>Save Universe</button> ");
+  appendHtmlRaw("<button type='submit' name='action' value='clear_universe'>Clear Universe</button>");
+  appendHtmlRaw("</form>");
+  appendHtmlRaw("</div>");
+
+  appendHtmlRaw("<details class='card'><summary><b>Advanced Text Editor</b></summary>");
+  appendHtmlRaw("<small>Format: universe,channels,value. Example: 1,1-10,255. Channels support ranges and comma lists.</small>");
+  appendHtmlRaw("<form method='POST' action='/dmx_presets'>");
+  appendHtml(String("<input type='hidden' name='preset' value='") + String(preset) + "'>");
+  appendHtml(String("<input type='hidden' name='u' value='") + String(universe) + "'>");
+  appendHtml(String("<input type='hidden' name='live_src' value='") + String(liveSourceMode) + "'>");
+  appendHtml(String("<input type='hidden' name='lu_from' value='") + String(liveFrom) + "'>");
+  appendHtml(String("<input type='hidden' name='lu_to' value='") + String(liveTo) + "'>");
+  if (liveNonZeroOnly) appendHtmlRaw("<input type='hidden' name='live_nonzero' value='1'>");
+  appendHtml(String("<textarea name='preset_text' placeholder='1,1-10,255&#10;2,1,128'>") + currentText + "</textarea><br>");
+  appendHtmlRaw("<button type='submit' name='action' value='save' class='primary'>Save Text</button> ");
+  appendHtmlRaw("<button type='submit' name='action' value='clear'>Clear Entire Preset</button>");
+  appendHtmlRaw("</form>");
+  appendHtmlRaw("</details>");
+
+  appendHtmlRaw("</div></body></html>");
+  flushHtml();
+  server.sendContent("");
 }
 
 static void handleSendTestOsc() {
@@ -5135,6 +6818,67 @@ static void handleSendTestGpio() {
   out.gpioPulseMs = gpms;
   out.gpioInvert = ginv;
   applyGpioOutput(out, 1.0f, false);
+  server.send(200, "text/plain", "Sent.");
+}
+
+static void handleSendTestDmx() {
+  if (!ensureAuthenticated()) return;
+
+  SensorConfig defaults = defaultSensorConfig(0);
+  SensorConfig::OutputConfig out = defaults.outputs[0];
+  out.target = OUT_TARGET_DMX;
+  if (server.hasArg("target")) {
+    int tgt = server.arg("target").toInt();
+    if (tgt == OUT_TARGET_DMX_PRESET) out.target = OUT_TARGET_DMX_PRESET;
+  }
+
+  if (server.hasArg("test_dev")) {
+    int dev = server.arg("test_dev").toInt();
+    if (dev >= 0 && dev < MAX_OSC_DEVICES) out.device = static_cast<uint8_t>(dev);
+  }
+  if (server.hasArg("dmxp")) out.dmxProtocol = sanitizeDmxProtocol(server.arg("dmxp").toInt());
+  if (server.hasArg("dmxd")) out.dmxDest = sanitizeDmxDest(server.arg("dmxd").toInt());
+  if (server.hasArg("dmxn")) out.dmxArtNet = sanitizeDmxArtNet(server.arg("dmxn").toInt());
+  if (server.hasArg("dmxs")) out.dmxArtSubnet = sanitizeDmxArtSubnet(server.arg("dmxs").toInt());
+  if (server.hasArg("dmxa")) out.dmxArtUniverse = sanitizeDmxArtUniverse(server.arg("dmxa").toInt());
+  if (server.hasArg("dmxu")) {
+    uint16_t u = static_cast<uint16_t>(server.arg("dmxu").toInt());
+    if (u > 0) out.dmxUniverse = u;
+  }
+  if (server.hasArg("dmxc")) {
+    out.dmxChannels = server.arg("dmxc");
+    out.dmxChannels.trim();
+    if (out.dmxChannels.length() == 0) out.dmxChannels = "1";
+  }
+  if (server.hasArg("dmxpr")) out.dmxPreset = sanitizeDmxPresetId(server.arg("dmxpr").toInt());
+  if (server.hasArg("dmxfd")) out.dmxFadeMs = sanitizeDmxFadeMs(server.arg("dmxfd").toInt());
+  if (server.hasArg("omode")) {
+    out.outMode = sanitizeOutputMode(server.arg("omode").toInt());
+    if (out.outMode == OUT_STRING) out.outMode = OUT_INT;
+  }
+  if (server.hasArg("omin")) out.outMin = server.arg("omin").toFloat();
+  if (server.hasArg("omax")) out.outMax = server.arg("omax").toFloat();
+  if (out.dmxProtocol == DMX_PROTO_ARTNET) {
+    out.dmxUniverse = encodeArtNetPortAddressOneBased(out.dmxArtNet, out.dmxArtSubnet, out.dmxArtUniverse);
+  } else {
+    decodeArtNetPortAddressOneBased(out.dmxUniverse, out.dmxArtNet, out.dmxArtSubnet, out.dmxArtUniverse);
+  }
+
+  if (out.target == OUT_TARGET_DMX_PRESET) {
+    if (!triggerDmxPreset(out)) {
+      server.send(400, "text/plain", "DMX preset test failed.");
+      return;
+    }
+    server.send(200, "text/plain", "Sent.");
+    return;
+  }
+
+  String kind = server.hasArg("kind") ? server.arg("kind") : "max";
+  float testValue = (kind == "min" || kind == "bmin") ? out.outMin : out.outMax;
+  if (!sendDmxOutput(out, testValue)) {
+    server.send(400, "text/plain", "DMX send failed (check protocol toggle and destination).");
+    return;
+  }
   server.send(200, "text/plain", "Sent.");
 }
 
@@ -5279,6 +7023,15 @@ void setup() {
   loadConfig();
   configureMqttClient();
   resetRuntimeState(true);
+  size_t dmxInBytes = static_cast<size_t>(MAX_DMX_PRESET_UNIVERSE) * 512;
+  dmxInData = static_cast<uint8_t*>(malloc(dmxInBytes));
+  if (dmxInData != nullptr) {
+    memset(dmxInData, 0, dmxInBytes);
+  } else {
+    config.dmxInArtNetEnabled = false;
+    config.dmxInSacnEnabled = false;
+    addLog("DMX input buffer allocation failed; DMX input disabled.");
+  }
   pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
   resetButtonArmed = false;
 
@@ -5305,10 +7058,13 @@ void setup() {
   server.on("/triggers", HTTP_POST, handleSaveTriggers);
   server.on("/settings", HTTP_GET, handleSettings);
   server.on("/settings", HTTP_POST, handleSaveSettings);
+  server.on("/dmx_presets", HTTP_GET, handleDmxPresetEditor);
+  server.on("/dmx_presets", HTTP_POST, handleDmxPresetEditor);
   server.on("/send_test", HTTP_POST, handleSendTestOsc);
   server.on("/send_udp_test", HTTP_POST, handleSendTestUdp);
   server.on("/send_mqtt_test", HTTP_POST, handleSendTestMqtt);
   server.on("/send_gpio_test", HTTP_POST, handleSendTestGpio);
+  server.on("/send_dmx_test", HTTP_POST, handleSendTestDmx);
   server.on("/scan_wifi", HTTP_GET, handleScanNetworks);
   server.on("/reset", HTTP_POST, handleReset);
   server.on("/reboot", HTTP_POST, handleReboot);
@@ -5378,6 +7134,7 @@ void loop() {
   }
 
   processOscInput();
+  processDmxInput();
 
   for (int i = 0; i < MAX_TRIGGERS; i++) {
     SensorConfig& s = config.sensors[i];
@@ -5535,7 +7292,7 @@ void loop() {
             } else {
               lastBool[i][o] = pressed ? 1 : 0;
             }
-          } else if (out.target == OUT_TARGET_UDP || out.target == OUT_TARGET_HTTP || out.target == OUT_TARGET_MQTT || out.target == OUT_TARGET_OSC) {
+          } else if (out.target == OUT_TARGET_UDP || out.target == OUT_TARGET_HTTP || out.target == OUT_TARGET_MQTT || out.target == OUT_TARGET_DMX || out.target == OUT_TARGET_OSC) {
             if (outMode == OUT_STRING) {
               lastBool[i][o] = pressed ? 1 : 0;
             } else if (outMode == OUT_FLOAT) {
@@ -5785,6 +7542,42 @@ void loop() {
         continue;
       }
 
+      if (out.target == OUT_TARGET_DMX) {
+        if (!out.sendMinOnRelease && s.type != SENSOR_ANALOG) {
+          bool rising = (norm >= 0.5f) && (prevLevel <= 0);
+          if (!rising) {
+            continue;
+          }
+          if (sendDmxOutput(out, 1.0f)) {
+            lastInt[i][o] = static_cast<int>(toDmxValue(out, 1.0f));
+          }
+          continue;
+        }
+        int intValue = static_cast<int>(toDmxValue(out, norm));
+        bool canSend = true;
+        if (s.type == SENSOR_ANALOG) {
+          if (lastInt[i][o] >= 0 && abs(intValue - lastInt[i][o]) <= DEAD_BAND) {
+            intValue = lastInt[i][o];
+            canSend = false;
+          }
+        }
+        if (intValue != lastInt[i][o] && canSend) {
+          if (sendDmxOutput(out, norm)) {
+            lastInt[i][o] = intValue;
+          }
+        }
+        continue;
+      }
+
+      if (out.target == OUT_TARGET_DMX_PRESET) {
+        bool rising = (norm >= 0.5f) && (prevLevel <= 0);
+        if (!rising) {
+          continue;
+        }
+        triggerDmxPreset(out);
+        continue;
+      }
+
       IPAddress outIp;
       uint16_t outPort;
       if (!getOscTarget(out.device, outIp, outPort)) {
@@ -5890,6 +7683,8 @@ void loop() {
       }
     }
   }
+
+  tickDmxPresetFade();
 
   delay(LOOP_DELAY_MS);
 
