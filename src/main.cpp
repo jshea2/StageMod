@@ -12,6 +12,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <esp_system.h>
+#include <esp_log.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <WiFiUdp.h>
@@ -19,12 +20,13 @@
 #include <sys/time.h>
 #include "driver/pcnt.h"
 #ifndef WEBSERVER_MAX_POST_ARGS
-#define WEBSERVER_MAX_POST_ARGS 800
+#define WEBSERVER_MAX_POST_ARGS 2000
 #endif
 #include <WebServer.h>
 #include <Update.h>
 #include <ArduinoJson.h>
 #include <PubSubClient.h>
+#include "web_ui.h"
 
 // =========================
 // Config (edit these)
@@ -66,7 +68,7 @@ const int MAX_TRIGGERS = 20;
 const int MAX_OSC_DEVICES = 8;
 const int MAX_OUTPUTS_PER_TRIGGER = 5;
 const int MAX_DMX_PRESETS = 100;
-const int MAX_DMX_PRESET_POINTS = 4096;
+const int MAX_DMX_PRESET_POINTS = 1024;
 const int MAX_DMX_PRESET_UNIVERSE = 40;
 const uint8_t MQTT_DEVICE_CUSTOM = 255;
 
@@ -552,12 +554,12 @@ static bool waitForNetwork(unsigned long timeoutMs) {
     }
     return true;
   }
-#else
+#endif
+  // WiFi mode (with or without Ethernet compiled in)
   while (WiFi.status() != WL_CONNECTED || !isValidIp(WiFi.localIP())) {
     delay(100);
     if (millis() - start > timeoutMs) return false;
   }
-#endif
   return true;
 }
 
@@ -821,6 +823,22 @@ static String jsonEscape(const String& s) {
   return out;
 }
 
+static String htmlEscape(const String& s) {
+  String out;
+  out.reserve(s.length() + 16);
+  for (char c : s) {
+    switch (c) {
+      case '&':  out += "&amp;";  break;
+      case '<':  out += "&lt;";   break;
+      case '>':  out += "&gt;";   break;
+      case '"':  out += "&quot;"; break;
+      case '\'': out += "&#39;";  break;
+      default:   out += c;        break;
+    }
+  }
+  return out;
+}
+
 static int compareVersion(const String& a, const String& b) {
   int ap[3] = {0, 0, 0};
   int bp[3] = {0, 0, 0};
@@ -849,9 +867,19 @@ static int compareVersion(const String& a, const String& b) {
 }
 
 static String exportConfigJson() {
-  DynamicJsonDocument doc(98304);
+  DynamicJsonDocument doc(32768);
   doc["version"] = FIRMWARE_VERSION;
   JsonObject c = doc.createNestedObject("config");
+  c["hostname"] = config.hostname;
+  c["netMode"] = static_cast<int>(config.netMode);
+  c["wifiSsid"] = config.wifiSsid;
+  c["useStatic"] = config.useStatic;
+  c["staticIp"] = ipToString(config.staticIp);
+  c["gateway"] = ipToString(config.gateway);
+  c["subnet"] = ipToString(config.subnet);
+  c["dns1"] = ipToString(config.dns1);
+  c["dns2"] = ipToString(config.dns2);
+  c["passwordEnabled"] = config.passwordEnabled;
   c["username"] = config.username;
   c["testDevice"] = config.testDevice;
   c["clickDebounceMs"] = config.clickDebounceMs;
@@ -903,7 +931,8 @@ static String exportConfigJson() {
     trOrder.add(config.triggerOrder[i]);
   }
   JsonArray sensors = c.createNestedArray("sensors");
-  for (int i = 0; i < MAX_TRIGGERS; i++) {
+  for (int ti = 0; ti < config.triggerCount; ti++) {
+    int i = config.triggerOrder[ti];
     const SensorConfig& s = config.sensors[i];
     JsonObject so = sensors.createNestedObject();
     so["index"] = i;
@@ -1009,6 +1038,17 @@ static bool applyConfigFromJson(const JsonObject& cfg, String& err) {
     return false;
   }
 
+  if (cfg.containsKey("hostname")) config.hostname = sanitizeHostname(String(cfg["hostname"].as<const char*>()));
+  if (cfg.containsKey("netMode")) { int m = cfg["netMode"].as<int>(); if (m == NET_ETHERNET || m == NET_WIFI) config.netMode = static_cast<NetMode>(m); }
+  if (cfg.containsKey("wifiSsid")) config.wifiSsid = String(cfg["wifiSsid"].as<const char*>());
+  if (cfg.containsKey("wifiPass")) { String p = String(cfg["wifiPass"].as<const char*>()); if (p.length() > 0) config.wifiPass = p; }
+  if (cfg.containsKey("useStatic")) config.useStatic = cfg["useStatic"];
+  if (cfg.containsKey("staticIp")) { IPAddress p; if (parseIpString(String(cfg["staticIp"].as<const char*>()), p)) config.staticIp = p; }
+  if (cfg.containsKey("gateway")) { IPAddress p; if (parseIpString(String(cfg["gateway"].as<const char*>()), p)) config.gateway = p; }
+  if (cfg.containsKey("subnet")) { IPAddress p; if (parseIpString(String(cfg["subnet"].as<const char*>()), p)) config.subnet = p; }
+  if (cfg.containsKey("dns1")) { IPAddress p; if (parseIpString(String(cfg["dns1"].as<const char*>()), p)) config.dns1 = p; }
+  if (cfg.containsKey("dns2")) { IPAddress p; if (parseIpString(String(cfg["dns2"].as<const char*>()), p)) config.dns2 = p; }
+  if (cfg.containsKey("passwordEnabled")) config.passwordEnabled = cfg["passwordEnabled"];
   if (cfg.containsKey("username")) config.username = String(cfg["username"].as<const char*>());
   if (cfg.containsKey("testDevice")) {
     int v = cfg["testDevice"];
@@ -1273,6 +1313,7 @@ static void startWifiAp() {
   String apSsid = buildApSsid();
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(apSsid.c_str());
+  delay(500);
   dnsServer.start(53, "*", WiFi.softAPIP());
   wifiApMode = true;
   Serial.print("AP mode: ");
@@ -2508,81 +2549,134 @@ static void saveConfig() {
     prefs.putBool(sensorKey(i, "en").c_str(), s.enabled);
     prefs.putString(sensorKey(i, "name").c_str(), s.name);
     prefs.putInt(sensorKey(i, "src").c_str(), s.source);
-    prefs.putString(sensorKey(i, "osia").c_str(), s.oscInAddress);
-    prefs.putUInt(sensorKey(i, "osit").c_str(), s.oscInArgType);
-    prefs.putUInt(sensorKey(i, "osim").c_str(), s.oscInMatchMode);
-    prefs.putFloat(sensorKey(i, "osiv").c_str(), s.oscInValue);
-    prefs.putFloat(sensorKey(i, "osmn").c_str(), s.oscInMin);
-    prefs.putFloat(sensorKey(i, "osmx").c_str(), s.oscInMax);
-    prefs.putString(sensorKey(i, "osis").c_str(), s.oscInString);
     prefs.putInt(sensorKey(i, "type").c_str(), s.type);
-    prefs.putInt(sensorKey(i, "pin").c_str(), s.pin);
-    prefs.putInt(sensorKey(i, "clk").c_str(), s.encClkPin);
-    prefs.putInt(sensorKey(i, "dt").c_str(), s.encDtPin);
-    prefs.putInt(sensorKey(i, "sw").c_str(), s.encSwPin);
-    prefs.putBool(sensorKey(i, "enc_app").c_str(), s.encAppendSign);
-    prefs.putBool(sensorKey(i, "enc_arg").c_str(), s.encSignArg);
-    prefs.putBool(sensorKey(i, "enc_inv").c_str(), s.encInvert);
-    prefs.putInt(sensorKey(i, "hct").c_str(), s.hcTrigPin);
-    prefs.putInt(sensorKey(i, "hce").c_str(), s.hcEchoPin);
-    prefs.putFloat(sensorKey(i, "hcmin").c_str(), s.hcMinCm);
-    prefs.putFloat(sensorKey(i, "hcmax").c_str(), s.hcMaxCm);
-    prefs.putBool(sensorKey(i, "inv").c_str(), s.invert);
-    prefs.putBool(sensorKey(i, "ah").c_str(), s.activeHigh);
-    prefs.putBool(sensorKey(i, "pu").c_str(), s.pullup);
-    prefs.putBool(sensorKey(i, "cd_en").c_str(), s.cooldownEnabled);
-    prefs.putUInt(sensorKey(i, "cd_ms").c_str(), s.cooldownMs);
     prefs.putUInt(sensorKey(i, "oc").c_str(), s.outputCount);
+
+    // Source-specific fields only
+    if (s.source == SRC_OSC) {
+      prefs.putString(sensorKey(i, "osia").c_str(), s.oscInAddress);
+      prefs.putUInt(sensorKey(i, "osit").c_str(), s.oscInArgType);
+      prefs.putUInt(sensorKey(i, "osim").c_str(), s.oscInMatchMode);
+      prefs.putFloat(sensorKey(i, "osiv").c_str(), s.oscInValue);
+      prefs.putFloat(sensorKey(i, "osmn").c_str(), s.oscInMin);
+      prefs.putFloat(sensorKey(i, "osmx").c_str(), s.oscInMax);
+      prefs.putString(sensorKey(i, "osis").c_str(), s.oscInString);
+    }
+    if (s.source == SRC_TIME) {
+      prefs.putInt(sensorKey(i, "tt").c_str(), s.timeType);
+      prefs.putInt(sensorKey(i, "ty").c_str(), s.timeYear);
+      prefs.putInt(sensorKey(i, "tm").c_str(), s.timeMonth);
+      prefs.putInt(sensorKey(i, "td").c_str(), s.timeDay);
+      prefs.putInt(sensorKey(i, "th").c_str(), s.timeHour);
+      prefs.putInt(sensorKey(i, "tmin").c_str(), s.timeMinute);
+      prefs.putInt(sensorKey(i, "tsec").c_str(), s.timeSecond);
+      prefs.putInt(sensorKey(i, "twm").c_str(), s.weeklyMask);
+      prefs.putUInt(sensorKey(i, "tint").c_str(), s.intervalSeconds);
+    }
+    if (s.source == SRC_SENSORS) {
+      prefs.putInt(sensorKey(i, "pin").c_str(), s.pin);
+      prefs.putBool(sensorKey(i, "inv").c_str(), s.invert);
+      if (s.type == SENSOR_ANALOG) {
+        // analog-only: smoothing handled globally
+      }
+      if (s.type == SENSOR_BUTTON || s.type == SENSOR_TOGGLE || s.type == SENSOR_BUTTON_DOUBLE ||
+          s.type == SENSOR_BUTTON_TRIPLE || s.type == SENSOR_BUTTON_LONG || s.type == SENSOR_DIGITAL || s.type == SENSOR_GPIO) {
+        prefs.putBool(sensorKey(i, "ah").c_str(), s.activeHigh);
+        prefs.putBool(sensorKey(i, "pu").c_str(), s.pullup);
+      }
+      if (s.type == SENSOR_BUTTON || s.type == SENSOR_BUTTON_DOUBLE || s.type == SENSOR_BUTTON_TRIPLE || s.type == SENSOR_BUTTON_LONG) {
+        prefs.putBool(sensorKey(i, "cd_en").c_str(), s.cooldownEnabled);
+        prefs.putUInt(sensorKey(i, "cd_ms").c_str(), s.cooldownMs);
+      }
+      if (s.type == SENSOR_ENCODER) {
+        prefs.putInt(sensorKey(i, "clk").c_str(), s.encClkPin);
+        prefs.putInt(sensorKey(i, "dt").c_str(), s.encDtPin);
+        prefs.putInt(sensorKey(i, "sw").c_str(), s.encSwPin);
+        prefs.putBool(sensorKey(i, "enc_app").c_str(), s.encAppendSign);
+        prefs.putBool(sensorKey(i, "enc_arg").c_str(), s.encSignArg);
+        prefs.putBool(sensorKey(i, "enc_inv").c_str(), s.encInvert);
+      }
+      if (s.type == SENSOR_HCSR04) {
+        prefs.putInt(sensorKey(i, "hct").c_str(), s.hcTrigPin);
+        prefs.putInt(sensorKey(i, "hce").c_str(), s.hcEchoPin);
+        prefs.putFloat(sensorKey(i, "hcmin").c_str(), s.hcMinCm);
+        prefs.putFloat(sensorKey(i, "hcmax").c_str(), s.hcMaxCm);
+      }
+    }
+
     for (int o = 0; o < s.outputCount; o++) {
       const SensorConfig::OutputConfig& out = s.outputs[o];
       prefs.putInt(outputKey(i, o, "tgt").c_str(), out.target);
-      prefs.putInt(outputKey(i, o, "dev").c_str(), out.device);
-      prefs.putString(outputKey(i, o, "addr").c_str(), out.oscAddress);
-      prefs.putString(outputKey(i, o, "baddr").c_str(), out.buttonAddress);
+      // Common output fields
+      prefs.putInt(outputKey(i, o, "omode").c_str(), out.outMode);
       prefs.putFloat(outputKey(i, o, "omin").c_str(), out.outMin);
       prefs.putFloat(outputKey(i, o, "omax").c_str(), out.outMax);
-      prefs.putInt(outputKey(i, o, "omode").c_str(), out.outMode);
-      prefs.putFloat(outputKey(i, o, "bmin").c_str(), out.buttonOutMin);
-      prefs.putFloat(outputKey(i, o, "bmax").c_str(), out.buttonOutMax);
-      prefs.putInt(outputKey(i, o, "bmode").c_str(), out.buttonOutMode);
       prefs.putBool(outputKey(i, o, "smin").c_str(), out.sendMinOnRelease);
-      prefs.putString(outputKey(i, o, "udp").c_str(), out.udpPayload);
-      prefs.putInt(outputKey(i, o, "gpin").c_str(), out.gpioPin);
-      prefs.putInt(outputKey(i, o, "gmode").c_str(), out.gpioMode);
-      prefs.putUInt(outputKey(i, o, "gpms").c_str(), out.gpioPulseMs);
-      prefs.putBool(outputKey(i, o, "ginv").c_str(), out.gpioInvert);
-      prefs.putInt(outputKey(i, o, "hm").c_str(), out.httpMethod);
-      prefs.putString(outputKey(i, o, "hu").c_str(), out.httpUrl);
-      prefs.putString(outputKey(i, o, "hb").c_str(), out.httpBody);
-      prefs.putString(outputKey(i, o, "hip").c_str(), out.httpIp);
-      prefs.putUInt(outputKey(i, o, "hpt").c_str(), out.httpPort);
-      prefs.putUInt(outputKey(i, o, "hdev").c_str(), out.httpDevice);
-      prefs.putString(outputKey(i, o, "mt").c_str(), out.mqttTopic);
-      prefs.putString(outputKey(i, o, "mp").c_str(), out.mqttPayload);
-      prefs.putBool(outputKey(i, o, "mr").c_str(), out.mqttRetain);
-      prefs.putUInt(outputKey(i, o, "dmxp").c_str(), out.dmxProtocol);
-      prefs.putUInt(outputKey(i, o, "dmxd").c_str(), out.dmxDest);
-      prefs.putUInt(outputKey(i, o, "dmxn").c_str(), out.dmxArtNet);
-      prefs.putUInt(outputKey(i, o, "dmxs").c_str(), out.dmxArtSubnet);
-      prefs.putUInt(outputKey(i, o, "dmxa").c_str(), out.dmxArtUniverse);
-      prefs.putUInt(outputKey(i, o, "dmxu").c_str(), out.dmxUniverse);
-      prefs.putString(outputKey(i, o, "dmxc").c_str(), out.dmxChannels);
-      prefs.putUInt(outputKey(i, o, "dmxpr").c_str(), out.dmxPreset);
-      prefs.putUInt(outputKey(i, o, "dmxfd").c_str(), out.dmxFadeMs);
-      prefs.putString(outputKey(i, o, "on").c_str(), out.onString);
-      prefs.putString(outputKey(i, o, "off").c_str(), out.offString);
-      prefs.putString(outputKey(i, o, "bon").c_str(), out.buttonOnString);
-      prefs.putString(outputKey(i, o, "boff").c_str(), out.buttonOffString);
+      if (out.outMode == OUT_STRING) {
+        prefs.putString(outputKey(i, o, "on").c_str(), out.onString);
+        prefs.putString(outputKey(i, o, "off").c_str(), out.offString);
+      }
+      // Target-specific fields
+      if (out.target == OUT_TARGET_OSC) {
+        prefs.putInt(outputKey(i, o, "dev").c_str(), out.device);
+        prefs.putString(outputKey(i, o, "addr").c_str(), out.oscAddress);
+        if (s.type == SENSOR_ENCODER) {
+          prefs.putString(outputKey(i, o, "baddr").c_str(), out.buttonAddress);
+          prefs.putFloat(outputKey(i, o, "bmin").c_str(), out.buttonOutMin);
+          prefs.putFloat(outputKey(i, o, "bmax").c_str(), out.buttonOutMax);
+          prefs.putInt(outputKey(i, o, "bmode").c_str(), out.buttonOutMode);
+          if (out.buttonOutMode == OUT_STRING) {
+            prefs.putString(outputKey(i, o, "bon").c_str(), out.buttonOnString);
+            prefs.putString(outputKey(i, o, "boff").c_str(), out.buttonOffString);
+          }
+        }
+      }
+      if (out.target == OUT_TARGET_UDP) {
+        prefs.putInt(outputKey(i, o, "dev").c_str(), out.device);
+        prefs.putString(outputKey(i, o, "udp").c_str(), out.udpPayload);
+      }
+      if (out.target == OUT_TARGET_GPIO) {
+        prefs.putInt(outputKey(i, o, "gpin").c_str(), out.gpioPin);
+        prefs.putInt(outputKey(i, o, "gmode").c_str(), out.gpioMode);
+        if (out.gpioMode == GPIO_OUT_PULSE) prefs.putUInt(outputKey(i, o, "gpms").c_str(), out.gpioPulseMs);
+        prefs.putBool(outputKey(i, o, "ginv").c_str(), out.gpioInvert);
+      }
+      if (out.target == OUT_TARGET_HTTP) {
+        prefs.putInt(outputKey(i, o, "hm").c_str(), out.httpMethod);
+        prefs.putString(outputKey(i, o, "hu").c_str(), out.httpUrl);
+        if (out.httpMethod == HTTPM_POST) prefs.putString(outputKey(i, o, "hb").c_str(), out.httpBody);
+        prefs.putString(outputKey(i, o, "hip").c_str(), out.httpIp);
+        prefs.putUInt(outputKey(i, o, "hpt").c_str(), out.httpPort);
+        prefs.putUInt(outputKey(i, o, "hdev").c_str(), out.httpDevice);
+        prefs.putString(outputKey(i, o, "addr").c_str(), out.oscAddress);
+      }
+      if (out.target == OUT_TARGET_MQTT) {
+        prefs.putString(outputKey(i, o, "mt").c_str(), out.mqttTopic);
+        prefs.putString(outputKey(i, o, "mp").c_str(), out.mqttPayload);
+        prefs.putBool(outputKey(i, o, "mr").c_str(), out.mqttRetain);
+        prefs.putString(outputKey(i, o, "addr").c_str(), out.oscAddress);
+      }
+      if (out.target == OUT_TARGET_DMX) {
+        prefs.putUInt(outputKey(i, o, "dmxp").c_str(), out.dmxProtocol);
+        prefs.putUInt(outputKey(i, o, "dmxd").c_str(), out.dmxDest);
+        if (out.dmxProtocol == DMX_PROTO_ARTNET) {
+          prefs.putUInt(outputKey(i, o, "dmxn").c_str(), out.dmxArtNet);
+          prefs.putUInt(outputKey(i, o, "dmxs").c_str(), out.dmxArtSubnet);
+          prefs.putUInt(outputKey(i, o, "dmxa").c_str(), out.dmxArtUniverse);
+        }
+        prefs.putUInt(outputKey(i, o, "dmxu").c_str(), out.dmxUniverse);
+        prefs.putString(outputKey(i, o, "dmxc").c_str(), out.dmxChannels);
+        if (out.dmxDest == DMX_DEST_UNICAST) prefs.putInt(outputKey(i, o, "dev").c_str(), out.device);
+        prefs.putString(outputKey(i, o, "addr").c_str(), out.oscAddress);
+      }
+      if (out.target == OUT_TARGET_DMX_PRESET) {
+        prefs.putUInt(outputKey(i, o, "dmxp").c_str(), out.dmxProtocol);
+        prefs.putUInt(outputKey(i, o, "dmxd").c_str(), out.dmxDest);
+        prefs.putUInt(outputKey(i, o, "dmxpr").c_str(), out.dmxPreset);
+        prefs.putUInt(outputKey(i, o, "dmxfd").c_str(), out.dmxFadeMs);
+        if (out.dmxDest == DMX_DEST_UNICAST) prefs.putInt(outputKey(i, o, "dev").c_str(), out.device);
+      }
     }
-    prefs.putInt(sensorKey(i, "tt").c_str(), s.timeType);
-    prefs.putInt(sensorKey(i, "ty").c_str(), s.timeYear);
-    prefs.putInt(sensorKey(i, "tm").c_str(), s.timeMonth);
-    prefs.putInt(sensorKey(i, "td").c_str(), s.timeDay);
-    prefs.putInt(sensorKey(i, "th").c_str(), s.timeHour);
-    prefs.putInt(sensorKey(i, "tmin").c_str(), s.timeMinute);
-    prefs.putInt(sensorKey(i, "tsec").c_str(), s.timeSecond);
-    prefs.putInt(sensorKey(i, "twm").c_str(), s.weeklyMask);
-    prefs.putUInt(sensorKey(i, "tint").c_str(), s.intervalSeconds);
   }
 
   for (int i = 0; i < MAX_DMX_PRESETS; i++) {
@@ -4414,725 +4508,9 @@ static void appendOscDeviceOptions(String& html, uint8_t selected) {
   for (int i = 0; i < config.oscDeviceCount; i++) {
     int idx = config.oscDeviceOrder[i];
     const OscDevice& d = config.oscDevices[idx];
-    String label = d.name + " (" + ipToString(d.ip) + ":" + String(d.port) + ")";
+    String label = htmlEscape(d.name) + " (" + ipToString(d.ip) + ":" + String(d.port) + ")";
     html += "<option value='" + String(idx) + "' " + String(idx == selected ? "selected" : "") + ">" + label + "</option>";
   }
-}
-
-static void handleTriggers() {
-  if (!ensureAuthenticated()) return;
-  String html;
-  html.reserve(20000);
-  html += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>";
-  html += "<title>StageMod Triggers</title>";
-  html += "<style>";
-  html += ":root{--bg:#f4f1ea;--ink:#1a1a1a;--muted:#6c6c6c;--card:#ffffff;--accent:#0b6b6f;--danger:#a02a2a;}";
-  html += "body{margin:0;font-family:'Avenir Next','Trebuchet MS','Segoe UI',sans-serif;background:linear-gradient(135deg,#f4f1ea 0%,#e7f0ef 100%);color:var(--ink);}";
-  html += ".page{max-width:900px;margin:0 auto;padding:20px 16px 40px;}";
-  html += ".header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;margin-bottom:8px;}";
-  html += ".title{font-size:22px;font-weight:700;letter-spacing:0.5px;}";
-  html += ".actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;}";
-  html += ".nav-link{font-size:16px;color:#6b34d6;text-decoration:underline;font-weight:600;}";
-  html += ".nav-pill{font-size:14px;color:#666;padding:6px 12px;border:1px solid #ddd;border-radius:999px;background:#fff;text-decoration:none;}";
-  html += ".nav-primary{font-size:16px;color:#fff;padding:8px 14px;border-radius:999px;background:var(--accent);text-decoration:none;}";
-  html += "a.primary{background:var(--accent);color:#fff;border-color:var(--accent);padding:6px 10px;border-radius:8px;text-decoration:none;}";
-  html += "a.primary{background:var(--accent);color:#fff;border-color:var(--accent);padding:6px 10px;border-radius:8px;text-decoration:none;}";
-  html += ".status{display:flex;flex-wrap:wrap;gap:10px;font-size:13px;color:var(--muted);margin:8px 0 14px;}";
-  html += ".card{background:var(--card);border:1px solid #e2e2e2;border-radius:12px;padding:12px;margin:10px 0;}";
-  html += "fieldset{border:1px solid #e2e2e2;border-radius:12px;padding:12px;margin:12px 0;background:#fff;}";
-  html += "legend{padding:0 6px;color:var(--muted);}";
-  html += "details{border:1px solid #e2e2e2;border-radius:12px;margin:12px 0;background:#fff;}";
-  html += "summary{cursor:pointer;list-style:none;padding:10px 12px;display:flex;align-items:center;justify-content:space-between;}";
-  html += ".chev{display:inline-block;margin-right:8px;font-size:14px;transition:transform 0.2s ease;}";
-  html += "details[open] .chev{transform:rotate(90deg);}";
-  html += ".toggle{position:relative;width:36px;height:20px;display:inline-block;}";
-  html += ".toggle input{opacity:0;width:0;height:0;}";
-  html += ".toggle span{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#c9c9c9;border-radius:999px;transition:0.2s;}";
-  html += ".toggle span:before{content:'';position:absolute;height:16px;width:16px;left:2px;top:2px;background:#fff;border-radius:50%;transition:0.2s;}";
-  html += ".toggle input:checked + span{background:#0b6b6f;}";
-  html += ".toggle input:checked + span:before{transform:translateX(16px);}";
-  html += ".chev{display:inline-block;margin-right:8px;font-size:14px;transition:transform 0.2s ease;}";
-  html += "details[open] .chev{transform:rotate(90deg);}";
-  html += ".chev{display:inline-block;margin-right:8px;font-size:14px;transition:transform 0.2s ease;}";
-  html += "details[open] .chev{transform:rotate(90deg);}";
-  html += "summary::-webkit-details-marker{display:none;}";
-  html += ".trigger-title{font-weight:600;}";
-  html += ".toggle{position:relative;width:36px;height:20px;display:inline-block;}";
-  html += ".toggle input{opacity:0;width:0;height:0;}";
-  html += ".toggle span{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#c9c9c9;border-radius:999px;transition:0.2s;}";
-  html += ".toggle span:before{content:'';position:absolute;height:16px;width:16px;left:2px;top:2px;background:#fff;border-radius:50%;transition:0.2s;}";
-  html += ".toggle input:checked + span{background:#0b6b6f;}";
-  html += ".toggle input:checked + span:before{transform:translateX(16px);}";
-  html += ".trigger-actions{display:flex;gap:6px;align-items:center;}";
-  html += ".icon-btn{border:1px solid #b9b9b9;background:#fff;color:#222;padding:4px 8px;border-radius:6px;cursor:pointer;}";
-  html += "input,select{width:100%;max-width:320px;padding:6px 8px;margin:2px 0 8px;border:1px solid #cfcfcf;border-radius:6px;background:#fff;}";
-  html += ".time-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:4px 0 8px;}";
-  html += ".time-row label{min-width:90px;color:#444;}";
-  html += ".time-row input,.time-row select{width:auto;min-width:170px;max-width:240px;}";
-  html += ".day-pills{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 4px;}";
-  html += ".day-pill{display:flex;align-items:center;gap:6px;border:1px solid #d6d6d6;border-radius:999px;padding:4px 10px;font-size:13px;background:#f9f9f9;}";
-  html += "button{border:1px solid #b9b9b9;background:#fff;color:#222;padding:6px 10px;border-radius:8px;cursor:pointer;}";
-  html += "button.primary{background:var(--accent);color:#fff;border-color:var(--accent);}";
-  html += "button.danger{background:var(--danger);color:#fff;border-color:var(--danger);}";
-  html += "small{color:var(--muted);}";
-  html += "#pin_help_modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);}";
-  html += "#pin_help_modal .modal{background:#fff;color:#000;max-width:520px;margin:10% auto;padding:16px;border-radius:12px;box-shadow:0 12px 30px rgba(0,0,0,0.2);}";
-  html += "</style></head><body>";
-  html += "<div class='page'>";
-  html += "<div class='header'>";
-  html += "<div class='title'>StageMod</div>";
-  html += "<div class='actions'>";
-  html += "<a href='https://github.com/OLIMEX/ESP32-POE/blob/master/DOCUMENTS/ESP32-POE-PINOUT.png' class='nav-pill'>Board Pin Help</a>";
-  html += "<a href='/logs' class='nav-pill'>Serial Log</a>";
-  html += "<a href='/settings' class='nav-primary'>Settings</a>";
-  html += "</div></div>";
-
-  html += "<div class='status'>";
-  html += "<div>IP: " + getLocalIp().toString() + "</div>";
-  html += "<div>mDNS: http://" + config.hostname + ".local/</div>";
-  html += "</div>";
-
-  bool anyConflict = false;
-  for (int i = 0; i < MAX_TRIGGERS; i++) {
-    if (hasPinConflict(i)) {
-      anyConflict = true;
-      break;
-    }
-  }
-  if (anyConflict) {
-    html += "<p style='color:#b00;'>Pin conflict detected: two triggers share the same GPIO.</p>";
-  }
-
-  html += "<form method='POST' action='/triggers'>";
-
-  for (int tIndex = 0; tIndex < config.triggerCount; tIndex++) {
-    int i = config.triggerOrder[tIndex];
-    SensorConfig& s = config.sensors[i];
-    String idx = String(i);
-
-    html += "<details data-trigger='" + String(idx) + "'>";
-    html += "<summary>";
-    html += "<span style='display:flex;align-items:center;gap:10px;'>";
-    html += "<span class='chev'>&#9654;</span>";
-    html += "<label class='toggle' title='Enable trigger'>";
-    html += "<input name='s" + idx + "_en' type='checkbox' " + String(s.enabled ? "checked" : "") + ">";
-    html += "<span></span></label>";
-    html += "<span class='trigger-title'>" + s.name + "</span>";
-    html += "</span>";
-    html += "<span class='trigger-actions'>";
-    html += "<button type='submit' name='action' value='up:" + idx + "' class='icon-btn'>&uarr;</button>";
-    html += "<button type='submit' name='action' value='down:" + idx + "' class='icon-btn'>&darr;</button>";
-    html += "<button type='submit' name='action' value='remove:" + idx + "' class='icon-btn'>×</button>";
-    html += "</span></summary>";
-    html += "<div style='padding:0 12px 12px;'>";
-    html += "<input type='hidden' name='s" + idx + "_present' value='1'>";
-    html += "<!-- Enable toggle moved to header -->";
-    html += "Name: <input name='s" + idx + "_name' type='text' value='" + s.name + "'><br>";
-
-    html += "<div class='card'><b>Input</b><br>";
-    html += "Source: <select name='s" + idx + "_src' id='s" + idx + "_src'>";
-    html += "<option value='0' " + String(s.source == SRC_SENSORS ? "selected" : "") + ">Sensors</option>";
-    html += "<option value='1' " + String(s.source == SRC_TIME ? "selected" : "") + ">Time</option>";
-    html += "<option value='2' " + String(s.source == SRC_OSC ? "selected" : "") + ">OSC In</option>";
-    html += "</select><br>";
-    html += "<div id='s" + idx + "_type_block'>Type: <select name='s" + idx + "_type' id='s" + idx + "_type'>";
-    html += "<option value='1' " + String(s.type == SENSOR_BUTTON ? "selected" : "") + ">Button (momentary)</option>";
-    html += "<option value='2' " + String(s.type == SENSOR_TOGGLE ? "selected" : "") + ">Button (toggle)</option>";
-    html += "<option value='5' " + String(s.type == SENSOR_BUTTON_DOUBLE ? "selected" : "") + ">Button (double click)</option>";
-    html += "<option value='6' " + String(s.type == SENSOR_BUTTON_TRIPLE ? "selected" : "") + ">Button (triple click)</option>";
-    html += "<option value='7' " + String(s.type == SENSOR_BUTTON_LONG ? "selected" : "") + ">Button (long press)</option>";
-    html += "<option value='8' " + String(s.type == SENSOR_GPIO ? "selected" : "") + ">GPIO (input)</option>";
-    html += "<option value='9' " + String(s.type == SENSOR_HCSR04 ? "selected" : "") + ">Ultrasonic (HC-SR04)</option>";
-    html += "<option value='0' " + String(s.type == SENSOR_ANALOG ? "selected" : "") + ">Analog (pot/slider)</option>";
-    html += "<option value='4' " + String(s.type == SENSOR_ENCODER ? "selected" : "") + ">Encoder</option>";
-    html += "</select><br></div>";
-    html += "<div id='s" + idx + "_pin_block'>";
-    html += "GPIO Pin: <input name='s" + idx + "_pin' type='number' value='" + String(s.pin) + "'><br>";
-    html += "<small>Analog pins allowed: 32,35,36. Digital pins allowed: 5,13,16,17,18,19,21,22,23,25,26,27,32,33,35,36,39</small><br>";
-    html += "</div>";
-    html += "<div id='s" + idx + "_hcsr04'>";
-    html += "<b>HC-SR04</b><br>";
-    html += "Trig pin: <input name='s" + idx + "_hc_t' type='number' value='" + String(s.hcTrigPin) + "'><br>";
-    html += "Echo pin: <input name='s" + idx + "_hc_e' type='number' value='" + String(s.hcEchoPin) + "'><br>";
-    html += "Min cm: <input name='s" + idx + "_hc_min' type='number' step='0.1' value='" + String(s.hcMinCm, 1) + "'><br>";
-    html += "Max cm: <input name='s" + idx + "_hc_max' type='number' step='0.1' value='" + String(s.hcMaxCm, 1) + "'><br>";
-    html += "<small>Tip: set Min higher than Max to invert.</small><br>";
-    html += "</div>";
-    html += "<div id='s" + idx + "_analog'>";
-    html += "Invert: <input name='s" + idx + "_inv' type='checkbox' " + String(s.invert ? "checked" : "") + "><br>";
-    html += "</div>";
-    html += "<div id='s" + idx + "_digital'>";
-    html += "Active high: <input id='s" + idx + "_ah' name='s" + idx + "_ah' type='checkbox' " + String(s.activeHigh ? "checked" : "") + "><br>";
-    html += "Use pullup: <input name='s" + idx + "_pu' type='checkbox' " + String(s.pullup ? "checked" : "") + "><br>";
-    html += "<small>Button to GND: pullup ON, active high OFF. Button to 3.3V: pullup OFF, active high ON.</small><br>";
-    html += "</div>";
-    html += "<div id='s" + idx + "_cooldown'>";
-    html += "<b>Cooldown</b><br>";
-    html += "Enabled: <input name='s" + idx + "_cd_en' type='checkbox' " + String(s.cooldownEnabled ? "checked" : "") + "><br>";
-    html += "Cooldown ms: <input name='s" + idx + "_cd_ms' type='number' value='" + String(s.cooldownMs) + "'><br>";
-    html += "<small>Limits how often the trigger can fire. Applies to all outputs.</small><br>";
-    html += "</div>";
-    html += "<div id='s" + idx + "_encoder'>";
-    html += "<b>Encoder</b><br>";
-    html += "CLK pin: <input name='s" + idx + "_clk' type='number' value='" + String(s.encClkPin) + "'><br>";
-    html += "DT pin: <input name='s" + idx + "_dt' type='number' value='" + String(s.encDtPin) + "'><br>";
-    html += "SW pin: <input name='s" + idx + "_sw' type='number' value='" + String(s.encSwPin) + "'><br>";
-    html += "Append /+/- to address: <input name='s" + idx + "_enc_app' type='checkbox' " + String(s.encAppendSign ? "checked" : "") + "><br>";
-    html += "Insert +/- as 1st arg: <input name='s" + idx + "_enc_arg' type='checkbox' " + String(s.encSignArg ? "checked" : "") + "><br>";
-    html += "Invert direction: <input name='s" + idx + "_enc_inv' type='checkbox' " + String(s.encInvert ? "checked" : "") + "><br>";
-    html += "<small>Encoder step sends relative changes. Use options above for QLab/Resolume.</small><br>";
-    html += "</div>";
-
-    html += "<div id='s" + idx + "_oscin'>";
-    html += "<b>OSC In</b><br>";
-    html += "Address pattern: <input name='s" + idx + "_osia' type='text' value='" + s.oscInAddress + "' placeholder='/trigger/*'><br>";
-    html += "Argument type: <select name='s" + idx + "_osit' id='s" + idx + "_osit'>";
-    html += "<option value='0' " + String(s.oscInArgType == OSC_IN_ARG_ANY ? "selected" : "") + ">Any / none</option>";
-    html += "<option value='1' " + String(s.oscInArgType == OSC_IN_ARG_INT ? "selected" : "") + ">Int</option>";
-    html += "<option value='2' " + String(s.oscInArgType == OSC_IN_ARG_FLOAT ? "selected" : "") + ">Float</option>";
-    html += "<option value='3' " + String(s.oscInArgType == OSC_IN_ARG_STRING ? "selected" : "") + ">String</option>";
-    html += "</select><br>";
-    html += "Match mode: <select name='s" + idx + "_osim' id='s" + idx + "_osim'>";
-    html += "<option value='0' " + String(s.oscInMatchMode == OSC_IN_MATCH_ANY ? "selected" : "") + ">Any value</option>";
-    html += "<option value='1' " + String(s.oscInMatchMode == OSC_IN_MATCH_EQUAL ? "selected" : "") + ">Equals</option>";
-    html += "<option value='2' " + String(s.oscInMatchMode == OSC_IN_MATCH_RANGE ? "selected" : "") + ">Range</option>";
-    html += "</select><br>";
-    html += "<div id='s" + idx + "_osiv_row'>Value: <input name='s" + idx + "_osiv' type='number' step='0.001' value='" + String(s.oscInValue, 3) + "'><br></div>";
-    html += "<div id='s" + idx + "_osir_row'>Min: <input name='s" + idx + "_osmn' type='number' step='0.001' value='" + String(s.oscInMin, 3) + "'><br>Max: <input name='s" + idx + "_osmx' type='number' step='0.001' value='" + String(s.oscInMax, 3) + "'><br></div>";
-    html += "<div id='s" + idx + "_osis_row'>String: <input name='s" + idx + "_osis' type='text' value='" + s.oscInString + "'><br></div>";
-    html += "<small>Wildcard '*' supported. Examples: /go, /qlab/*</small><br>";
-    html += "</div>";
-
-    html += "<div id='s" + idx + "_time_block'>";
-    html += "<small>Current time: " + formatTimeLocal() + "</small><br>";
-    html += "<div class='time-row'><label>Time type</label><select name='s" + idx + "_tt' id='s" + idx + "_tt'>";
-    html += "<option value='0' " + String(s.timeType == TIME_ONCE ? "selected" : "") + ">Date and Time</option>";
-    html += "<option value='1' " + String(s.timeType == TIME_DAILY ? "selected" : "") + ">Daily</option>";
-    html += "<option value='2' " + String(s.timeType == TIME_WEEKLY ? "selected" : "") + ">Weekly</option>";
-    html += "<option value='3' " + String(s.timeType == TIME_INTERVAL ? "selected" : "") + ">Every X</option>";
-    html += "</select></div>";
-    html += "<div id='s" + idx + "_time_once'>";
-    html += "<div class='time-row'><label>Date</label><input name='s" + idx + "_date' type='date' value='" + String(s.timeYear) + "-" + (s.timeMonth < 10 ? "0" : "") + String(s.timeMonth) + "-" + (s.timeDay < 10 ? "0" : "") + String(s.timeDay) + "'></div>";
-    html += "<div class='time-row'><label>Time</label><input name='s" + idx + "_time' type='time' step='1' value='" + (s.timeHour < 10 ? "0" : "") + String(s.timeHour) + ":" + (s.timeMinute < 10 ? "0" : "") + String(s.timeMinute) + ":" + (s.timeSecond < 10 ? "0" : "") + String(s.timeSecond) + "'></div>";
-    html += "</div>";
-    html += "<div id='s" + idx + "_time_daily'>";
-    html += "<div class='time-row'><label>Time</label><input name='s" + idx + "_time_daily' type='time' step='1' value='" + (s.timeHour < 10 ? "0" : "") + String(s.timeHour) + ":" + (s.timeMinute < 10 ? "0" : "") + String(s.timeMinute) + ":" + (s.timeSecond < 10 ? "0" : "") + String(s.timeSecond) + "'></div>";
-    html += "</div>";
-    html += "<div id='s" + idx + "_time_weekly'>";
-    html += "<div class='time-row'><label>Days</label></div>";
-    html += "<div class='day-pills'>";
-    const char* days[7] = {"Su","Mo","Tu","We","Th","Fr","Sa"};
-    for (int d = 0; d < 7; d++) {
-      bool checked = (s.weeklyMask & (1 << d)) != 0;
-      html += "<label class='day-pill'><input type='checkbox' name='s" + idx + "_w" + String(d) + "' " + String(checked ? "checked" : "") + "> " + days[d] + "</label>";
-    }
-    html += "</div>";
-    html += "<div class='time-row'><label>Time</label><input name='s" + idx + "_time_weekly' type='time' step='1' value='" + (s.timeHour < 10 ? "0" : "") + String(s.timeHour) + ":" + (s.timeMinute < 10 ? "0" : "") + String(s.timeMinute) + ":" + (s.timeSecond < 10 ? "0" : "") + String(s.timeSecond) + "'></div>";
-    html += "</div>";
-    uint32_t intervalSec = s.intervalSeconds;
-    String intervalUnit = (intervalSec % 3600 == 0) ? "hours" : "minutes";
-    uint32_t intervalValue = (intervalUnit == "hours") ? (intervalSec / 3600) : (intervalSec / 60);
-    if (intervalValue == 0) intervalValue = 1;
-    html += "<div id='s" + idx + "_time_interval'>";
-    html += "<div class='time-row'><label>Every</label><input name='s" + idx + "_interval_val' type='number' min='1' value='" + String(intervalValue) + "' style='max-width:120px;'> ";
-    html += "<select name='s" + idx + "_interval_unit'>";
-    html += "<option value='minutes' " + String(intervalUnit == "minutes" ? "selected" : "") + ">minutes</option>";
-    html += "<option value='hours' " + String(intervalUnit == "hours" ? "selected" : "") + ">hours</option>";
-    html += "</select></div>";
-    html += "</div>";
-    html += "</div>";
-    html += "</div>";
-
-    html += "<div class='card'><b>Output</b><br>";
-    for (int o = 0; o < s.outputCount; o++) {
-      const SensorConfig::OutputConfig& out = s.outputs[o];
-      String oidx = String(o);
-      html += "<div class='card' style='background:#f9f9f9;border-color:#ddd;'>";
-      html += "<div style='display:flex;align-items:center;justify-content:space-between;gap:8px;'>";
-      html += "<b>Output " + String(o + 1) + "</b>";
-      if (o > 0) {
-        html += "<button type='submit' name='action' value='out_remove:" + idx + ":" + oidx + "' class='icon-btn'>×</button>";
-      }
-      html += "</div>";
-      html += "<input type='hidden' name='s" + idx + "_o" + oidx + "_present' value='1'>";
-      html += "Output: <select name='s" + idx + "_o" + oidx + "_tgt' id='s" + idx + "_o" + oidx + "_tgt'>";
-      html += "<option value='0' " + String(out.target == OUT_TARGET_OSC ? "selected" : "") + ">OSC Out</option>";
-      html += "<option value='3' " + String(out.target == OUT_TARGET_UDP ? "selected" : "") + ">UDP Raw</option>";
-      html += "<option value='4' " + String(out.target == OUT_TARGET_GPIO ? "selected" : "") + ">GPIO Out</option>";
-      html += "<option value='7' " + String(out.target == OUT_TARGET_DMX ? "selected" : "") + ">DMX Net Out</option>";
-      html += "<option value='8' " + String(out.target == OUT_TARGET_DMX_PRESET ? "selected" : "") + ">DMX Preset</option>";
-      html += "<option value='5' " + String(out.target == OUT_TARGET_HTTP ? "selected" : "") + ">HTTP Webhook</option>";
-      html += "<option value='6' " + String(out.target == OUT_TARGET_MQTT ? "selected" : "") + ">MQTT Out</option>";
-      html += "<option value='2' " + String(out.target == OUT_TARGET_RESET_COOLDOWNS ? "selected" : "") + ">Reset Cooldowns</option>";
-      html += "<option value='1' " + String(out.target == OUT_TARGET_REBOOT ? "selected" : "") + ">Reboot Device</option>";
-      html += "</select><br>";
-      html += "<div id='s" + idx + "_o" + oidx + "_dev_block'>";
-      html += "Device: <select name='s" + idx + "_o" + oidx + "_dev' id='s" + idx + "_o" + oidx + "_dev'>";
-      appendOscDeviceOptions(html, out.device);
-      html += "</select><br>";
-      html += "</div>";
-      html += "<div id='s" + idx + "_o" + oidx + "_osc_out'>";
-      html += "<div id='s" + idx + "_o" + oidx + "_addr_block'>";
-      html += "OSC address: <input id='s" + idx + "_o" + oidx + "_addr' name='s" + idx + "_o" + oidx + "_addr' type='text' value='" + out.oscAddress + "'><br>";
-      html += "</div>";
-      html += "<div id='s" + idx + "_o" + oidx + "_enc_addr'>";
-      html += "Encoder address: <input name='s" + idx + "_o" + oidx + "_enc_addr' type='text' value='" + out.oscAddress + "'><br>";
-      html += "</div>";
-      html += "Argument type: <select name='s" + idx + "_o" + oidx + "_omode' id='s" + idx + "_o" + oidx + "_omode'>";
-      html += "<option value='0' " + String(out.outMode == OUT_INT ? "selected" : "") + ">Int</option>";
-      html += "<option value='1' " + String(out.outMode == OUT_FLOAT ? "selected" : "") + ">Float</option>";
-      html += "<option value='2' id='s" + idx + "_o" + oidx + "_opt_string' " + String(out.outMode == OUT_STRING ? "selected" : "") + ">String</option>";
-      html += "</select><br>";
-      html += "<div id='s" + idx + "_o" + oidx + "_minrel_slot_main'></div>";
-      html += "<div id='s" + idx + "_o" + oidx + "_minrel'>";
-      html += "Send max on press only: <input id='s" + idx + "_o" + oidx + "_smin' name='s" + idx + "_o" + oidx + "_smin' type='checkbox' " + String(!out.sendMinOnRelease ? "checked" : "") + "><br>";
-      html += "</div>";
-      String mainStrStyle = (s.type == SENSOR_ENCODER || out.outMode != OUT_STRING) ? " style='display:none;'" : "";
-      html += "<div id='s" + idx + "_o" + oidx + "_string'" + mainStrStyle + ">";
-      html += "<div id='s" + idx + "_o" + oidx + "_offrow'>Off string: <input name='s" + idx + "_o" + oidx + "_off' type='text' value='" + out.offString + "'><button type='button' class='icon-btn' data-idx='" + idx + "' data-oidx='" + oidx + "' data-test='min' onclick='sendOutputTest(" + idx + "," + oidx + ",\"min\");return false;'>Test</button><br></div>";
-      html += "<div id='s" + idx + "_o" + oidx + "_onrow'>On string: <input name='s" + idx + "_o" + oidx + "_on' type='text' value='" + out.onString + "'><button type='button' class='icon-btn' data-idx='" + idx + "' data-oidx='" + oidx + "' data-test='max' onclick='sendOutputTest(" + idx + "," + oidx + ",\"max\");return false;'>Test</button><br></div>";
-      html += "</div>";
-      html += "</div>";
-      html += "<div id='s" + idx + "_o" + oidx + "_range'>";
-      bool hideMainMin = (s.type == SENSOR_ENCODER) || (out.outMode == OUT_STRING) || (!out.sendMinOnRelease);
-      String mainMinStyle = hideMainMin ? " style='display:none;'" : "";
-      html += "<div id='s" + idx + "_o" + oidx + "_minrow'" + mainMinStyle + ">Output min: <input name='s" + idx + "_o" + oidx + "_omin' type='number' step='0.001' value='" + String(out.outMin, 3) + "'><button type='button' class='icon-btn' data-idx='" + idx + "' data-oidx='" + oidx + "' data-test='min' onclick='sendOutputTest(" + idx + "," + oidx + ",\"min\");return false;'>Test</button><br></div>";
-      html += "<span id='s" + idx + "_o" + oidx + "_omax_label'>Output max</span>: <input name='s" + idx + "_o" + oidx + "_omax' type='number' step='0.001' value='" + String(out.outMax, 3) + "'><button type='button' class='icon-btn' data-idx='" + idx + "' data-oidx='" + oidx + "' data-test='max' onclick='sendOutputTest(" + idx + "," + oidx + ",\"max\");return false;'>Test</button><br>";
-      html += "</div>";
-      html += "<div id='s" + idx + "_o" + oidx + "_btn_block'>";
-      html += "<div id='s" + idx + "_o" + oidx + "_button_addr'>";
-      html += "Button address: <input name='s" + idx + "_o" + oidx + "_btn_addr' type='text' value='" + out.buttonAddress + "'><br>";
-      html += "</div>";
-      html += "Button argument type: <select name='s" + idx + "_o" + oidx + "_bmode' id='s" + idx + "_o" + oidx + "_bmode'>";
-      html += "<option value='0' " + String(out.buttonOutMode == OUT_INT ? "selected" : "") + ">Int</option>";
-      html += "<option value='1' " + String(out.buttonOutMode == OUT_FLOAT ? "selected" : "") + ">Float</option>";
-      html += "<option value='2' " + String(out.buttonOutMode == OUT_STRING ? "selected" : "") + ">String</option>";
-      html += "</select><br>";
-      html += "<div id='s" + idx + "_o" + oidx + "_minrel_slot_btn'></div>";
-      String bStrStyle = (out.buttonOutMode == OUT_STRING) ? "" : " style='display:none;'";
-      html += "<div id='s" + idx + "_o" + oidx + "_bstring'" + bStrStyle + ">";
-      html += "<div id='s" + idx + "_o" + oidx + "_boffrow'>Off string: <input name='s" + idx + "_o" + oidx + "_boff' type='text' value='" + out.buttonOffString + "'><button type='button' class='icon-btn' data-idx='" + idx + "' data-oidx='" + oidx + "' data-test='bmin' onclick='sendOutputTest(" + idx + "," + oidx + ",\"bmin\");return false;'>Test</button><br></div>";
-      html += "<div id='s" + idx + "_o" + oidx + "_bonrow'>On string: <input name='s" + idx + "_o" + oidx + "_bon' type='text' value='" + out.buttonOnString + "'><button type='button' class='icon-btn' data-idx='" + idx + "' data-oidx='" + oidx + "' data-test='bmax' onclick='sendOutputTest(" + idx + "," + oidx + ",\"bmax\");return false;'>Test</button><br></div>";
-      html += "</div>";
-      String bRangeStyle = (out.buttonOutMode == OUT_STRING) ? " style='display:none;'" : "";
-      html += "<div id='s" + idx + "_o" + oidx + "_brange'" + bRangeStyle + ">";
-      bool hideBtnMin = (!out.sendMinOnRelease) || (out.buttonOutMode == OUT_STRING);
-      String bMinStyle = hideBtnMin ? " style='display:none;'" : "";
-      html += "<div id='s" + idx + "_o" + oidx + "_bminrow'" + bMinStyle + ">Output min: <input name='s" + idx + "_o" + oidx + "_bmin' type='number' step='0.001' value='" + String(out.buttonOutMin, 3) + "'><button type='button' class='icon-btn' data-idx='" + idx + "' data-oidx='" + oidx + "' data-test='bmin' onclick='sendOutputTest(" + idx + "," + oidx + ",\"bmin\");return false;'>Test</button><br></div>";
-      html += "Output max: <input name='s" + idx + "_o" + oidx + "_bmax' type='number' step='0.001' value='" + String(out.buttonOutMax, 3) + "'><button type='button' class='icon-btn' data-idx='" + idx + "' data-oidx='" + oidx + "' data-test='bmax' onclick='sendOutputTest(" + idx + "," + oidx + ",\"bmax\");return false;'>Test</button><br>";
-      html += "</div>";
-      html += "</div>";
-      html += "<div id='s" + idx + "_o" + oidx + "_udp_block'>";
-      html += "UDP payload: <input name='s" + idx + "_o" + oidx + "_udp' type='text' value='" + out.udpPayload + "'><button type='button' class='icon-btn' data-idx='" + idx + "' data-oidx='" + oidx + "' data-test='udp' onclick='sendOutputTest(" + idx + "," + oidx + ",\"udp\");return false;'>Test</button><br>";
-      html += "</div>";
-      html += "<div id='s" + idx + "_o" + oidx + "_dmx_block'>";
-      html += "Protocol: <select name='s" + idx + "_o" + oidx + "_dmxp' id='s" + idx + "_o" + oidx + "_dmxp'>";
-      html += "<option value='0' " + String(out.dmxProtocol == DMX_PROTO_ARTNET ? "selected" : "") + ">Art-Net</option>";
-      html += "<option value='1' " + String(out.dmxProtocol == DMX_PROTO_SACN ? "selected" : "") + ">sACN (E1.31)</option>";
-      html += "</select><br>";
-      html += "Destination: <select name='s" + idx + "_o" + oidx + "_dmxd' id='s" + idx + "_o" + oidx + "_dmxd'>";
-      html += "<option value='0' " + String(out.dmxDest == DMX_DEST_AUTO ? "selected" : "") + ">Auto (Broadcast/Multicast)</option>";
-      html += "<option value='1' " + String(out.dmxDest == DMX_DEST_UNICAST ? "selected" : "") + ">Unicast (use Network client)</option>";
-      html += "</select><br>";
-      html += "<div id='s" + idx + "_o" + oidx + "_dmx_artnet'>";
-      html += "Net: <input name='s" + idx + "_o" + oidx + "_dmxn' type='number' min='0' max='127' value='" + String(out.dmxArtNet) + "' style='max-width:90px;'><br>";
-      html += "Subnet: <input name='s" + idx + "_o" + oidx + "_dmxs' type='number' min='0' max='15' value='" + String(out.dmxArtSubnet) + "' style='max-width:90px;'><br>";
-      html += "Universe: <input name='s" + idx + "_o" + oidx + "_dmxa' type='number' min='0' max='15' value='" + String(out.dmxArtUniverse) + "' style='max-width:90px;'><br>";
-      html += "</div>";
-      html += "<div id='s" + idx + "_o" + oidx + "_dmx_sacn'>";
-      html += "Universe: <input name='s" + idx + "_o" + oidx + "_dmxu' type='number' min='1' max='63999' value='" + String(out.dmxUniverse) + "' style='max-width:120px;'><br>";
-      html += "</div>";
-      html += "<div id='s" + idx + "_o" + oidx + "_dmx_channels'>";
-      html += "Channels: <input name='s" + idx + "_o" + oidx + "_dmxc' type='text' value='" + out.dmxChannels + "' placeholder='1,5,10-20'><br>";
-      html += "</div>";
-      html += "<div id='s" + idx + "_o" + oidx + "_dmx_preset'>";
-      html += "Preset: <input name='s" + idx + "_o" + oidx + "_dmxpr' type='number' min='1' max='" + String(MAX_DMX_PRESETS) + "' value='" + String(out.dmxPreset) + "' style='max-width:120px;'><br>";
-      html += "Fade ms: <input name='s" + idx + "_o" + oidx + "_dmxfd' type='number' min='0' max='600000' value='" + String(out.dmxFadeMs) + "' style='max-width:140px;'><button type='button' class='icon-btn' data-idx='" + idx + "' data-oidx='" + oidx + "' data-test='dmxpreset' onclick='sendOutputTest(" + idx + "," + oidx + ",\"dmxpreset\");return false;'>Test</button><br>";
-      html += "</div>";
-      html += "<div class='helper'>Art-Net uses Net/Subnet/Universe (0-based). sACN uses Universe (1-based). Preset editor supports universes 1-" + String(MAX_DMX_PRESET_UNIVERSE) + ".</div>";
-      html += "</div>";
-      html += "<div id='s" + idx + "_o" + oidx + "_http_block'>";
-      html += "Method: <select name='s" + idx + "_o" + oidx + "_hm'>";
-      html += "<option value='0' " + String(out.httpMethod == HTTPM_GET ? "selected" : "") + ">GET</option>";
-      html += "<option value='1' " + String(out.httpMethod == HTTPM_POST ? "selected" : "") + ">POST</option>";
-      html += "</select><br>";
-      html += "Network client: <select name='s" + idx + "_o" + oidx + "_hdev' id='s" + idx + "_o" + oidx + "_hdev'>";
-      for (int d = 0; d < config.oscDeviceCount; d++) {
-        int didx = config.oscDeviceOrder[d];
-        const OscDevice& dev = config.oscDevices[didx];
-        String label = dev.name + " (" + ipToString(dev.ip) + ":" + String(dev.port) + ")";
-        html += "<option value='" + String(didx) + "' data-ip='" + ipToString(dev.ip) + "' data-port='" + String(dev.port) + "' " + String(out.httpDevice == didx ? "selected" : "") + ">" + label + "</option>";
-      }
-      html += "<option value='255' " + String(out.httpDevice == 255 ? "selected" : "") + ">Custom...</option>";
-      html += "</select><br>";
-      html += "Host/IP: <input name='s" + idx + "_o" + oidx + "_hip' type='text' value='" + out.httpIp + "' placeholder='wled.local'><br>";
-      html += "Port: <input name='s" + idx + "_o" + oidx + "_hpt' type='number' value='" + String(out.httpPort) + "' style='max-width:120px;'><br>";
-      html += "URL: <input name='s" + idx + "_o" + oidx + "_hu' type='text' value='" + out.httpUrl + "' placeholder='http://{ip}:{port}/win&A={value}'><br>";
-      html += "<div id='s" + idx + "_o" + oidx + "_http_body'>Body: <input name='s" + idx + "_o" + oidx + "_hb' type='text' value='" + out.httpBody + "' placeholder='{value}'></div>";
-      html += "<div class='helper'>Tokens: {value}, {ip}, {port} (case-insensitive). Example: http://{ip}/win&A={value} (0-255).</div>";
-      html += "</div>";
-      html += "<div id='s" + idx + "_o" + oidx + "_mqtt_block'>";
-      html += "MQTT topic: <input name='s" + idx + "_o" + oidx + "_mt' type='text' value='" + out.mqttTopic + "' placeholder='stagemod/{TriggerName}/output/1'><br>";
-      html += "MQTT payload: <input name='s" + idx + "_o" + oidx + "_mp' type='text' value='" + out.mqttPayload + "' placeholder='{value}'><button type='button' class='icon-btn' data-idx='" + idx + "' data-oidx='" + oidx + "' data-test='mqtt' onclick='sendOutputTest(" + idx + "," + oidx + ",\"mqtt\");return false;'>Test</button><br>";
-      html += "Retain: <input name='s" + idx + "_o" + oidx + "_mr' type='checkbox' " + String(out.mqttRetain ? "checked" : "") + "><br>";
-      html += "<div class='helper'>Tokens: {value}, {norm}, {state}</div>";
-      html += "</div>";
-      html += "<div id='s" + idx + "_o" + oidx + "_gpio_block'>";
-      html += "GPIO pin: <input name='s" + idx + "_o" + oidx + "_gpin' type='number' min='0' max='39' value='" + String(out.gpioPin) + "' style='max-width:100px;'> ";
-      html += "<small>Output pins allowed: 5,13,16,17,18,19,21,22,23,25,26,27,32,33 (use a pin not used by inputs)</small><br>";
-      html += "Mode: <select name='s" + idx + "_o" + oidx + "_gmode' id='s" + idx + "_o" + oidx + "_gmode'>";
-      html += "<option value='0' " + String(out.gpioMode == GPIO_OUT_HIGH ? "selected" : "") + ">Level</option>";
-      html += "<option value='2' " + String(out.gpioMode == GPIO_OUT_PULSE ? "selected" : "") + ">Pulse</option>";
-      html += "<option value='3' " + String(out.gpioMode == GPIO_OUT_PWM ? "selected" : "") + ">PWM</option>";
-      html += "</select><br>";
-      html += "Invert: <input type='checkbox' name='s" + idx + "_o" + oidx + "_ginv' " + String(out.gpioInvert ? "checked" : "") + "><br>";
-      html += "<div id='s" + idx + "_o" + oidx + "_gpulse'>Pulse ms: <input name='s" + idx + "_o" + oidx + "_gpms' type='number' min='1' value='" + String(out.gpioPulseMs) + "' style='max-width:120px;'></div>";
-      html += "<div class='helper'>Level: LOW by default, goes HIGH while active. Invert flips it. Pulse: LOW then HIGH for duration (Invert pulses LOW). PWM uses output min/max as duty (0-255); Invert reverses duty.</div>";
-      html += "<button type='button' class='icon-btn' data-idx='" + idx + "' data-oidx='" + oidx + "' data-test='gpio' onclick='sendOutputTest(" + idx + "," + oidx + ",\"gpio\");return false;'>Test</button><br>";
-      html += "</div>";
-      html += "</div>";
-    }
-    html += "<button type='submit' name='action' value='out_add:" + idx + "' style='padding:6px 10px;font-size:13px;border:1px solid #b9b9b9;background:#fff;color:#222;border-radius:8px;cursor:pointer;'>Add Output</button>";
-    html += "</div>";
-
-    html += "</div></details>";
-  }
-
-  html += "<button type='submit' name='action' value='add' style='padding:8px 12px;font-size:14px;border:1px solid #b9b9b9;background:#fff;color:#222;border-radius:8px;cursor:pointer;'>Add Trigger</button>";
-  html += "<div style='height:14px;'></div>";
-  html += "<button type='submit' name='action' value='save' class='primary'>Save</button>";
-  html += "<script>";
-  html += "function updateTrigger(i){";
-  html += "const srcSel=document.getElementById('s'+i+'_src');";
-  html += "const tSel=document.getElementById('s'+i+'_type');";
-  html += "const typeBlock=document.getElementById('s'+i+'_type_block');";
-  html += "const oscinBlock=document.getElementById('s'+i+'_oscin');";
-  html += "const ositSel=document.getElementById('s'+i+'_osit');";
-  html += "const osimSel=document.getElementById('s'+i+'_osim');";
-  html += "const osivRow=document.getElementById('s'+i+'_osiv_row');";
-  html += "const osirRow=document.getElementById('s'+i+'_osir_row');";
-  html += "const osisRow=document.getElementById('s'+i+'_osis_row');";
-  html += "const ttSel=document.getElementById('s'+i+'_tt');";
-  html += "const src=srcSel?srcSel.value:'0';";
-  html += "const t=tSel? tSel.value : '0';";
-  html += "const a=document.getElementById('s'+i+'_analog');";
-  html += "const d=document.getElementById('s'+i+'_digital');";
-  html += "const pin=document.getElementById('s'+i+'_pin_block');";
-  html += "const enc=document.getElementById('s'+i+'_encoder');";
-  html += "const hc=document.getElementById('s'+i+'_hcsr04');";
-  html += "const cd=document.getElementById('s'+i+'_cooldown');";
-  html += "const timeBlock=document.getElementById('s'+i+'_time_block');";
-  html += "const timeOnce=document.getElementById('s'+i+'_time_once');";
-  html += "const timeDaily=document.getElementById('s'+i+'_time_daily');";
-  html += "const timeWeekly=document.getElementById('s'+i+'_time_weekly');";
-  html += "const timeInterval=document.getElementById('s'+i+'_time_interval');";
-  html += "const isSensor=(src==='0');";
-  html += "const isTime=(src==='1');";
-  html += "const isOscIn=(src==='2');";
-  html += "const isEnc=(isSensor && t==='4');";
-  html += "if(typeBlock){typeBlock.style.display=isSensor?'block':'none';}";
-  html += "if(oscinBlock){oscinBlock.style.display=isOscIn?'block':'none';}";
-  html += "if(isOscIn){";
-  html += "let mt=osimSel?osimSel.value:'0';";
-  html += "const at=ositSel?ositSel.value:'0';";
-  html += "if(at==='3' && mt==='2' && osimSel){osimSel.value='1';mt='1';}";
-  html += "if(osivRow){osivRow.style.display=(mt==='1' && at!=='3')?'block':'none';}";
-  html += "if(osirRow){osirRow.style.display=(mt==='2' && at!=='3')?'block':'none';}";
-  html += "if(osisRow){osisRow.style.display=(mt==='1' && at==='3')?'block':'none';}";
-  html += "}";
-  html += "if(timeBlock){timeBlock.style.display=isTime?'block':'none';}";
-  html += "if(ttSel){";
-  html += "const tt=ttSel.value;";
-  html += "if(timeOnce) timeOnce.style.display=(tt==='0')?'block':'none';";
-  html += "if(timeDaily) timeDaily.style.display=(tt==='1')?'block':'none';";
-  html += "if(timeWeekly) timeWeekly.style.display=(tt==='2')?'block':'none';";
-  html += "if(timeInterval) timeInterval.style.display=(tt==='3')?'block':'none';";
-  html += "}";
-  html += "if(a){a.style.display=(isSensor && t==='0')?'block':'none';}";
-  html += "if(d){d.style.display=(isSensor && t!=='0'&&!isEnc)?'block':'none';}";
-  html += "if(pin){pin.style.display=(isSensor && !isEnc && t!=='9')?'block':'none';}";
-  html += "if(enc){enc.style.display=(isSensor && isEnc)?'block':'none';}";
-  html += "if(hc){hc.style.display=(isSensor && t==='9')?'block':'none';}";
-  html += "if(cd){cd.style.display=(isSensor && (t==='1' || t==='8'))?'block':'none';}";
-  html += "for(let o=0;o<" + String(MAX_OUTPUTS_PER_TRIGGER) + ";o++){";
-  html += "const tgt=document.getElementById('s'+i+'_o'+o+'_tgt');";
-  html += "if(!tgt) continue;";
-  html += "const oscOut=document.getElementById('s'+i+'_o'+o+'_osc_out');";
-  html += "const devBlock=document.getElementById('s'+i+'_o'+o+'_dev_block');";
-  html += "const udpBlock=document.getElementById('s'+i+'_o'+o+'_udp_block');";
-  html += "const gpioBlock=document.getElementById('s'+i+'_o'+o+'_gpio_block');";
-  html += "const dmxBlock=document.getElementById('s'+i+'_o'+o+'_dmx_block');";
-  html += "const dmxProto=document.getElementById('s'+i+'_o'+o+'_dmxp');";
-  html += "const dmxDest=document.getElementById('s'+i+'_o'+o+'_dmxd');";
-  html += "const dmxArt=document.getElementById('s'+i+'_o'+o+'_dmx_artnet');";
-  html += "const dmxSacn=document.getElementById('s'+i+'_o'+o+'_dmx_sacn');";
-  html += "const dmxChannels=document.getElementById('s'+i+'_o'+o+'_dmx_channels');";
-  html += "const dmxPreset=document.getElementById('s'+i+'_o'+o+'_dmx_preset');";
-  html += "const httpBlock=document.getElementById('s'+i+'_o'+o+'_http_block');";
-  html += "const mqttBlock=document.getElementById('s'+i+'_o'+o+'_mqtt_block');";
-  html += "const httpBody=document.getElementById('s'+i+'_o'+o+'_http_body');";
-  html += "const httpDev=document.getElementById('s'+i+'_o'+o+'_hdev');";
-  html += "const httpIp=document.querySelector(\"input[name='s\"+i+\"_o\"+o+\"_hip']\");";
-  html += "const httpPort=document.querySelector(\"input[name='s\"+i+\"_o\"+o+\"_hpt']\");";
-  html += "const gmode=document.getElementById('s'+i+'_o'+o+'_gmode');";
-  html += "const gpulse=document.getElementById('s'+i+'_o'+o+'_gpulse');";
-  html += "const addrBlock=document.getElementById('s'+i+'_o'+o+'_addr_block');";
-  html += "const encAddr=document.getElementById('s'+i+'_o'+o+'_enc_addr');";
-  html += "const btnAddr=document.getElementById('s'+i+'_o'+o+'_button_addr');";
-  html += "const btnBlock=document.getElementById('s'+i+'_o'+o+'_btn_block');";
-  html += "const om=document.getElementById('s'+i+'_o'+o+'_omode');";
-  html += "const opt=document.getElementById('s'+i+'_o'+o+'_opt_string');";
-  html += "const range=document.getElementById('s'+i+'_o'+o+'_range');";
-  html += "const minRow=document.getElementById('s'+i+'_o'+o+'_minrow');";
-  html += "const minRel=document.getElementById('s'+i+'_o'+o+'_minrel');";
-  html += "const minRelSlotMain=document.getElementById('s'+i+'_o'+o+'_minrel_slot_main');";
-  html += "const minRelSlotBtn=document.getElementById('s'+i+'_o'+o+'_minrel_slot_btn');";
-  html += "const smin=document.getElementById('s'+i+'_o'+o+'_smin');";
-  html += "const str=document.getElementById('s'+i+'_o'+o+'_string');";
-  html += "const onRow=document.getElementById('s'+i+'_o'+o+'_onrow');";
-  html += "const offRow=document.getElementById('s'+i+'_o'+o+'_offrow');";
-  html += "const bmode=document.getElementById('s'+i+'_o'+o+'_bmode');";
-  html += "const bstring=document.getElementById('s'+i+'_o'+o+'_bstring');";
-  html += "const bonRow=document.getElementById('s'+i+'_o'+o+'_bonrow');";
-  html += "const boffRow=document.getElementById('s'+i+'_o'+o+'_boffrow');";
-  html += "const brange=document.getElementById('s'+i+'_o'+o+'_brange');";
-  html += "const bminrow=document.getElementById('s'+i+'_o'+o+'_bminrow');";
-  html += "const omaxLabel=document.getElementById('s'+i+'_o'+o+'_omax_label');";
-  html += "const ominInput=document.querySelector(\"input[name='s\"+i+\"_o\"+o+\"_omin']\");";
-  html += "const omaxInput=document.querySelector(\"input[name='s\"+i+\"_o\"+o+\"_omax']\");";
-  html += "const isOsc=(tgt.value==='0');";
-  html += "const isUdp=(tgt.value==='3');";
-  html += "const isGpio=(tgt.value==='4');";
-  html += "const isDmx=(tgt.value==='7');";
-  html += "const isDmxPreset=(tgt.value==='8');";
-  html += "const isDmxLike=(isDmx||isDmxPreset);";
-  html += "const dmxIsSacn=(isDmxLike && dmxProto && dmxProto.value==='1');";
-  html += "const dmxUnicast=(isDmxLike && dmxDest && dmxDest.value==='1');";
-  html += "const isHttp=(tgt.value==='5');";
-  html += "const isMqtt=(tgt.value==='6');";
-  html += "if(oscOut){oscOut.style.display=(isOsc||isHttp||isMqtt||isDmx)?'block':'none';}";
-  html += "if(devBlock){devBlock.style.display=(isOsc||isUdp||dmxUnicast)?'block':'none';}";
-  html += "if(udpBlock){udpBlock.style.display=isUdp?'block':'none';}";
-  html += "if(gpioBlock){gpioBlock.style.display=isGpio?'block':'none';}";
-  html += "if(dmxBlock){dmxBlock.style.display=isDmxLike?'block':'none';}";
-  html += "if(dmxArt){dmxArt.style.display=(isDmxLike && !dmxIsSacn)?'block':'none';}";
-  html += "if(dmxSacn){dmxSacn.style.display=(isDmxLike && dmxIsSacn)?'block':'none';}";
-  html += "if(dmxChannels){dmxChannels.style.display=isDmx?'block':'none';}";
-  html += "if(dmxPreset){dmxPreset.style.display=isDmxPreset?'block':'none';}";
-  html += "if(httpBlock){httpBlock.style.display=isHttp?'block':'none';}";
-  html += "if(mqttBlock){mqttBlock.style.display=isMqtt?'block':'none';}";
-  html += "if(omaxLabel){omaxLabel.textContent=isEnc?'Output':'Output max';}";
-  html += "if(minRel){";
-  html += "if(isEnc){if(minRelSlotBtn){minRelSlotBtn.appendChild(minRel);}}";
-  html += "else{if(minRelSlotMain){minRelSlotMain.appendChild(minRel);}}";
-  html += "}";
-  html += "if(httpBody&&isHttp){";
-  html += "const m=document.querySelector(\"select[name='s\"+i+\"_o\"+o+\"_hm']\");";
-  html += "if(m){httpBody.style.display=(m.value==='1')?'block':'none';}";
-  html += "}";
-  html += "if(isHttp && httpDev && httpIp && httpPort){";
-  html += "const applyHttpClient=()=>{";
-  html += "const opt=httpDev.options[httpDev.selectedIndex];";
-  html += "if(!opt){return;}";
-  html += "if(opt.value==='255'){httpIp.disabled=false;httpPort.disabled=false;return;}";
-  html += "const ip=opt.getAttribute('data-ip')||'';";
-  html += "const port=opt.getAttribute('data-port')||'';";
-  html += "httpIp.disabled=true;httpPort.disabled=true;";
-  html += "if(ip){httpIp.value=ip;}";
-  html += "if(port){httpPort.value=port;}";
-  html += "};";
-  html += "httpDev.onchange=applyHttpClient;applyHttpClient();";
-  html += "}";
-  html += "if(gpulse&&gmode){gpulse.style.display=(isGpio && gmode.value==='2')?'block':'none';}";
-  html += "if(isGpio && gmode && gmode.value==='3' && ominInput && omaxInput){";
-  html += "const omin=parseFloat(ominInput.value||'0');";
-  html += "const omax=parseFloat(omaxInput.value||'0');";
-  html += "if(omax<=100){omaxInput.value='255';}";
-  html += "if(omin<0||isNaN(omin)){ominInput.value='0';}";
-  html += "}";
-  html += "if(om){om.disabled=!(isOsc||isHttp||isMqtt||isDmx);}";
-  html += "if(om&&opt){";
-  html += "if(!(isOsc||isHttp||isMqtt||isDmx)){opt.disabled=true;}";
-  html += "else if(isEnc){";
-  html += "opt.disabled=true;";
-  html += "if(om.value==='2'){om.value='1';}";
-  html += "}else if(isDmx){";
-  html += "opt.disabled=true;";
-  html += "if(om.value==='2'){om.value='0';}";
-  html += "}else if(isSensor && t==='0'){";
-  html += "opt.disabled=true;";
-  html += "if(om.value==='2'){om.value='1';}";
-  html += "}else{";
-  html += "opt.disabled=false;";
-  html += "}";
-  html += "}";
-  html += "if(str&&om){";
-  html += "const showStr=((isOsc||isHttp||isMqtt||isDmx) && !isEnc && om.value==='2');";
-  html += "str.style.display=showStr?'block':'none';";
-  html += "if(offRow){offRow.style.display=(showStr && smin && smin.checked)?'none':'block';}";
-  html += "}";
-  html += "if(range&&om){range.style.display=((isOsc||isHttp||isMqtt||isDmx) && om.value!=='2')?'block':(isGpio && gmode && gmode.value==='3' ? 'block' : 'none');}";
-  html += "if(addrBlock){addrBlock.style.display=(isOsc && !isEnc)?'block':'none';}";
-  html += "if(encAddr){encAddr.style.display=(isOsc && isEnc)?'block':'none';}";
-  html += "if(btnAddr){btnAddr.style.display=(isOsc && isEnc)?'block':'none';}";
-  html += "if(btnBlock){btnBlock.style.display=(isOsc && isEnc)?'block':'none';}";
-  html += "if(minRel){";
-  html += "if(isOsc||isHttp||isMqtt||isDmx){minRel.style.display=(isEnc||!isSensor||t!=='0')?'block':'none';}";
-  html += "else{minRel.style.display='none';}";
-  html += "}";
-  html += "if(minRow&&smin&&om){";
-  html += "if(isOsc||isHttp||isMqtt||isDmx){";
-  html += "if(isEnc){minRow.style.display='none';}";
-  html += "else if(om.value==='2'){minRow.style.display='none';}";
-  html += "else{minRow.style.display=smin.checked?'none':'block';}";
-  html += "}else if(isGpio && gmode && gmode.value==='3'){minRow.style.display='block';}";
-  html += "else{minRow.style.display='none';}";
-  html += "}";
-  html += "if(bstring&&bmode){";
-  html += "const showBStr=(isOsc && isEnc && bmode.value==='2');";
-  html += "bstring.style.display=showBStr?'block':'none';";
-  html += "if(boffRow){boffRow.style.display=(showBStr && smin && smin.checked)?'none':'block';}";
-  html += "}";
-  html += "if(brange&&bmode){brange.style.display=(isOsc && isEnc && bmode.value!=='2')?'block':'none';}";
-  html += "if(bminrow&&smin&&bmode){";
-  html += "if(!(isOsc && isEnc)){bminrow.style.display='none';}";
-  html += "else if(bmode.value==='2'){bminrow.style.display='none';}";
-  html += "else{bminrow.style.display=smin.checked?'none':'block';}";
-  html += "}";
-  html += "}";
-  html += "}";
-  html += "";
-  html += "";
-  html += "for(let i=0;i<" + String(MAX_TRIGGERS) + ";i++){";
-  html += "const tSel=document.getElementById('s'+i+'_type');";
-  html += "const srcSel=document.getElementById('s'+i+'_src');";
-  html += "const ttSel=document.getElementById('s'+i+'_tt');";
-  html += "const ositSel=document.getElementById('s'+i+'_osit');";
-  html += "const osimSel=document.getElementById('s'+i+'_osim');";
-  html += "if(tSel){tSel.addEventListener('change',()=>updateTrigger(i));}";
-  html += "if(srcSel){srcSel.addEventListener('change',()=>updateTrigger(i));}";
-  html += "if(ttSel){ttSel.addEventListener('change',()=>updateTrigger(i));}";
-  html += "if(ositSel){ositSel.addEventListener('change',()=>updateTrigger(i));}";
-  html += "if(osimSel){osimSel.addEventListener('change',()=>updateTrigger(i));}";
-  html += "for(let o=0;o<" + String(MAX_OUTPUTS_PER_TRIGGER) + ";o++){";
-  html += "const om=document.getElementById('s'+i+'_o'+o+'_omode');";
-  html += "if(om){om.addEventListener('change',()=>updateTrigger(i));}";
-  html += "const bm=document.getElementById('s'+i+'_o'+o+'_bmode');";
-  html += "if(bm){bm.addEventListener('change',()=>updateTrigger(i));}";
-  html += "const ot=document.getElementById('s'+i+'_o'+o+'_tgt');";
-  html += "if(ot){ot.addEventListener('change',()=>updateTrigger(i));}";
-  html += "const smin=document.getElementById('s'+i+'_o'+o+'_smin');";
-  html += "if(smin){smin.addEventListener('change',()=>updateTrigger(i));}";
-  html += "const gm=document.getElementById('s'+i+'_o'+o+'_gmode');";
-  html += "if(gm){gm.addEventListener('change',()=>updateTrigger(i));}";
-  html += "const dd=document.getElementById('s'+i+'_o'+o+'_dmxd');";
-  html += "if(dd){dd.addEventListener('change',()=>updateTrigger(i));}";
-  html += "const dp=document.getElementById('s'+i+'_o'+o+'_dmxp');";
-  html += "if(dp){dp.addEventListener('change',()=>updateTrigger(i));}";
-  html += "const hm=document.querySelector(\"select[name='s\"+i+\"_o\"+o+\"_hm']\");";
-  html += "if(hm){hm.addEventListener('change',()=>updateTrigger(i));}";
-  html += "const hd=document.getElementById('s'+i+'_o'+o+'_hdev');";
-  html += "if(hd){hd.addEventListener('change',()=>updateTrigger(i));}";
-  html += "}";
-  html += "updateTrigger(i);";
-  html += "}";
-  html += "const detailsEls=document.querySelectorAll('details[data-trigger]');";
-  html += "const stored=localStorage.getItem('trigger_open');";
-  html += "let openIdx=-1; if(stored!==null){openIdx=parseInt(stored,10);}"; 
-  html += "if(detailsEls.length){detailsEls.forEach(d=>{const idx=d.getAttribute('data-trigger'); if(openIdx>=0 && idx===String(openIdx)){d.open=true;} else if(openIdx>=0){d.open=false;}});}";
-  html += "detailsEls.forEach(d=>{d.addEventListener('toggle',()=>{if(d.open){localStorage.setItem('trigger_open',d.getAttribute('data-trigger'));}});});";
-  html += "function sendOutputTest(idx, oidx, kind){";
-  html += "const tSel=document.getElementById('s'+idx+'_type');";
-  html += "const t=tSel? tSel.value : '0';";
-  html += "const isEnc=(t==='4');";
-  html += "const tgt=document.getElementById('s'+idx+'_o'+oidx+'_tgt');";
-  html += "if(tgt && tgt.value==='3'){";
-  html += "const dev=document.getElementById('s'+idx+'_o'+oidx+'_dev');";
-  html += "const udp=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_udp']\");";
-  html += "const data=new URLSearchParams();";
-  html += "if(dev){data.set('test_dev',dev.value);}";
-  html += "data.set('payload',udp?udp.value:'');";
-  html += "fetch('/send_udp_test',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data.toString(),credentials:'same-origin'}).then(r=>r.text()).then(t=>console.log('udp test',t)).catch(e=>console.warn('udp test failed',e));";
-  html += "return;";
-  html += "}";
-  html += "if(tgt && tgt.value==='4'){";
-  html += "const gpin=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_gpin']\");";
-  html += "const gmode=document.getElementById('s'+idx+'_o'+oidx+'_gmode');";
-  html += "const gpms=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_gpms']\");";
-  html += "const ginv=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_ginv']\");";
-  html += "const data=new URLSearchParams();";
-  html += "data.set('gpin',gpin?gpin.value:'');";
-  html += "data.set('gmode',gmode?gmode.value:'');";
-  html += "data.set('gpms',gpms?gpms.value:'');";
-  html += "if(ginv&&ginv.checked){data.set('ginv','1');}";
-  html += "fetch('/send_gpio_test',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data.toString(),credentials:'same-origin'}).then(r=>r.text()).then(t=>console.log('gpio test',t)).catch(e=>console.warn('gpio test failed',e));";
-  html += "return;";
-  html += "}";
-  html += "if(tgt && tgt.value==='6'){";
-  html += "const mt=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_mt']\");";
-  html += "const mp=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_mp']\");";
-  html += "const mr=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_mr']\");";
-  html += "const data=new URLSearchParams();";
-  html += "data.set('topic',mt?mt.value:'');";
-  html += "data.set('payload',mp?mp.value:'');";
-  html += "if(mr&&mr.checked){data.set('retain','1');}";
-  html += "fetch('/send_mqtt_test',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data.toString(),credentials:'same-origin'}).then(r=>r.text()).then(t=>console.log('mqtt test',t)).catch(e=>console.warn('mqtt test failed',e));";
-  html += "return;";
-  html += "}";
-  html += "if(tgt && tgt.value!=='0'){return;}";
-  html += "const addrInput=document.getElementById('s'+idx+'_o'+oidx+'_addr');";
-  html += "const encAddrInput=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_enc_addr']\");";
-  html += "const btnAddrInput=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_btn_addr']\");";
-  html += "const useBtn=(kind==='bmin' || kind==='bmax');";
-  html += "const addr=useBtn?(btnAddrInput?btnAddrInput.value:''):(isEnc?(encAddrInput?encAddrInput.value:''):(addrInput?addrInput.value:''));";
-  html += "const dev=document.getElementById('s'+idx+'_o'+oidx+'_dev');";
-  html += "const om=document.getElementById('s'+idx+'_o'+oidx+'_omode');";
-  html += "const onStr=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_on']\");";
-  html += "const offStr=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_off']\");";
-  html += "const omin=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_omin']\");";
-  html += "const omax=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_omax']\");";
-  html += "const bm=document.getElementById('s'+idx+'_o'+oidx+'_bmode');";
-  html += "const bon=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_bon']\");";
-  html += "const boff=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_boff']\");";
-  html += "const bmin=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_bmin']\");";
-  html += "const bmax=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_bmax']\");";
-  html += "if(!addr){return;}";
-  html += "const data=new URLSearchParams();";
-  html += "data.set('test_addr',addr);";
-  html += "if(dev){data.set('test_dev',dev.value);}"; 
-  html += "if(useBtn){";
-  html += "const mode=bm?bm.value:'0';";
-  html += "if(mode==='2'){";
-  html += "data.set('test_type','string');";
-  html += "const v=(kind==='bmax')?(bon?bon.value:''):(boff?boff.value:'');";
-  html += "data.set('test_value',v||'');";
-  html += "}else if(mode==='1'){";
-  html += "data.set('test_type','float');";
-  html += "const v=(kind==='bmax')?(bmax?bmax.value:'0'):(bmin?bmin.value:'0');";
-  html += "data.set('test_value',v);";
-  html += "}else{";
-  html += "data.set('test_type','int');";
-  html += "const v=(kind==='bmax')?(bmax?bmax.value:'0'):(bmin?bmin.value:'0');";
-  html += "data.set('test_value',v);";
-  html += "}";
-  html += "}else if(om&&om.value==='2'){";
-  html += "data.set('test_type','string');";
-  html += "const v=(kind==='max')?(onStr?onStr.value:''):(offStr?offStr.value:'');";
-  html += "data.set('test_value',v||'');";
-  html += "}else if(om&&om.value==='1'){";
-  html += "data.set('test_type','float');";
-  html += "const v=(kind==='max')?(omax?omax.value:'0'):(omin?omin.value:'0');";
-  html += "data.set('test_value',v);";
-  html += "}else{";
-  html += "data.set('test_type','int');";
-  html += "const v=(kind==='max')?(omax?omax.value:'0'):(omin?omin.value:'0');";
-  html += "data.set('test_value',v);";
-  html += "}";
-  html += "fetch('/send_test',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data.toString(),credentials:'same-origin'}).then(r=>r.text()).then(t=>console.log('test send',t)).catch(e=>console.warn('test send failed',e));";
-  html += "}";
-  html += "</script>";
-  html += "</form></div></body></html>";
-  server.send(200, "text/html", html);
 }
 
 static void handleSaveTriggers() {
@@ -5553,475 +4931,6 @@ static void handleSaveTriggers() {
   server.send(303, "text/plain", "Saved.");
 }
 
-static void handleSettings() {
-  if (!ensureAuthenticated()) return;
-  String html;
-  html.reserve(22000);
-  html += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>";
-  html += "<title>StageMod Settings</title>";
-  html += "<style>";
-  html += ":root{--bg:#f4f1ea;--ink:#1a1a1a;--muted:#6c6c6c;--card:#ffffff;--accent:#0b6b6f;--danger:#a02a2a;}";
-  html += "body{margin:0;font-family:'Avenir Next','Trebuchet MS','Segoe UI',sans-serif;background:linear-gradient(135deg,#f4f1ea 0%,#e7f0ef 100%);color:var(--ink);}";
-  html += ".page{max-width:900px;margin:0 auto;padding:20px 16px 40px;}";
-  html += ".header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;margin-bottom:8px;}";
-  html += ".title{font-size:22px;font-weight:700;letter-spacing:0.5px;}";
-  html += ".actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;}";
-  html += ".nav-link{font-size:16px;color:#6b34d6;text-decoration:underline;font-weight:600;}";
-  html += ".nav-pill{font-size:14px;color:#666;padding:6px 12px;border:1px solid #ddd;border-radius:999px;background:#fff;text-decoration:none;}";
-  html += ".nav-primary{font-size:16px;color:#fff;padding:8px 14px;border-radius:999px;background:var(--accent);text-decoration:none;}";
-  html += ".card{background:var(--card);border:1px solid #e2e2e2;border-radius:12px;padding:12px;margin:10px 0;}";
-  html += "fieldset{border:1px solid #e2e2e2;border-radius:12px;padding:12px;margin:10px 0;background:#fff;}";
-  html += "legend{padding:0 6px;color:var(--muted);}";
-  html += "details{border:1px solid #e2e2e2;border-radius:12px;margin:10px 0;background:#fff;}";
-  html += "summary{cursor:pointer;list-style:none;padding:10px 12px;display:flex;align-items:center;justify-content:space-between;}";
-  html += "summary::-webkit-details-marker{display:none;}";
-  html += ".chev{display:inline-block;margin-right:8px;font-size:14px;transition:transform 0.2s ease;}";
-  html += "details[open] .chev{transform:rotate(90deg);}";
-  html += ".trigger-title{font-weight:600;}";
-  html += ".toggle{position:relative;width:36px;height:20px;display:inline-block;}";
-  html += ".toggle input{opacity:0;width:0;height:0;}";
-  html += ".toggle span{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#c9c9c9;border-radius:999px;transition:0.2s;}";
-  html += ".toggle span:before{content:'';position:absolute;height:16px;width:16px;left:2px;top:2px;background:#fff;border-radius:50%;transition:0.2s;}";
-  html += ".toggle input:checked + span{background:#0b6b6f;}";
-  html += ".toggle input:checked + span:before{transform:translateX(16px);}";
-  html += ".toggle input:disabled + span{background:#b9b9b9;cursor:default;}";
-  html += ".trigger-actions{display:flex;gap:6px;align-items:center;}";
-  html += ".icon-btn{border:1px solid #b9b9b9;background:#fff;color:#222;padding:4px 8px;border-radius:6px;cursor:pointer;}";
-  html += "input,select{width:100%;max-width:320px;padding:6px 8px;margin:2px 0 8px;border:1px solid #cfcfcf;border-radius:6px;background:#fff;}";
-  html += "button{border:1px solid #b9b9b9;background:#fff;color:#222;padding:6px 10px;border-radius:8px;cursor:pointer;}";
-  html += "button.primary{background:var(--accent);color:#fff;border-color:var(--accent);}";
-  html += "button.danger{background:var(--danger);color:#fff;border-color:var(--danger);}";
-  html += "small{color:var(--muted);}";
-  html += "</style></head><body>";
-  html += "<div class='page'>";
-  html += "<div class='header'>";
-  html += "<div class='title'>StageMod Settings</div>";
-  html += "<div class='actions'>";
-  html += "<a href='https://github.com/OLIMEX/ESP32-POE/blob/master/DOCUMENTS/ESP32-POE-PINOUT.png' class='nav-pill'>Board Pin Help</a>";
-  html += "<a href='/logs' class='nav-pill'>Serial Log</a>";
-  html += "<a href='/' class='nav-primary'>Triggers</a>";
-  html += "</div></div>";
-
-  html += "<form method='POST' action='/settings'>";
-  html += "<div class='card'><b>Network</b><br>";
-  html += "Hostname: <input name='hostname' type='text' value='" + config.hostname + "'><br>";
-  html += "Network: <select name='net_mode' id='net_mode'>";
-  html += "<option value='0' " + String(config.netMode == NET_ETHERNET ? "selected" : "") + ">Ethernet</option>";
-  html += "<option value='1' " + String(config.netMode == NET_WIFI ? "selected" : "") + ">WiFi</option>";
-  html += "</select><br>";
-  html += "<div id='wifi_fields'>";
-  html += "WiFi SSID: ";
-  html += "<select id='wifi_ssid_select' name='wifi_ssid_select' style='display:none;'><option value=''>Scan to list networks...</option></select> ";
-  html += "<button type='button' id='scan_wifi'>Scan WiFi</button><br>";
-  html += "<input id='wifi_ssid' name='wifi_ssid' type='text' value='" + config.wifiSsid + "' placeholder='Or type SSID manually'><br>";
-  html += "WiFi pass: <input name='wifi_pass' type='password' value=''><br>";
-  html += "</div>";
-  html += "<hr>";
-  html += "DHCP: <input name='dhcp_enabled' id='dhcp_enabled' type='checkbox' " + String(config.useStatic ? "" : "checked") + "><br>";
-  html += "<div id='static_fields'>";
-  html += "Static IP addr: <input name='static_ip' type='text' value='" + ipToString(config.staticIp) + "'><br>";
-  html += "Gateway: <input name='gateway' type='text' value='" + ipToString(config.gateway) + "'><br>";
-  html += "Subnet: <input name='subnet' type='text' value='" + ipToString(config.subnet) + "'><br>";
-  html += "DNS1: <input name='dns1' type='text' value='" + ipToString(config.dns1) + "'><br>";
-  html += "DNS2: <input name='dns2' type='text' value='" + ipToString(config.dns2) + "'><br>";
-  html += "</div>";
-  html += "<small>Static IP changes may require reboot.</small><br>";
-  html += "</div>";
-
-  html += "<div class='card'><b>OSC Input</b><br>";
-  html += "Enable OSC input triggers: <input name='osci_en' type='checkbox' " + String(config.oscInEnabled ? "checked" : "") + "><br>";
-  html += "Listen port: <input name='osci_port' type='number' min='1' max='65535' value='" + String(config.oscInPort) + "' style='max-width:140px;'><br>";
-  html += "<small>Trigger-level OSC matching is configured on the Triggers page (Source = OSC In).</small><br>";
-  html += "</div>";
-
-  html += "<div class='card'><b>DMX Net Output</b><br>";
-  html += "Enable Art-Net out: <input name='artnet_en' type='checkbox' " + String(config.artnetEnabled ? "checked" : "") + "><br>";
-  html += "Enable sACN out: <input name='sacn_en' type='checkbox' " + String(config.sacnEnabled ? "checked" : "") + "><br>";
-  html += "<small>These toggles gate DMX Net Out and DMX Preset playback protocols.</small><br>";
-  html += "</div>";
-
-  html += "<div class='card'><b>DMX Input</b><br>";
-  html += "Enable Art-Net in: <input name='dmxi_art' type='checkbox' " + String(config.dmxInArtNetEnabled ? "checked" : "") + "><br>";
-  html += "Enable sACN in: <input name='dmxi_sac' type='checkbox' " + String(config.dmxInSacnEnabled ? "checked" : "") + "><br>";
-  html += "Auto source mode: <select name='dmxi_src'>";
-  html += "<option value='0' " + String(config.dmxInSourceMode == DMX_IN_SOURCE_RECENT ? "selected" : "") + ">Most recent wins</option>";
-  html += "<option value='1' " + String(config.dmxInSourceMode == DMX_IN_SOURCE_PREFER_ARTNET ? "selected" : "") + ">Prefer Art-Net</option>";
-  html += "<option value='2' " + String(config.dmxInSourceMode == DMX_IN_SOURCE_PREFER_SACN ? "selected" : "") + ">Prefer sACN</option>";
-  html += "</select><br>";
-  html += "<small>Used by DMX preset snapshots in the preset editor when source view is set to Auto.</small><br>";
-  html += "</div>";
-
-  int dmxPresetPointsUsed = totalDmxPresetPointsExcluding(-1);
-  html += "<div class='card'><b>DMX Presets</b><br>";
-  html += "<div>Stored points: <b>" + String(dmxPresetPointsUsed) + "</b> / " + String(MAX_DMX_PRESET_POINTS) + "</div>";
-  html += "<small>Presets can span universes 1-" + String(MAX_DMX_PRESET_UNIVERSE) + " and are recalled by DMX Preset outputs.</small><br>";
-  html += "<a href='/dmx_presets' class='nav-primary' style='display:inline-block;margin-top:8px;'>Open DMX Preset Editor</a>";
-  html += "</div>";
-
-  html += "<div class='card'><b>Network Clients (OSC / UDP / MQTT / HTTP Webhook)</b><br>";
-  html += "<small>Device 1 is the default target for OSC/UDP. MQTT broker and HTTP webhook can also select from this list.</small><br>";
-  html += "<div style='margin-top:10px;'><b>Network Client Devices</b><br>";
-
-  for (int dIndex = 0; dIndex < config.oscDeviceCount; dIndex++) {
-    int i = config.oscDeviceOrder[dIndex];
-    OscDevice& d = config.oscDevices[i];
-    html += "<details " + String(dIndex == 0 ? "open" : "") + ">";
-    html += "<summary>";
-    html += "<span style='display:flex;align-items:center;gap:10px;'>";
-    html += "<span class='chev'>&#9654;</span>";
-    html += "<label class='toggle' title='Enable device'>";
-    html += "<input name='dev" + String(i) + "_en' type='checkbox' " + String(d.enabled ? "checked" : "") + ">";
-    html += "<span></span></label>";
-    html += "<span class='trigger-title'>" + d.name + "</span>";
-    html += "</span>";
-    html += "<span class='trigger-actions'>";
-    html += "<button type='submit' name='action' value='dev_up:" + String(i) + "' class='icon-btn'>&uarr;</button>";
-    html += "<button type='submit' name='action' value='dev_down:" + String(i) + "' class='icon-btn'>&darr;</button>";
-    if (i != 0) {
-      html += "<button type='submit' name='action' value='dev_remove:" + String(i) + "' class='icon-btn'>×</button>";
-    }
-    html += "</span></summary>";
-    html += "<div style='padding:0 12px 12px;'>";
-    html += "<input type='hidden' name='d" + String(i) + "_present' value='1'>";
-    html += "Name: <input name='dev" + String(i) + "_name' type='text' value='" + d.name + "'><br>";
-    html += "IP: <input name='dev" + String(i) + "_ip' type='text' value='" + ipToString(d.ip) + "'><br>";
-    html += "Port: <input name='dev" + String(i) + "_port' type='number' value='" + String(d.port) + "'><br>";
-    html += "<b>Heartbeat</b><br>";
-    html += "Enable: <input name='dev" + String(i) + "_hb_en' type='checkbox' " + String(d.hbEnabled ? "checked" : "") + "><br>";
-    html += "Address: <input name='dev" + String(i) + "_hb_addr' type='text' value='" + d.hbAddress + "'><br>";
-    html += "Interval ms: <input name='dev" + String(i) + "_hb_ms' type='number' value='" + String(d.hbMs) + "'><br>";
-    html += "</div></details>";
-  }
-  html += "<button type='submit' name='action' value='dev_add'>Add Network Client</button><br><br>";
-  html += "</div>";
-
-  html += "<div style='margin-top:10px;'><b>Test OSC/UDP</b><br>";
-  html += "Device: <select id='test_dev' name='test_dev'>";
-  appendOscDeviceOptions(html, config.testDevice);
-  html += "</select><br>";
-  html += "Address: <input id='test_addr' name='test_addr' type='text' value='/test'><br>";
-  html += "Output type: <select id='test_type' name='test_type'>";
-  html += "<option value='int'>Int</option>";
-  html += "<option value='float'>Float</option>";
-  html += "<option value='string'>String</option>";
-  html += "</select><br>";
-  html += "Output: <input id='test_value' name='test_value' type='text' value='1'><br>";
-  html += "<button type='button' id='test_send_btn'>Send</button>";
-  html += "</div>";
-  html += "</div>";
-
-  String mqttHostDisplay = config.mqttHost;
-  uint16_t mqttPortDisplay = config.mqttPort > 0 ? config.mqttPort : DEFAULT_MQTT_PORT;
-  if (config.mqttDevice < MAX_OSC_DEVICES) {
-    const OscDevice& md = config.oscDevices[config.mqttDevice];
-    mqttHostDisplay = ipToString(md.ip);
-    mqttPortDisplay = md.port > 0 ? md.port : DEFAULT_MQTT_PORT;
-  }
-
-  html += "<div class='card'><b>MQTT</b><br>";
-  html += "Enable MQTT output: <input id='mqtt_en' name='mqtt_en' type='checkbox' " + String(config.mqttEnabled ? "checked" : "") + "><br>";
-  html += "<div id='mqtt_fields'>";
-  html += "Broker device: <select id='mqtt_dev' name='mqtt_dev'>";
-  for (int d = 0; d < config.oscDeviceCount; d++) {
-    int didx = config.oscDeviceOrder[d];
-    const OscDevice& dev = config.oscDevices[didx];
-    uint16_t devPort = dev.port > 0 ? dev.port : DEFAULT_MQTT_PORT;
-    String label = dev.name + " (" + ipToString(dev.ip) + ":" + String(devPort) + ")";
-    html += "<option value='" + String(didx) + "' data-ip='" + ipToString(dev.ip) + "' data-port='" + String(devPort) + "' " + String(config.mqttDevice == didx ? "selected" : "") + ">" + label + "</option>";
-  }
-  html += "<option value='" + String(MQTT_DEVICE_CUSTOM) + "' " + String(config.mqttDevice == MQTT_DEVICE_CUSTOM ? "selected" : "") + ">Custom...</option>";
-  html += "</select><br>";
-  html += "Broker host/IP: <input id='mqtt_host' name='mqtt_host' type='text' value='" + mqttHostDisplay + "' placeholder='192.168.1.10'><br>";
-  html += "Broker port: <input id='mqtt_port' name='mqtt_port' type='number' min='1' max='65535' value='" + String(mqttPortDisplay) + "' style='max-width:120px;'><br>";
-  html += "Client ID: <input name='mqtt_client_id' type='text' value='" + config.mqttClientId + "'><br>";
-  html += "Username: <input name='mqtt_user' type='text' value='" + config.mqttUser + "'><br>";
-  html += "Password: <input name='mqtt_pass' type='password' value=''><br>";
-  html += "Base topic: <input name='mqtt_base' type='text' value='" + config.mqttBaseTopic + "' placeholder='stagemod'><br>";
-  html += "<small>Leave password blank to keep current password.</small><br>";
-  html += "<small>Status: " + String(mqttClient.connected() ? "connected" : "disconnected") + "</small><br>";
-  html += "</div>";
-  html += "</div>";
-
-  html += "<div class='card'><b>Sensors</b><br>";
-  html += "<b>Buttons</b><br>";
-  html += "Debounce ms: <input name='click_db' type='number' value='" + String(config.clickDebounceMs) + "'><br>";
-  html += "Multi-click gap ms: <input name='click_gap' type='number' value='" + String(config.multiClickGapMs) + "'><br>";
-  html += "Long press ms: <input name='long_ms' type='number' value='" + String(config.longPressMs) + "'><br><br>";
-  html += "<b>Encoder</b><br>";
-  html += "<small>Steps per output is fixed at 2 (more sensitive).</small><br><br>";
-  html += "<b>Potentiometer / Ultrasonic</b><br>";
-  html += "Smoothing: <input name='analog_smooth' type='checkbox' " + String(config.analogSmoothing ? "checked" : "") + "><br>";
-  html += "</div>";
-
-  html += "<div class='card'><b>Time</b><br>";
-  html += "<div>Current time: " + formatTimeLocal() + "</div>";
-  html += "Mode: <select name='time_mode' id='time_mode'>";
-  html += "<option value='0' " + String(config.timeMode == TIME_NTP ? "selected" : "") + ">NTP</option>";
-  html += "<option value='1' " + String(config.timeMode == TIME_MANUAL ? "selected" : "") + ">Manual</option>";
-  html += "</select><br>";
-  html += "<div id='ntp_fields'>";
-  html += "NTP server: <input name='ntp_srv' type='text' value='" + config.ntpServer + "'><br>";
-  html += "</div>";
-  html += "Time zone: <select name='tz'>";
-  html += "<option value='PST8PDT,M3.2.0/2,M11.1.0/2' " + String(config.timeZone == "PST8PDT,M3.2.0/2,M11.1.0/2" ? "selected" : "") + ">Pacific (PST/PDT)</option>";
-  html += "<option value='MST7MDT,M3.2.0/2,M11.1.0/2' " + String(config.timeZone == "MST7MDT,M3.2.0/2,M11.1.0/2" ? "selected" : "") + ">Mountain (MST/MDT)</option>";
-  html += "<option value='CST6CDT,M3.2.0/2,M11.1.0/2' " + String(config.timeZone == "CST6CDT,M3.2.0/2,M11.1.0/2" ? "selected" : "") + ">Central (CST/CDT)</option>";
-  html += "<option value='EST5EDT,M3.2.0/2,M11.1.0/2' " + String(config.timeZone == "EST5EDT,M3.2.0/2,M11.1.0/2" ? "selected" : "") + ">Eastern (EST/EDT)</option>";
-  html += "<option value='AKST9AKDT,M3.2.0/2,M11.1.0/2' " + String(config.timeZone == "AKST9AKDT,M3.2.0/2,M11.1.0/2" ? "selected" : "") + ">Alaska (AKST/AKDT)</option>";
-  html += "<option value='HST10' " + String(config.timeZone == "HST10" ? "selected" : "") + ">Hawaii (HST)</option>";
-  html += "<option value='UTC0' " + String(config.timeZone == "UTC0" ? "selected" : "") + ">UTC</option>";
-  html += "<option value='GMT0' " + String(config.timeZone == "GMT0" ? "selected" : "") + ">GMT</option>";
-  html += "</select><br>";
-  html += "Time display: <select name='time_24'>";
-  html += "<option value='0' " + String(!config.timeDisplay24h ? "selected" : "") + ">12-hour</option>";
-  html += "<option value='1' " + String(config.timeDisplay24h ? "selected" : "") + ">24-hour</option>";
-  html += "</select><br>";
-  html += "<div id='manual_fields'>";
-  html += "Date: <input name='manual_date' type='date' value='" + formatDateLocal() + "'><br>";
-  html += "Time: <input name='manual_time' type='time' step='1' value='" + formatTimeLocalInput() + "'><br>";
-  html += "<button type='submit' name='action' value='time_set'>Set Time</button><br>";
-  html += "</div>";
-  html += "</div>";
-
-  html += "<div class='card'><b>Security</b><br>";
-  html += "Username: <input name='username' type='text' value='" + config.username + "'><br>";
-  html += "Enable password: <input name='pwd_enabled' type='checkbox' " + String(config.passwordEnabled ? "checked" : "") + "><br>";
-  html += "New password: <input name='pwd_new' type='password' value=''><br>";
-  html += "<small>Leave new password blank to keep current.</small><br>";
-  html += "</div>";
-
-  html += "<button type='submit' class='primary'>Save Settings</button>";
-  html += "</form>";
-
-  html += "<div class='card'><b>Config Import/Export</b><br>";
-  html += "<div style='margin-top:6px;'>";
-  html += "<button type='button' onclick=\"window.location.href='/export_config'\">Download Config</button>";
-  html += "</div>";
-  html += "<form method='POST' action='/import_config' enctype='multipart/form-data' style='margin-top:8px;'>";
-  html += "<input type='file' name='config' accept='.json,application/json,text/plain' style='margin-right:8px;'><button type='submit'>Import Config</button>";
-  html += "</form>";
-  html += "<small>Network settings and passwords are not included.</small><br>";
-  html += "</div>";
-
-  html += "<div class='card'><b>Update</b><br>";
-  html += "<div>Firmware version: <b>" + String(FIRMWARE_VERSION) + "</b></div>";
-  html += "<div style='margin-top:8px;'><b>Firmware Update</b><br>";
-  html += "<small>Upload a new firmware .bin over your local network. Internet is not required.</small><br>";
-  html += "<form method='POST' action='/update' enctype='multipart/form-data' style='margin-top:8px;'>";
-  html += "<div style='display:flex;gap:8px;align-items:center;flex-wrap:wrap;'>";
-  html += "<input type='file' name='update' accept='.bin' style='margin:0;'>";
-  html += "<button type='submit'>Install Update</button>";
-  html += "</div>";
-  html += "</form></div><br>";
-  html += "</div>";
-
-  html += "<div class='card'><b>Device</b><br>";
-  html += "<button type='button' id='reboot_btn'>Reboot Device</button> ";
-  html += "<button type='button' id='factory_reset_btn' class='danger'>Factory Reset</button>";
-  html += "</div>";
-
-  html += "<script>";
-  html += "const dh=document.getElementById('dhcp_enabled');";
-  html += "const sf=document.getElementById('static_fields');";
-  html += "const nm=document.getElementById('net_mode');";
-  html += "const wf=document.getElementById('wifi_fields');";
-  html += "const tm=document.getElementById('time_mode');";
-  html += "const ntp=document.getElementById('ntp_fields');";
-  html += "const man=document.getElementById('manual_fields');";
-  html += "const mq=document.getElementById('mqtt_en');";
-  html += "const mqf=document.getElementById('mqtt_fields');";
-  html += "const mqDev=document.getElementById('mqtt_dev');";
-  html += "const mqHost=document.getElementById('mqtt_host');";
-  html += "const mqPort=document.getElementById('mqtt_port');";
-  html += "function toggleDhcp(){sf.style.display=dh.checked?'none':'block';}";
-  html += "function toggleNet(){wf.style.display=(nm.value==='1')?'block':'none';}";
-  html += "function toggleTime(){if(!tm){return;}ntp.style.display=(tm.value==='0')?'block':'none';man.style.display=(tm.value==='1')?'block':'none';}";
-  html += "function toggleMqtt(){if(!mq||!mqf){return;}mqf.style.display=mq.checked?'block':'none';}";
-  html += "function applyMqttDevice(){";
-  html += "if(!mqDev||!mqHost||!mqPort){return;}";
-  html += "const opt=mqDev.options[mqDev.selectedIndex];";
-  html += "const custom=(mqDev.value==='255');";
-  html += "mqHost.disabled=!custom;";
-  html += "mqPort.disabled=!custom;";
-  html += "if(custom||!opt){return;}";
-  html += "const ip=opt.getAttribute('data-ip')||'';";
-  html += "const port=opt.getAttribute('data-port')||'';";
-  html += "if(ip){mqHost.value=ip;}";
-  html += "if(port){mqPort.value=port;}";
-  html += "}";
-  html += "dh.addEventListener('change',toggleDhcp);";
-  html += "nm.addEventListener('change',toggleNet);";
-  html += "if(tm){tm.addEventListener('change',toggleTime);}";
-  html += "if(mq){mq.addEventListener('change',toggleMqtt);}";
-  html += "if(mqDev){mqDev.addEventListener('change',applyMqttDevice);}";
-  html += "toggleDhcp();toggleNet();toggleTime();toggleMqtt();applyMqttDevice();";
-  html += "const scanBtn=document.getElementById('scan_wifi');";
-  html += "const wifiSelect=document.getElementById('wifi_ssid_select');";
-  html += "const wifiInput=document.getElementById('wifi_ssid');";
-  html += "function showWifiSelect(){if(wifiSelect){wifiSelect.style.display='inline-block';}}";
-  html += "if(wifiSelect&&wifiInput){wifiSelect.addEventListener('change',()=>{";
-  html += "const v=wifiSelect.value; if(v==='__custom__'){wifiInput.focus();return;} wifiInput.value=v;});}";
-  html += "if(scanBtn&&wifiSelect&&wifiInput){";
-  html += "scanBtn.addEventListener('click',()=>{";
-  html += "showWifiSelect();";
-  html += "wifiSelect.innerHTML='';";
-  html += "const opt=document.createElement('option');opt.textContent='Scanning...';opt.value='';wifiSelect.appendChild(opt);";
-  html += "fetch('/scan_wifi').then(r=>r.json()).then(list=>{";
-  html += "wifiSelect.innerHTML='';";
-  html += "if(!list.length){const o=document.createElement('option');o.textContent='No networks found';o.value='';wifiSelect.appendChild(o);return;}";
-  html += "list.forEach(item=>{const o=document.createElement('option');o.value=item.ssid;o.textContent=item.ssid+' ('+item.rssi+'dBm)';wifiSelect.appendChild(o);});";
-  html += "const o=document.createElement('option');o.value='__custom__';o.textContent='Custom...';wifiSelect.appendChild(o);";
-  html += "const current=wifiInput.value; if(current){for(const opt of wifiSelect.options){if(opt.value===current){wifiSelect.value=current;break;}}}";
-  html += "if(!current && wifiSelect.options.length){const first=wifiSelect.options[0]; if(first && first.value && first.value!=='__custom__'){wifiSelect.value=first.value; wifiInput.value=first.value;}}";
-  html += "}).catch(()=>{wifiSelect.innerHTML='';const o=document.createElement('option');o.textContent='Scan failed';o.value='';wifiSelect.appendChild(o);});";
-  html += "});}";
-  html += "const testBtn=document.getElementById('test_send_btn');";
-  html += "const testAddr=document.getElementById('test_addr');";
-  html += "const testType=document.getElementById('test_type');";
-  html += "const testValue=document.getElementById('test_value');";
-  html += "const testDev=document.getElementById('test_dev');";
-  html += "if(testBtn&&testAddr){testBtn.addEventListener('click',()=>{";
-  html += "const data=new URLSearchParams();";
-  html += "data.set('test_addr',testAddr.value||'/test');";
-  html += "if(testType){data.set('test_type',testType.value);}"; 
-  html += "if(testValue){data.set('test_value',testValue.value);}"; 
-  html += "if(testDev){data.set('test_dev',testDev.value);}"; 
-  html += "fetch('/send_test',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data.toString(),credentials:'same-origin'}).then(r=>r.text()).then(t=>console.log('test send',t)).catch(e=>console.warn('test send failed',e));";
-  html += "});}";
-  html += "const resetBtn=document.getElementById('factory_reset_btn');";
-  html += "const rebootBtn=document.getElementById('reboot_btn');";
-  html += "if(resetBtn){resetBtn.addEventListener('click',()=>{if(!confirm('Factory reset will erase all settings. Continue?')){return;}fetch('/reset',{method:'POST'});});}";
-  html += "if(rebootBtn){rebootBtn.addEventListener('click',()=>{if(!confirm('Reboot device now?')){return;}fetch('/reboot',{method:'POST'});});}";
-  html += "function sendOutputTest(idx, oidx, kind){";
-  html += "const tSel=document.getElementById('s'+idx+'_type');";
-  html += "const t=tSel? tSel.value : '0';";
-  html += "const isEnc=(t==='4');";
-  html += "const tgt=document.getElementById('s'+idx+'_o'+oidx+'_tgt');";
-  html += "if(tgt && tgt.value==='3'){";
-  html += "const dev=document.getElementById('s'+idx+'_o'+oidx+'_dev');";
-  html += "const udp=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_udp']\");";
-  html += "const data=new URLSearchParams();";
-  html += "if(dev){data.set('test_dev',dev.value);}";
-  html += "data.set('payload',udp?udp.value:'');";
-  html += "fetch('/send_udp_test',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data.toString(),credentials:'same-origin'}).then(r=>r.text()).then(t=>console.log('udp test',t)).catch(e=>console.warn('udp test failed',e));";
-  html += "return;";
-  html += "}";
-  html += "if(tgt && tgt.value==='4'){";
-  html += "const gpin=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_gpin']\");";
-  html += "const gmode=document.getElementById('s'+idx+'_o'+oidx+'_gmode');";
-  html += "const gpms=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_gpms']\");";
-  html += "const ginv=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_ginv']\");";
-  html += "const data=new URLSearchParams();";
-  html += "data.set('gpin',gpin?gpin.value:'');";
-  html += "data.set('gmode',gmode?gmode.value:'');";
-  html += "data.set('gpms',gpms?gpms.value:'');";
-  html += "if(ginv&&ginv.checked){data.set('ginv','1');}";
-  html += "fetch('/send_gpio_test',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data.toString(),credentials:'same-origin'}).then(r=>r.text()).then(t=>console.log('gpio test',t)).catch(e=>console.warn('gpio test failed',e));";
-  html += "return;";
-  html += "}";
-  html += "if(tgt && tgt.value==='6'){";
-  html += "const topic=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_mt']\");";
-  html += "const payload=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_mp']\");";
-  html += "const retain=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_mr']\");";
-  html += "const data=new URLSearchParams();";
-  html += "data.set('topic',topic?topic.value:'');";
-  html += "data.set('payload',payload?payload.value:'');";
-  html += "if(retain&&retain.checked){data.set('retain','1');}";
-  html += "fetch('/send_mqtt_test',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data.toString(),credentials:'same-origin'}).then(r=>r.text()).then(t=>console.log('mqtt test',t)).catch(e=>console.warn('mqtt test failed',e));";
-  html += "return;";
-  html += "}";
-  html += "if(tgt && (tgt.value==='7' || tgt.value==='8')){";
-  html += "const dev=document.getElementById('s'+idx+'_o'+oidx+'_dev');";
-  html += "const dmxp=document.querySelector(\"select[name='s\"+idx+\"_o\"+oidx+\"_dmxp']\");";
-  html += "const dmxd=document.getElementById('s'+idx+'_o'+oidx+'_dmxd');";
-  html += "const dmxn=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_dmxn']\");";
-  html += "const dmxs=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_dmxs']\");";
-  html += "const dmxa=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_dmxa']\");";
-  html += "const dmxu=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_dmxu']\");";
-  html += "const dmxc=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_dmxc']\");";
-  html += "const dmxpr=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_dmxpr']\");";
-  html += "const dmxfd=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_dmxfd']\");";
-  html += "const om=document.getElementById('s'+idx+'_o'+oidx+'_omode');";
-  html += "const omin=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_omin']\");";
-  html += "const omax=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_omax']\");";
-  html += "const data=new URLSearchParams();";
-  html += "data.set('target',tgt.value);";
-  html += "if(dev){data.set('test_dev',dev.value);}";
-  html += "data.set('dmxp',dmxp?dmxp.value:'0');";
-  html += "data.set('dmxd',dmxd?dmxd.value:'0');";
-  html += "data.set('dmxn',dmxn?dmxn.value:'0');";
-  html += "data.set('dmxs',dmxs?dmxs.value:'0');";
-  html += "data.set('dmxa',dmxa?dmxa.value:'0');";
-  html += "data.set('dmxu',dmxu?dmxu.value:'1');";
-  html += "data.set('dmxc',dmxc?dmxc.value:'1');";
-  html += "data.set('dmxpr',dmxpr?dmxpr.value:'1');";
-  html += "data.set('dmxfd',dmxfd?dmxfd.value:'0');";
-  html += "data.set('omode',om?om.value:'0');";
-  html += "data.set('kind',kind||'max');";
-  html += "data.set('omin',omin?omin.value:'0');";
-  html += "data.set('omax',omax?omax.value:'100');";
-  html += "fetch('/send_dmx_test',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data.toString(),credentials:'same-origin'}).then(r=>r.text()).then(t=>console.log('dmx test',t)).catch(e=>console.warn('dmx test failed',e));";
-  html += "return;";
-  html += "}";
-  html += "if(tgt && tgt.value!=='0'){return;}";
-  html += "const addrInput=document.getElementById('s'+idx+'_o'+oidx+'_addr');";
-  html += "const encAddrInput=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_enc_addr']\");";
-  html += "const btnAddrInput=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_btn_addr']\");";
-  html += "const useBtn=(kind==='bmin' || kind==='bmax');";
-  html += "const addr=useBtn?(btnAddrInput?btnAddrInput.value:''):(isEnc?(encAddrInput?encAddrInput.value:''):(addrInput?addrInput.value:''));";
-  html += "const dev=document.getElementById('s'+idx+'_o'+oidx+'_dev');";
-  html += "const om=document.getElementById('s'+idx+'_o'+oidx+'_omode');";
-  html += "const onStr=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_on']\");";
-  html += "const offStr=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_off']\");";
-  html += "const omin=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_omin']\");";
-  html += "const omax=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_omax']\");";
-  html += "const bm=document.getElementById('s'+idx+'_o'+oidx+'_bmode');";
-  html += "const bon=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_bon']\");";
-  html += "const boff=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_boff']\");";
-  html += "const bmin=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_bmin']\");";
-  html += "const bmax=document.querySelector(\"input[name='s\"+idx+\"_o\"+oidx+\"_bmax']\");";
-  html += "if(!addr){return;}";
-  html += "const data=new URLSearchParams();";
-  html += "data.set('test_addr',addr);";
-  html += "if(dev){data.set('test_dev',dev.value);}"; 
-  html += "if(useBtn){";
-  html += "const mode=bm?bm.value:'0';";
-  html += "if(mode==='2'){";
-  html += "data.set('test_type','string');";
-  html += "const v=(kind==='bmax')?(bon?bon.value:''):(boff?boff.value:'');";
-  html += "data.set('test_value',v||'');";
-  html += "}else if(mode==='1'){";
-  html += "data.set('test_type','float');";
-  html += "const v=(kind==='bmax')?(bmax?bmax.value:'0'):(bmin?bmin.value:'0');";
-  html += "data.set('test_value',v);";
-  html += "}else{";
-  html += "data.set('test_type','int');";
-  html += "const v=(kind==='bmax')?(bmax?bmax.value:'0'):(bmin?bmin.value:'0');";
-  html += "data.set('test_value',v);";
-  html += "}";
-  html += "}else if(om&&om.value==='2'){";
-  html += "data.set('test_type','string');";
-  html += "const v=(kind==='max')?(onStr?onStr.value:''):(offStr?offStr.value:'');";
-  html += "data.set('test_value',v||'');";
-  html += "}else if(om&&om.value==='1'){";
-  html += "data.set('test_type','float');";
-  html += "const v=(kind==='max')?(omax?omax.value:'0'):(omin?omin.value:'0');";
-  html += "data.set('test_value',v);";
-  html += "}else{";
-  html += "data.set('test_type','int');";
-  html += "const v=(kind==='max')?(omax?omax.value:'0'):(omin?omin.value:'0');";
-  html += "data.set('test_value',v);";
-  html += "}";
-  html += "fetch('/send_test',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data.toString(),credentials:'same-origin'}).then(r=>r.text()).then(t=>console.log('test send',t)).catch(e=>console.warn('test send failed',e));";
-  html += "}";
-  html += "document.querySelectorAll(\"button[data-test]\").forEach(btn=>{";
-  html += "btn.addEventListener('click',()=>{sendOutputTest(btn.dataset.idx,btn.dataset.oidx,btn.dataset.test);});";
-  html += "});";
-  html += "</script>";
-  html += "</div></body></html>";
-  server.send(200, "text/html", html);
-}
-
 static void handleSaveSettings() {
   if (!ensureAuthenticated()) return;
   String action = server.hasArg("action") ? server.arg("action") : "save";
@@ -6312,7 +5221,7 @@ static void handleSaveSettings() {
   pendingMdnsRestart = (config.hostname != oldHostname);
   setupEncoderCounters();
 
-  server.sendHeader("Location", "/settings", true);
+  server.sendHeader("Location", "/", true);
   server.send(303, "text/plain", "Saved.");
 }
 
@@ -6341,7 +5250,7 @@ static void handleImportConfig() {
     return;
   }
 
-  DynamicJsonDocument doc(98304);
+  DynamicJsonDocument doc(32768);
   DeserializationError err = deserializeJson(doc, importPayload);
   if (err) {
     server.send(400, "text/plain", String("Import failed: invalid JSON (") + err.c_str() + ").");
@@ -6573,6 +5482,7 @@ static void handleDmxPresetEditor() {
   }
 
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.sendHeader("Connection", "close");
   server.send(200, "text/html", "");
   String html;
   html.reserve(4096);
@@ -6613,6 +5523,7 @@ static void handleDmxPresetEditor() {
   appendHtmlRaw("table.grid .ch{font-size:10px;line-height:1;color:#555;}");
   appendHtmlRaw("table.grid input{width:52px;max-width:none;margin:0;padding:4px 4px;font-size:12px;text-align:center;}");
   appendHtmlRaw("a{color:#0b6b6f;}");
+  appendHtmlRaw("@media(prefers-color-scheme:dark){body{background:#161616;color:#e2e2e2;}.card,fieldset,select,input,textarea{background:#222;border-color:#383838;color:#e2e2e2;}button{background:#2a2a2a;border-color:#444;color:#e2e2e2;}a{color:#0d9488;}}");
   appendHtmlRaw("</style></head><body><div class='page'>");
 
   appendHtmlRaw("<div class='top'><h2 style='margin:0;'>DMX Preset Editor</h2><a href='/settings'>Back to settings</a></div>");
@@ -6909,7 +5820,18 @@ static void handleReboot() {
 
 static void handleScanNetworks() {
   if (!ensureAuthenticated()) return;
-  int n = WiFi.scanNetworks(false, true);
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  // Use async scan to avoid blocking the web server
+  int n = WiFi.scanComplete();
+  if (n == WIFI_SCAN_FAILED) {
+    WiFi.scanNetworks(true, true);  // async, show hidden
+    server.send(200, "application/json", "[]");
+    return;
+  }
+  if (n == WIFI_SCAN_RUNNING) {
+    server.send(200, "application/json", "[]");
+    return;
+  }
   String json = "[";
   bool first = true;
   for (int i = 0; i < n; i++) {
@@ -6933,7 +5855,9 @@ static void handleLogsPage() {
   html += "<style>body{font-family:'Avenir Next','Trebuchet MS','Segoe UI',sans-serif;background:#f4f1ea;color:#1a1a1a;padding:20px;}";
   html += ".card{background:#fff;border:1px solid #ddd;border-radius:12px;padding:16px;max-width:820px;}";
   html += "pre{background:#111;color:#e6e6e6;padding:12px;border-radius:10px;white-space:pre-wrap;min-height:260px;}";
-  html += "a{color:#0b6b6f;}</style></head><body>";
+  html += "a{color:#0b6b6f;}";
+  html += "@media(prefers-color-scheme:dark){body{background:#161616;color:#e2e2e2;}.card{background:#222;border-color:#383838;}a{color:#0d9488;}}";
+  html += "</style></head><body>";
   html += "<div class='card'><h2>Serial Log</h2>";
   html += "<p><a href='/'>Back to settings</a></p>";
   html += "<pre id='logbox'>Loading...</pre></div>";
@@ -6953,22 +5877,38 @@ static void handleLogsText() {
 static void handleUpdatePage() {
   if (!ensureAuthenticated()) return;
   String html;
-  html.reserve(1600);
+  html.reserve(1800);
   html += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>";
   html += "<title>StageMod Firmware Update</title>";
-  html += "<style>body{font-family:'Avenir Next','Trebuchet MS','Segoe UI',sans-serif;background:#f4f1ea;color:#1a1a1a;padding:20px;}";
-  html += ".card{background:#fff;border:1px solid #ddd;border-radius:12px;padding:16px;max-width:520px;}";
-  html += "button{border:1px solid #b9b9b9;background:#0b6b6f;color:#fff;padding:8px 12px;border-radius:8px;cursor:pointer;}";
-  html += "</style></head><body>";
-  html += "<div class='card'>";
+  html += "<style>*{box-sizing:border-box;}body{font-family:system-ui,sans-serif;background:#1e1e1e;color:#e2e2e2;padding:20px;margin:0;}";
+  html += ".card{background:#2a2a2a;border:1px solid #383838;border-radius:12px;padding:20px;max-width:480px;margin:20px auto;}";
+  html += "h2{color:#0d9488;margin-top:0;}";
+  html += "button{background:#0d9488;color:#fff;border:none;padding:10px 20px;border-radius:8px;font-size:16px;cursor:pointer;width:100%;}";
+  html += "input[type=file]{width:100%;padding:8px;margin:8px 0 16px;border:1px solid #444;border-radius:8px;background:#1a1a1a;color:#e2e2e2;}";
+  html += "#msg{margin-top:16px;padding:12px;border-radius:8px;background:#1a1a1a;text-align:center;display:none;}";
+  html += "a{color:#0d9488;}</style></head><body><div class='card'>";
   html += "<h2>Firmware Update</h2>";
-  html += "<p>Upload a new firmware .bin over your local network. Internet is not required.</p>";
-  html += "<form method='POST' action='/update' enctype='multipart/form-data'>";
-  html += "<input type='file' name='update' accept='.bin'><br><br>";
-  html += "<button type='submit'>Install Update</button>";
+  html += "<p style='color:#999;'>Upload a .bin file. Internet is not required.</p>";
+  html += "<form method='POST' action='/update' enctype='multipart/form-data' target='uf' id='f'>";
+  html += "<input type='file' name='update' accept='.bin' id='file'>";
+  html += "<button type='submit' id='btn'>Install Update</button>";
   html += "</form>";
-  html += "<p><a href='/'>Back to settings</a></p>";
-  html += "</div></body></html>";
+  html += "<iframe name='uf' style='display:none' id='uf'></iframe>";
+  html += "<div id='msg'></div>";
+  html += "<p><a href='/'>Back</a></p>";
+  html += "</div><script>";
+  html += "document.getElementById('f').onsubmit=function(){";
+  html += "if(!document.getElementById('file').files[0]){alert('Select a .bin file');return false;}";
+  html += "document.getElementById('btn').disabled=true;";
+  html += "document.getElementById('btn').textContent='Uploading...';";
+  html += "document.getElementById('msg').style.display='block';";
+  html += "document.getElementById('msg').textContent='Uploading firmware — do not close this page...';";
+  html += "return true;};";
+  html += "document.getElementById('uf').onload=function(){";
+  html += "document.getElementById('msg').textContent='Update complete! Rebooting...';";
+  html += "document.getElementById('btn').textContent='Done';";
+  html += "setTimeout(function(){window.location.replace('/');},8000);};";
+  html += "</script></body></html>";
   server.send(200, "text/html", html);
 }
 
@@ -6977,16 +5917,7 @@ static void handleUpdateFinished() {
   bool ok = !Update.hasError();
   server.sendHeader("Connection", "close");
   if (ok) {
-    String html;
-    html.reserve(600);
-    html += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>";
-    html += "<title>Update Successful</title>";
-    html += "<style>body{font-family:'Avenir Next','Trebuchet MS','Segoe UI',sans-serif;background:#111;color:#f2f2f2;padding:20px;}</style>";
-    html += "</head><body>";
-    html += "Update successful. Rebooting...<br>Returning to Settings...";
-    html += "<script>setTimeout(()=>{window.location='/settings';},8000);</script>";
-    html += "</body></html>";
-    server.send(200, "text/html", html);
+    server.send(200, "text/html", "<html><body>OK</body></html>");
   } else {
     String msg = String("Update failed. ") + Update.errorString();
     server.send(200, "text/plain", msg);
@@ -7001,23 +5932,576 @@ static void handleUpdateFinished() {
 static void handleUpdateUpload() {
   HTTPUpload& upload = server.upload();
   if (upload.status == UPLOAD_FILE_START) {
+    Serial.println("OTA: starting, free heap: " + String(ESP.getFreeHeap()));
+    // Free resources for OTA — device reboots after anyway
+    MDNS.end();
+    if (dmxInData) { free(dmxInData); dmxInData = nullptr; }
+    oscUdp.stop();
+    artnetInUdp.stop();
+    sacnInUdp.stop();
+    mqttClient.disconnect();
+    Serial.println("OTA: freed resources, heap now: " + String(ESP.getFreeHeap()));
     if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
       addLog(String("Firmware update begin failed: ") + Update.errorString());
+      Serial.println("OTA begin failed: " + String(Update.errorString()));
     } else {
       addLog("Firmware update upload started.");
     }
   } else if (upload.status == UPLOAD_FILE_WRITE) {
-    Update.write(upload.buf, upload.currentSize);
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      Serial.println("OTA write failed at " + String(upload.totalSize) + " bytes: " + String(Update.errorString()));
+    }
   } else if (upload.status == UPLOAD_FILE_END) {
+    Serial.println("OTA: upload done, " + String(upload.totalSize) + " bytes, heap: " + String(ESP.getFreeHeap()));
     if (!Update.end(true)) {
       addLog(String("Firmware update end failed: ") + Update.errorString());
     }
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    Update.abort();
+    Serial.println("OTA: aborted");
   }
+}
+
+// =====================================================================
+// JSON REST API
+// =====================================================================
+
+static void apiCors() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+static void apiJson(int code, const String& body) {
+  apiCors();
+  server.send(code, "application/json", body);
+}
+
+static void apiError(int code, const String& msg) {
+  apiJson(code, "{\"error\":\"" + jsonEscape(msg) + "\"}");
+}
+
+// Parse trailing integer from URI like /api/trigger/3 → 3
+static int apiPathIndex() {
+  String uri = server.uri();
+  int slash = uri.lastIndexOf('/');
+  if (slash < 0) return -1;
+  String num = uri.substring(slash + 1);
+  if (num.length() == 0 || !isDigit(num[0])) return -1;
+  int n = num.toInt();
+  if (n < 0 || n >= MAX_TRIGGERS) return -1;
+  return n;
+}
+
+// Serialize one trigger into an existing JsonObject
+static void serializeTriggerTo(int i, JsonObject so) {
+  const SensorConfig& s = config.sensors[i];
+  so["index"] = i;
+  so["enabled"] = s.enabled;
+  so["name"] = s.name;
+  so["source"] = static_cast<int>(s.source);
+  so["oscInAddress"] = s.oscInAddress;
+  so["oscInArgType"] = s.oscInArgType;
+  so["oscInMatchMode"] = s.oscInMatchMode;
+  so["oscInValue"] = s.oscInValue;
+  so["oscInMin"] = s.oscInMin;
+  so["oscInMax"] = s.oscInMax;
+  so["oscInString"] = s.oscInString;
+  so["type"] = static_cast<int>(s.type);
+  so["pin"] = s.pin;
+  so["encClkPin"] = s.encClkPin;
+  so["encDtPin"] = s.encDtPin;
+  so["encSwPin"] = s.encSwPin;
+  so["encAppendSign"] = s.encAppendSign;
+  so["encSignArg"] = s.encSignArg;
+  so["encInvert"] = s.encInvert;
+  so["encSteps"] = s.encSteps;
+  so["invert"] = s.invert;
+  so["activeHigh"] = s.activeHigh;
+  so["pullup"] = s.pullup;
+  so["hcTrigPin"] = s.hcTrigPin;
+  so["hcEchoPin"] = s.hcEchoPin;
+  so["hcMinCm"] = s.hcMinCm;
+  so["hcMaxCm"] = s.hcMaxCm;
+  so["cooldownEnabled"] = s.cooldownEnabled;
+  so["cooldownMs"] = s.cooldownMs;
+  so["outputCount"] = s.outputCount;
+  JsonArray outs = so.createNestedArray("outputs");
+  for (int o = 0; o < s.outputCount && o < MAX_OUTPUTS_PER_TRIGGER; o++) {
+    const SensorConfig::OutputConfig& out = s.outputs[o];
+    JsonObject oo = outs.createNestedObject();
+    oo["index"] = o;
+    oo["target"] = static_cast<int>(out.target);
+    oo["device"] = out.device;
+    oo["oscAddress"] = out.oscAddress;
+    oo["buttonAddress"] = out.buttonAddress;
+    oo["outMin"] = out.outMin;
+    oo["outMax"] = out.outMax;
+    oo["outMode"] = static_cast<int>(out.outMode);
+    oo["buttonOutMin"] = out.buttonOutMin;
+    oo["buttonOutMax"] = out.buttonOutMax;
+    oo["buttonOutMode"] = static_cast<int>(out.buttonOutMode);
+    oo["sendMinOnRelease"] = out.sendMinOnRelease;
+    oo["udpPayload"] = out.udpPayload;
+    oo["gpioPin"] = out.gpioPin;
+    oo["gpioMode"] = static_cast<int>(out.gpioMode);
+    oo["gpioPulseMs"] = out.gpioPulseMs;
+    oo["gpioInvert"] = out.gpioInvert;
+    oo["httpMethod"] = static_cast<int>(out.httpMethod);
+    oo["httpUrl"] = out.httpUrl;
+    oo["httpBody"] = out.httpBody;
+    oo["httpIp"] = out.httpIp;
+    oo["httpPort"] = out.httpPort;
+    oo["httpDevice"] = out.httpDevice;
+    oo["mqttTopic"] = out.mqttTopic;
+    oo["mqttPayload"] = out.mqttPayload;
+    oo["mqttRetain"] = out.mqttRetain;
+    oo["dmxProtocol"] = out.dmxProtocol;
+    oo["dmxDest"] = out.dmxDest;
+    oo["dmxArtNet"] = out.dmxArtNet;
+    oo["dmxArtSubnet"] = out.dmxArtSubnet;
+    oo["dmxArtUniverse"] = out.dmxArtUniverse;
+    oo["dmxUniverse"] = out.dmxUniverse;
+    oo["dmxChannels"] = out.dmxChannels;
+    oo["dmxPreset"] = out.dmxPreset;
+    oo["dmxFadeMs"] = out.dmxFadeMs;
+    oo["onString"] = out.onString;
+    oo["offString"] = out.offString;
+    oo["buttonOnString"] = out.buttonOnString;
+    oo["buttonOffString"] = out.buttonOffString;
+  }
+  so["timeType"] = static_cast<int>(s.timeType);
+  so["timeYear"] = s.timeYear;
+  so["timeMonth"] = s.timeMonth;
+  so["timeDay"] = s.timeDay;
+  so["timeHour"] = s.timeHour;
+  so["timeMinute"] = s.timeMinute;
+  so["timeSecond"] = s.timeSecond;
+  so["weeklyMask"] = s.weeklyMask;
+  so["intervalSeconds"] = s.intervalSeconds;
+}
+
+// Apply a sensor JsonObject to config.sensors[idx]
+static void applySensorFromJson(int idx, JsonObject so) {
+  SensorConfig& s = config.sensors[idx];
+  if (so.containsKey("enabled")) s.enabled = so["enabled"];
+  if (so.containsKey("name")) s.name = String(so["name"].as<const char*>());
+  if (so.containsKey("source")) s.source = static_cast<SensorSource>(so["source"].as<int>());
+  if (so.containsKey("oscInAddress")) s.oscInAddress = String(so["oscInAddress"].as<const char*>());
+  if (so.containsKey("oscInArgType")) s.oscInArgType = so["oscInArgType"];
+  if (so.containsKey("oscInMatchMode")) s.oscInMatchMode = so["oscInMatchMode"];
+  if (so.containsKey("oscInValue")) s.oscInValue = so["oscInValue"];
+  if (so.containsKey("oscInMin")) s.oscInMin = so["oscInMin"];
+  if (so.containsKey("oscInMax")) s.oscInMax = so["oscInMax"];
+  if (so.containsKey("oscInString")) s.oscInString = String(so["oscInString"].as<const char*>());
+  if (so.containsKey("type")) s.type = static_cast<SensorType>(so["type"].as<int>());
+  if (so.containsKey("pin")) s.pin = so["pin"];
+  if (so.containsKey("encClkPin")) s.encClkPin = so["encClkPin"];
+  if (so.containsKey("encDtPin")) s.encDtPin = so["encDtPin"];
+  if (so.containsKey("encSwPin")) s.encSwPin = so["encSwPin"];
+  if (so.containsKey("encAppendSign")) s.encAppendSign = so["encAppendSign"];
+  if (so.containsKey("encSignArg")) s.encSignArg = so["encSignArg"];
+  if (so.containsKey("encInvert")) s.encInvert = so["encInvert"];
+  if (so.containsKey("encSteps")) s.encSteps = so["encSteps"];
+  if (so.containsKey("invert")) s.invert = so["invert"];
+  if (so.containsKey("activeHigh")) s.activeHigh = so["activeHigh"];
+  if (so.containsKey("pullup")) s.pullup = so["pullup"];
+  if (so.containsKey("hcTrigPin")) s.hcTrigPin = so["hcTrigPin"];
+  if (so.containsKey("hcEchoPin")) s.hcEchoPin = so["hcEchoPin"];
+  if (so.containsKey("hcMinCm")) s.hcMinCm = so["hcMinCm"];
+  if (so.containsKey("hcMaxCm")) s.hcMaxCm = so["hcMaxCm"];
+  if (so.containsKey("cooldownEnabled")) s.cooldownEnabled = so["cooldownEnabled"];
+  if (so.containsKey("cooldownMs")) s.cooldownMs = so["cooldownMs"];
+  if (so.containsKey("outputCount")) {
+    int oc = so["outputCount"];
+    s.outputCount = static_cast<uint8_t>(constrain(oc, 1, MAX_OUTPUTS_PER_TRIGGER));
+  }
+  bool importedArtAddr[MAX_OUTPUTS_PER_TRIGGER] = {};
+  JsonArray outs = so["outputs"].as<JsonArray>();
+  if (!outs.isNull()) {
+    for (JsonObject oo : outs) {
+      int oidx = oo["index"] | -1;
+      if (oidx < 0 || oidx >= MAX_OUTPUTS_PER_TRIGGER) continue;
+      SensorConfig::OutputConfig& out = s.outputs[oidx];
+      if (oo.containsKey("target")) out.target = sanitizeOutputTarget(oo["target"].as<int>());
+      if (oo.containsKey("device")) out.device = oo["device"];
+      if (oo.containsKey("oscAddress")) out.oscAddress = String(oo["oscAddress"].as<const char*>());
+      if (oo.containsKey("buttonAddress")) out.buttonAddress = String(oo["buttonAddress"].as<const char*>());
+      if (oo.containsKey("outMin")) out.outMin = oo["outMin"];
+      if (oo.containsKey("outMax")) out.outMax = oo["outMax"];
+      if (oo.containsKey("outMode")) out.outMode = static_cast<OutputMode>(oo["outMode"].as<int>());
+      if (oo.containsKey("buttonOutMin")) out.buttonOutMin = oo["buttonOutMin"];
+      if (oo.containsKey("buttonOutMax")) out.buttonOutMax = oo["buttonOutMax"];
+      if (oo.containsKey("buttonOutMode")) out.buttonOutMode = static_cast<OutputMode>(oo["buttonOutMode"].as<int>());
+      if (oo.containsKey("sendMinOnRelease")) out.sendMinOnRelease = oo["sendMinOnRelease"];
+      if (oo.containsKey("udpPayload")) out.udpPayload = String(oo["udpPayload"].as<const char*>());
+      if (oo.containsKey("gpioPin")) out.gpioPin = oo["gpioPin"];
+      if (oo.containsKey("gpioMode")) out.gpioMode = static_cast<GpioOutMode>(oo["gpioMode"].as<int>());
+      if (oo.containsKey("gpioPulseMs")) out.gpioPulseMs = oo["gpioPulseMs"];
+      if (oo.containsKey("gpioInvert")) out.gpioInvert = oo["gpioInvert"];
+      if (oo.containsKey("httpMethod")) out.httpMethod = static_cast<HttpMethod>(oo["httpMethod"].as<int>());
+      if (oo.containsKey("httpUrl")) out.httpUrl = String(oo["httpUrl"].as<const char*>());
+      if (oo.containsKey("httpBody")) out.httpBody = String(oo["httpBody"].as<const char*>());
+      if (oo.containsKey("httpIp")) out.httpIp = String(oo["httpIp"].as<const char*>());
+      if (oo.containsKey("httpPort")) out.httpPort = oo["httpPort"];
+      if (oo.containsKey("httpDevice")) out.httpDevice = oo["httpDevice"];
+      if (oo.containsKey("mqttTopic")) out.mqttTopic = String(oo["mqttTopic"].as<const char*>());
+      if (oo.containsKey("mqttPayload")) out.mqttPayload = String(oo["mqttPayload"].as<const char*>());
+      if (oo.containsKey("mqttRetain")) out.mqttRetain = oo["mqttRetain"];
+      if (oo.containsKey("dmxProtocol")) out.dmxProtocol = sanitizeDmxProtocol(oo["dmxProtocol"].as<int>());
+      if (oo.containsKey("dmxDest")) out.dmxDest = sanitizeDmxDest(oo["dmxDest"].as<int>());
+      if (oo.containsKey("dmxArtNet")) out.dmxArtNet = sanitizeDmxArtNet(oo["dmxArtNet"].as<int>());
+      if (oo.containsKey("dmxArtSubnet")) out.dmxArtSubnet = sanitizeDmxArtSubnet(oo["dmxArtSubnet"].as<int>());
+      if (oo.containsKey("dmxArtUniverse")) out.dmxArtUniverse = sanitizeDmxArtUniverse(oo["dmxArtUniverse"].as<int>());
+      importedArtAddr[oidx] = oo.containsKey("dmxArtNet") || oo.containsKey("dmxArtSubnet") || oo.containsKey("dmxArtUniverse");
+      if (oo.containsKey("dmxUniverse")) { uint16_t u = oo["dmxUniverse"]; if (u > 0) out.dmxUniverse = u; }
+      if (oo.containsKey("dmxChannels")) out.dmxChannels = String(oo["dmxChannels"].as<const char*>());
+      if (oo.containsKey("dmxPreset")) out.dmxPreset = sanitizeDmxPresetId(oo["dmxPreset"].as<int>());
+      if (oo.containsKey("dmxFadeMs")) out.dmxFadeMs = sanitizeDmxFadeMs(oo["dmxFadeMs"].as<int>());
+      if (oo.containsKey("onString")) out.onString = String(oo["onString"].as<const char*>());
+      if (oo.containsKey("offString")) out.offString = String(oo["offString"].as<const char*>());
+      if (oo.containsKey("buttonOnString")) out.buttonOnString = String(oo["buttonOnString"].as<const char*>());
+      if (oo.containsKey("buttonOffString")) out.buttonOffString = String(oo["buttonOffString"].as<const char*>());
+      if ((out.target == OUT_TARGET_DMX || out.target == OUT_TARGET_DMX_PRESET) && out.outMode == OUT_STRING) out.outMode = OUT_INT;
+    }
+  }
+  if (so.containsKey("timeType")) s.timeType = static_cast<TimeTriggerType>(so["timeType"].as<int>());
+  if (so.containsKey("timeYear")) s.timeYear = so["timeYear"];
+  if (so.containsKey("timeMonth")) s.timeMonth = so["timeMonth"];
+  if (so.containsKey("timeDay")) s.timeDay = so["timeDay"];
+  if (so.containsKey("timeHour")) s.timeHour = so["timeHour"];
+  if (so.containsKey("timeMinute")) s.timeMinute = so["timeMinute"];
+  if (so.containsKey("timeSecond")) s.timeSecond = so["timeSecond"];
+  if (so.containsKey("weeklyMask")) s.weeklyMask = so["weeklyMask"];
+  if (so.containsKey("intervalSeconds")) s.intervalSeconds = so["intervalSeconds"];
+  // Pin validation
+  if (!isAllowedDigitalPin(s.pin) && s.type != SENSOR_ANALOG) s.pin = defaultSensorPin(idx);
+  if (!isAllowedAnalogPin(s.pin) && s.type == SENSOR_ANALOG) s.pin = defaultSensorPin(idx);
+  if (!isAllowedDigitalPin(s.encClkPin)) s.encClkPin = 13;
+  if (!isAllowedDigitalPin(s.encDtPin)) s.encDtPin = 16;
+  if (!isAllowedDigitalPin(s.encSwPin)) s.encSwPin = 33;
+  if (!isAllowedDigitalPin(s.hcTrigPin)) s.hcTrigPin = 13;
+  if (!isAllowedDigitalPin(s.hcEchoPin)) s.hcEchoPin = 16;
+  if (s.source != SRC_TIME && s.source != SRC_OSC) s.source = SRC_SENSORS;
+  if (s.oscInAddress.length() == 0) s.oscInAddress = "/trigger/*";
+  if (s.oscInArgType > OSC_IN_ARG_STRING) s.oscInArgType = OSC_IN_ARG_ANY;
+  if (s.oscInMatchMode > OSC_IN_MATCH_RANGE) s.oscInMatchMode = OSC_IN_MATCH_ANY;
+  if (s.oscInString.length() == 0) s.oscInString = "go";
+  for (int o = 0; o < s.outputCount; o++) {
+    if (s.outputs[o].dmxUniverse == 0) s.outputs[o].dmxUniverse = 1;
+    if (importedArtAddr[o] && s.outputs[o].dmxProtocol == DMX_PROTO_ARTNET)
+      s.outputs[o].dmxUniverse = encodeArtNetPortAddressOneBased(s.outputs[o].dmxArtNet, s.outputs[o].dmxArtSubnet, s.outputs[o].dmxArtUniverse);
+    if (!importedArtAddr[o])
+      decodeArtNetPortAddressOneBased(s.outputs[o].dmxUniverse, s.outputs[o].dmxArtNet, s.outputs[o].dmxArtSubnet, s.outputs[o].dmxArtUniverse);
+    s.outputs[o].dmxArtNet = sanitizeDmxArtNet(s.outputs[o].dmxArtNet);
+    s.outputs[o].dmxArtSubnet = sanitizeDmxArtSubnet(s.outputs[o].dmxArtSubnet);
+    s.outputs[o].dmxArtUniverse = sanitizeDmxArtUniverse(s.outputs[o].dmxArtUniverse);
+    if (s.outputs[o].dmxChannels.length() == 0) s.outputs[o].dmxChannels = "1";
+    s.outputs[o].dmxPreset = sanitizeDmxPresetId(s.outputs[o].dmxPreset);
+  }
+}
+
+// GET /api/config — full config JSON
+static void handleApiGetConfig() {
+  if (!ensureAuthenticated()) return;
+  apiCors();
+  String json = exportConfigJson();
+  server.setContentLength(json.length());
+  server.send(200, "application/json", json);
+}
+
+// POST /api/config — save settings (non-trigger fields)
+static void handleApiPostConfig() {
+  if (!ensureAuthenticated()) return;
+  String body = server.arg("plain");
+  if (body.length() == 0) { apiError(400, "Empty body"); return; }
+  DynamicJsonDocument doc(8192);
+  if (deserializeJson(doc, body) != DeserializationError::Ok) { apiError(400, "Invalid JSON"); return; }
+  String err;
+  if (!applyConfigFromJson(doc.as<JsonObject>(), err)) { apiError(400, err); return; }
+  saveConfig();
+  apiJson(200, "{\"ok\":true}");
+}
+
+// GET /api/status
+static void handleApiGetStatus() {
+  apiCors();
+  DynamicJsonDocument doc(512);
+  doc["firmware"] = FIRMWARE_VERSION;
+  doc["ip"] = getLocalIp().toString();
+  doc["hostname"] = config.hostname;
+  doc["uptime"] = millis() / 1000;
+  doc["apMode"] = wifiApMode;
+  doc["netMode"] = static_cast<int>(config.netMode);
+  doc["time"] = formatTimeLocal();
+  doc["date"] = formatDateLocal();
+  String out;
+  serializeJson(doc, out);
+  apiJson(200, out);
+}
+
+// GET /api/live — real-time sensor values and trigger states
+static void handleApiGetLive() {
+  apiCors();
+  DynamicJsonDocument doc(4096);
+  doc["uptime"] = millis() / 1000;
+  doc["heap"] = ESP.getFreeHeap();
+  doc["ip"] = getLocalIp().toString();
+  doc["apMode"] = wifiApMode;
+  doc["time"] = formatTimeLocal();
+  JsonArray triggers = doc.createNestedArray("triggers");
+  for (int i = 0; i < config.triggerCount; i++) {
+    int idx = config.triggerOrder[i];
+    const SensorConfig& s = config.sensors[idx];
+    if (!s.enabled) continue;
+    JsonObject t = triggers.createNestedObject();
+    t["index"] = idx;
+    t["name"] = s.name;
+    t["source"] = static_cast<int>(s.source);
+    t["type"] = static_cast<int>(s.type);
+    // Current sensor reading
+    for (int o = 0; o < s.outputCount && o < MAX_OUTPUTS_PER_TRIGGER; o++) {
+      if (o == 0) {
+        t["lastInt"] = lastInt[idx][o];
+        t["lastFloat"] = serialized(String(lastFloat[idx][o], 3));
+        t["lastBool"] = lastBool[idx][o];
+      }
+    }
+    t["toggleState"] = toggleState[idx];
+    t["cooldownActive"] = (s.cooldownEnabled && lastButtonTriggerMs[idx] > 0 && (millis() - lastButtonTriggerMs[idx]) < s.cooldownMs);
+  }
+  String out;
+  serializeJson(doc, out);
+  apiJson(200, out);
+}
+
+// GET /api/trigger/N
+static void handleApiGetTrigger() {
+  if (!ensureAuthenticated()) return;
+  int n = apiPathIndex();
+  if (n < 0) { apiError(400, "Invalid trigger index"); return; }
+  DynamicJsonDocument doc(8192);
+  JsonObject obj = doc.to<JsonObject>();
+  serializeTriggerTo(n, obj);
+  String out;
+  serializeJson(doc, out);
+  apiJson(200, out);
+}
+
+// POST /api/trigger/N — body is a full trigger JSON object
+static void handleApiPostTrigger() {
+  if (!ensureAuthenticated()) return;
+  int n = apiPathIndex();
+  if (n < 0) { apiError(400, "Invalid trigger index"); return; }
+  String body = server.arg("plain");
+  if (body.length() == 0) { apiError(400, "Empty body"); return; }
+  DynamicJsonDocument doc(8192);
+  if (deserializeJson(doc, body) != DeserializationError::Ok) { apiError(400, "Invalid JSON"); return; }
+  applySensorFromJson(n, doc.as<JsonObject>());
+  saveConfig();
+  applySensorPinModes();
+  setupEncoderCounters();
+  // Echo back what was saved so the UI can confirm
+  DynamicJsonDocument resp(8192);
+  JsonObject ro = resp.to<JsonObject>();
+  serializeTriggerTo(n, ro);
+  String out;
+  serializeJson(resp, out);
+  apiJson(200, out);
+}
+
+// DELETE /api/trigger/N — remove from order and disable
+static void handleApiDeleteTrigger() {
+  if (!ensureAuthenticated()) return;
+  int n = apiPathIndex();
+  if (n < 0) { apiError(400, "Invalid trigger index"); return; }
+  config.sensors[n].enabled = false;
+  uint8_t newOrder[MAX_TRIGGERS];
+  uint8_t newCount = 0;
+  for (int i = 0; i < config.triggerCount; i++) {
+    if (config.triggerOrder[i] != static_cast<uint8_t>(n))
+      newOrder[newCount++] = config.triggerOrder[i];
+  }
+  config.triggerCount = newCount;
+  memcpy(config.triggerOrder, newOrder, newCount);
+  clearSensorKeys(n);
+  saveConfig();
+  apiJson(200, "{\"ok\":true}");
+}
+
+// POST /api/triggers/add — create new empty trigger, return it
+static void handleApiAddTrigger() {
+  if (!ensureAuthenticated()) return;
+  if (config.triggerCount >= MAX_TRIGGERS) { apiError(400, "Max triggers reached"); return; }
+  int idx = findUnusedTrigger();
+  if (idx < 0) { apiError(400, "No free trigger slot"); return; }
+  config.sensors[idx] = defaultSensorConfig(idx);
+  config.sensors[idx].enabled = true;
+  config.triggerOrder[config.triggerCount++] = static_cast<uint8_t>(idx);
+  saveConfig();
+  DynamicJsonDocument doc(8192);
+  JsonObject obj = doc.to<JsonObject>();
+  serializeTriggerTo(idx, obj);
+  String out;
+  serializeJson(doc, out);
+  apiJson(200, out);
+}
+
+// POST /api/triggers/reorder — body: {"order":[2,0,1,...]}
+static void handleApiReorderTriggers() {
+  if (!ensureAuthenticated()) return;
+  String body = server.arg("plain");
+  DynamicJsonDocument doc(512);
+  if (deserializeJson(doc, body) != DeserializationError::Ok) { apiError(400, "Invalid JSON"); return; }
+  JsonArray arr = doc["order"].as<JsonArray>();
+  if (arr.isNull()) { apiError(400, "Missing order array"); return; }
+  uint8_t newCount = 0;
+  for (JsonVariant v : arr) {
+    int idx = v.as<int>();
+    if (idx >= 0 && idx < MAX_TRIGGERS && newCount < MAX_TRIGGERS)
+      config.triggerOrder[newCount++] = static_cast<uint8_t>(idx);
+  }
+  config.triggerCount = newCount;
+  saveConfig();
+  apiJson(200, "{\"ok\":true}");
+}
+
+// POST /api/devices/add — add new network client device
+static void handleApiAddDevice() {
+  if (!ensureAuthenticated()) return;
+  if (config.oscDeviceCount >= MAX_OSC_DEVICES) { apiError(400, "Max devices reached"); return; }
+  int idx = findUnusedOscDevice();
+  if (idx < 0) { apiError(400, "No free device slot"); return; }
+  OscDevice d;
+  d.enabled = true;
+  d.name = String("Device ") + String(idx + 1);
+  d.ip = config.clientIp;
+  d.port = config.clientPort;
+  d.hbEnabled = false;
+  d.hbAddress = "/heartbeat";
+  d.hbMs = 5000;
+  config.oscDevices[idx] = d;
+  config.oscDeviceOrder[config.oscDeviceCount++] = static_cast<uint8_t>(idx);
+  saveConfig();
+  apiJson(200, "{\"ok\":true}");
+}
+
+// POST /api/devices/remove — body: {"index": N}
+static void handleApiRemoveDevice() {
+  if (!ensureAuthenticated()) return;
+  String body = server.arg("plain");
+  DynamicJsonDocument doc(128);
+  if (deserializeJson(doc, body) != DeserializationError::Ok) { apiError(400, "Invalid JSON"); return; }
+  int idx = doc["index"] | -1;
+  if (idx <= 0 || idx >= MAX_OSC_DEVICES) { apiError(400, "Invalid device index"); return; }
+  config.oscDevices[idx].enabled = false;
+  uint8_t newOrder[MAX_OSC_DEVICES];
+  uint8_t newCount = 0;
+  for (int i = 0; i < config.oscDeviceCount; i++) {
+    if (config.oscDeviceOrder[i] != static_cast<uint8_t>(idx))
+      newOrder[newCount++] = config.oscDeviceOrder[i];
+  }
+  config.oscDeviceCount = newCount;
+  memcpy(config.oscDeviceOrder, newOrder, newCount);
+  clearDeviceKeys(idx);
+  saveConfig();
+  apiJson(200, "{\"ok\":true}");
+}
+
+// Dispatch /api/trigger/N by HTTP method
+static void handleApiTriggerDispatch() {
+  if (server.method() == HTTP_OPTIONS) { apiCors(); server.send(204); return; }
+  if (server.method() == HTTP_GET)    { handleApiGetTrigger();    return; }
+  if (server.method() == HTTP_POST)   { handleApiPostTrigger();   return; }
+  if (server.method() == HTTP_DELETE) { handleApiDeleteTrigger(); return; }
+  apiError(405, "Method not allowed");
+}
+
+// Lightweight handler — only saves network fields, doesn't touch protocols/triggers
+static void handleSetupSave() {
+  if (server.hasArg("net_mode")) config.netMode = sanitizeNetworkMode(server.arg("net_mode").toInt());
+  if (server.hasArg("hostname")) config.hostname = sanitizeHostname(server.arg("hostname"));
+  if (server.hasArg("wifi_ssid") && server.arg("wifi_ssid").length() > 0) config.wifiSsid = server.arg("wifi_ssid");
+  if (server.hasArg("wifi_pass") && server.arg("wifi_pass").length() > 0) config.wifiPass = server.arg("wifi_pass");
+  config.useStatic = !server.hasArg("dhcp_enabled");
+  if (server.hasArg("static_ip")) { IPAddress p; if (parseIpString(server.arg("static_ip"), p)) config.staticIp = p; }
+  if (server.hasArg("gateway")) { IPAddress p; if (parseIpString(server.arg("gateway"), p)) config.gateway = p; }
+  if (server.hasArg("subnet")) { IPAddress p; if (parseIpString(server.arg("subnet"), p)) config.subnet = p; }
+  saveConfig();
+  addLog("Setup saved. Rebooting...");
+  server.send(200, "text/html",
+    "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<style>body{font-family:system-ui,sans-serif;background:#1e1e1e;color:#e2e2e2;text-align:center;padding:40px;}"
+    "h2{color:#0d9488;}</style></head><body>"
+    "<h2>Saved!</h2><p>StageMod is connecting to your network.<br>This may take up to 30 seconds.</p>"
+    "<p>Try: <a href='http://" + config.hostname + ".local' style='color:#0d9488'>"
+    "http://" + config.hostname + ".local</a></p>"
+    "</body></html>");
+  delay(500);
+  ESP.restart();
+}
+
+static void serveSetupPage() {
+  // Synchronous WiFi scan — default 300ms/channel ≈ 4 seconds total
+  int n = WiFi.scanNetworks(false, true);
+  String netOptions;
+  for (int i = 0; i < n; i++) {
+    String ssid = WiFi.SSID(i);
+    if (ssid.length() == 0) continue;
+    netOptions += "<div class='net' onclick=\"document.getElementById('ssid').value='" + htmlEscape(ssid) + "'\">"
+      + htmlEscape(ssid) + "<span class='sig'>" + String(WiFi.RSSI(i)) + " dBm</span></div>";
+  }
+  WiFi.scanDelete();
+  if (n <= 0) netOptions = "<div style='color:#888'>No networks found — try refreshing</div>";
+
+  String html = "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1,user-scalable=no'>"
+    "<title>StageMod Setup</title><style>"
+    "*{box-sizing:border-box;}"
+    "body{font-family:-apple-system,system-ui,sans-serif;background:#1e1e1e;color:#e2e2e2;padding:0;margin:0;}"
+    ".card{background:#2a2a2a;border-radius:12px;padding:16px;max-width:420px;margin:12px auto;}"
+    "h2{color:#0d9488;margin:0 0 4px;font-size:22px;} .sub{color:#999;font-size:13px;margin:0 0 16px;}"
+    "input,select{width:100%;padding:10px;margin:4px 0 12px;border:1px solid #444;border-radius:8px;background:#1a1a1a;color:#e2e2e2;font-size:15px;-webkit-appearance:none;}"
+    "select{background:#1a1a1a url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%23999'%3E%3Cpath d='M2 4l4 4 4-4'/%3E%3C/svg%3E\") no-repeat right 10px center;padding-right:30px;}"
+    "button,.btn{background:#0d9488;color:#fff;border:none;padding:12px;border-radius:8px;font-size:16px;font-weight:600;cursor:pointer;width:100%;display:block;text-align:center;text-decoration:none;margin:8px 0;}"
+    ".btn-sec{background:#444;font-size:13px;padding:8px;margin:4px 0 12px;}"
+    "label{font-size:13px;color:#999;display:block;margin-bottom:2px;}"
+    ".status{text-align:center;color:#666;font-size:11px;margin-top:12px;}"
+    ".nets{max-height:200px;overflow-y:auto;margin:4px 0 8px;}"
+    ".net{padding:10px 12px;background:#333;border-radius:8px;margin:4px 0;cursor:pointer;display:flex;justify-content:space-between;align-items:center;-webkit-tap-highlight-color:transparent;}"
+    ".net:active{background:#444;} .sig{color:#0d9488;font-size:12px;} .wifi{} .hidden{display:none;}"
+    "</style></head><body><div class='card'><h2>StageMod Setup</h2>"
+    "<p class='sub'>Configure your network connection.</p>"
+    "<form method='POST' action='/setup'>"
+    "<label>Connection Mode</label>"
+    "<select name='net_mode' id='mode' onchange=\"document.getElementById('wifi').className=this.value==='1'?'wifi':'hidden'\">"
+#if USE_ETHERNET
+    "<option value='0'>Ethernet</option>"
+#endif
+    "<option value='1' selected>WiFi</option>"
+    "</select>"
+    "<div id='wifi' class='wifi'>"
+    "<label>WiFi Networks" + String(n > 0 ? " (" + String(n) + " found)" : "") + "</label>"
+    "<div class='nets'>" + netOptions + "</div>"
+    "<a href='/' class='btn btn-sec'>Rescan</a>"
+    "<label>WiFi SSID</label>"
+    "<input name='wifi_ssid' id='ssid' type='text' placeholder='Enter or tap above'>"
+    "<label>WiFi Password</label>"
+    "<input name='wifi_pass' type='password' placeholder='Password'>"
+    "</div>"
+    "<label>Hostname</label>"
+    "<input name='hostname' type='text' value='" + htmlEscape(config.hostname) + "'>"
+    "<input type='hidden' name='dhcp_enabled' value='1'>"
+    "<br><button type='submit'>Save & Connect</button>"
+    "</form>"
+    "<div class='status'>StageMod v" + String(FIRMWARE_VERSION) + " | AP: " + buildApSsid() + "</div>"
+    "</div></body></html>";
+  server.send(200, "text/html", html);
 }
 
 void setup() {
   Serial.begin(115200);
   delay(300);
+  esp_log_level_set("Preferences", ESP_LOG_NONE);
   Serial.print("StageMod firmware v");
   Serial.println(FIRMWARE_VERSION);
   loadConfig();
@@ -7036,28 +6520,47 @@ void setup() {
   resetButtonArmed = false;
 
   Serial.println("Starting network...");
-#if USE_ETHERNET
-  ETH.begin();
-#endif
-  applyNetworkConfig();
-  if (waitForNetwork(30000)) {
-    Serial.print("Network OK. ESP32 IP: ");
-    Serial.println(getLocalIp());
-    addLog(String("Network OK. IP ") + getLocalIp().toString());
-    configureUdpListener();
-    startMdns();
-    applyTimeConfig();
-  } else {
-    Serial.println("Network failed to connect.");
-    addLog("Network failed. Starting AP.");
+  // If WiFi mode with no SSID saved, skip straight to AP mode
+  bool freshSetup = (config.netMode == NET_WIFI && config.wifiSsid.length() == 0);
+  if (freshSetup) {
+    Serial.println("No WiFi SSID configured. Starting AP for setup.");
+    addLog("No SSID. Starting AP for setup.");
     startWifiAp();
     configureUdpListener();
+  } else {
+#if USE_ETHERNET
+    if (config.netMode == NET_ETHERNET) ETH.begin();
+#endif
+    applyNetworkConfig();
+    if (waitForNetwork(30000)) {
+      Serial.print("Network OK. ESP32 IP: ");
+      Serial.println(getLocalIp());
+      addLog(String("Network OK. IP ") + getLocalIp().toString());
+      configureUdpListener();
+      startMdns();
+      applyTimeConfig();
+    } else {
+      Serial.println("Network failed to connect.");
+      addLog("Network failed. Starting AP.");
+      startWifiAp();
+      configureUdpListener();
+    }
   }
 
-  server.on("/", HTTP_GET, handleTriggers);
+  server.on("/", HTTP_GET, []() {
+    if (!ensureAuthenticated()) return;
+    if (wifiApMode) {
+      serveSetupPage();
+
+      return;
+    }
+    server.sendHeader("Content-Encoding", "gzip");
+    server.sendHeader("Cache-Control", "no-cache");
+    server.send_P(200, "text/html", (const char*)WEB_UI_GZ, WEB_UI_GZ_LEN);
+  });
   server.on("/triggers", HTTP_POST, handleSaveTriggers);
-  server.on("/settings", HTTP_GET, handleSettings);
   server.on("/settings", HTTP_POST, handleSaveSettings);
+  server.on("/setup", HTTP_POST, handleSetupSave);
   server.on("/dmx_presets", HTTP_GET, handleDmxPresetEditor);
   server.on("/dmx_presets", HTTP_POST, handleDmxPresetEditor);
   server.on("/send_test", HTTP_POST, handleSendTestOsc);
@@ -7074,24 +6577,28 @@ void setup() {
   server.on("/update", HTTP_POST, handleUpdateFinished, handleUpdateUpload);
   server.on("/export_config", HTTP_GET, handleExportConfig);
   server.on("/import_config", HTTP_POST, handleImportConfig, handleImportUpload);
-  server.on("/generate_204", HTTP_GET, []() {
-    server.sendHeader("Location", "/settings", true);
-    server.send(302, "text/plain", "");
-  });
-  server.on("/hotspot-detect.html", HTTP_GET, []() {
-    server.sendHeader("Location", "/settings", true);
-    server.send(302, "text/plain", "");
-  });
-  server.on("/fwlink", HTTP_GET, []() {
-    server.sendHeader("Location", "/settings", true);
-    server.send(302, "text/plain", "");
-  });
-  server.on("/ncsi.txt", HTTP_GET, []() {
-    server.sendHeader("Location", "/settings", true);
-    server.send(302, "text/plain", "");
-  });
+
+  // JSON REST API
+  server.on("/api/config",           HTTP_GET,     handleApiGetConfig);
+  server.on("/api/config",           HTTP_POST,    handleApiPostConfig);
+  server.on("/api/config",           HTTP_OPTIONS, []() { apiCors(); server.send(204); });
+  server.on("/api/status",           HTTP_GET,     handleApiGetStatus);
+  server.on("/api/live",             HTTP_GET,     handleApiGetLive);
+  server.on("/api/triggers/add",     HTTP_POST,    handleApiAddTrigger);
+  server.on("/api/triggers/reorder", HTTP_POST,    handleApiReorderTriggers);
+  server.on("/api/devices/add",      HTTP_POST,    handleApiAddDevice);
+  server.on("/api/devices/remove",   HTTP_POST,    handleApiRemoveDevice);
+
+  // Captive portal detection — serve setup form directly
+  server.on("/generate_204", HTTP_GET, []() { serveSetupPage(); });
+  server.on("/hotspot-detect.html", HTTP_GET, []() { serveSetupPage(); });
+  server.on("/fwlink", HTTP_GET, []() { serveSetupPage(); });
+  server.on("/ncsi.txt", HTTP_GET, []() { serveSetupPage(); });
+  server.on("/favicon.ico", HTTP_GET, []() { server.send(204); });
   server.onNotFound([]() {
-    server.sendHeader("Location", "/settings", true);
+    String uri = server.uri();
+    if (uri.startsWith("/api/trigger/")) { handleApiTriggerDispatch(); return; }
+    server.sendHeader("Location", "/", true);
     server.send(302, "text/plain", "");
   });
   server.begin();

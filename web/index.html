@@ -1,0 +1,1285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>StageMod</title>
+<style>
+:root{
+--bg:#1a1a1e;--bg2:#232328;--bg3:#2a2a30;--bg4:#35353d;
+--fg:#e2e2e6;--fg2:#a0a0a8;--fg3:#6c6c74;
+--acc:#0d9488;--acc2:#0a7a70;--acc3:rgba(13,148,136,.15);
+--red:#e54545;--green:#3dbd5d;--yellow:#e5b845;
+--radius:10px;--radius-sm:6px;
+--font:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:var(--font);background:var(--bg);color:var(--fg);font-size:14px;padding-bottom:44px;overflow-x:hidden}
+a{color:var(--acc);text-decoration:none}
+input,select,textarea,button{font:inherit;color:var(--fg);border-radius:var(--radius-sm)}
+input[type=text],input[type=number],input[type=password],select,textarea{
+  background:var(--bg);border:1px solid var(--bg4);padding:7px 10px;width:100%;outline:none;transition:border .2s}
+input:focus,select:focus,textarea:focus{border-color:var(--acc)}
+input[type=number]{-moz-appearance:textfield}
+input::-webkit-outer-spin-button,input::-webkit-inner-spin-button{-webkit-appearance:none}
+select{cursor:pointer;-webkit-appearance:none;appearance:none;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%236c6c74'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 10px center;padding-right:28px}
+textarea{resize:vertical;min-height:56px}
+button,.btn{
+  background:var(--acc);color:#fff;border:none;padding:8px 16px;border-radius:var(--radius-sm);
+  cursor:pointer;font-weight:600;font-size:13px;transition:background .15s,opacity .15s;white-space:nowrap}
+button:hover,.btn:hover{background:var(--acc2)}
+button:active{opacity:.8}
+button:disabled{opacity:.4;cursor:default}
+.btn-sm{padding:5px 10px;font-size:12px}
+.btn-outline{background:transparent;border:1px solid var(--bg4);color:var(--fg2)}
+.btn-outline:hover{border-color:var(--fg3);background:var(--bg3)}
+.btn-danger{background:var(--red)}
+.btn-danger:hover{background:#c03030}
+.btn-icon{background:none;border:none;color:var(--fg3);padding:4px 6px;font-size:16px;min-width:0}
+.btn-icon:hover{color:var(--fg)}
+
+/* Layout */
+.header{background:var(--bg2);border-bottom:1px solid var(--bg4);padding:0 16px;display:flex;align-items:center;height:48px;position:sticky;top:0;z-index:100}
+.header h1{font-size:16px;font-weight:700;color:var(--acc);margin-right:auto;letter-spacing:.5px}
+.tabs{display:flex;gap:2px}
+.tab{padding:8px 18px;cursor:pointer;color:var(--fg2);font-weight:600;font-size:13px;border-bottom:2px solid transparent;transition:color .15s,border .15s}
+.tab:hover{color:var(--fg)}
+.tab.active{color:var(--acc);border-bottom-color:var(--acc)}
+
+.main{max-width:900px;margin:0 auto;padding:16px}
+.panel{display:none}
+.panel.active{display:block}
+
+/* Cards */
+.card{background:var(--bg2);border:1px solid var(--bg4);border-radius:var(--radius);margin-bottom:12px;overflow:hidden}
+.card-header{display:flex;align-items:center;gap:8px;padding:10px 14px;cursor:pointer;user-select:none}
+.card-header:hover{background:var(--bg3)}
+.card-header .arrow{color:var(--fg3);font-size:11px;transition:transform .2s;flex-shrink:0}
+.card-header .arrow.open{transform:rotate(90deg)}
+.card-header .tname{font-weight:600;font-size:14px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.card-body{padding:14px;border-top:1px solid var(--bg4);display:none}
+.card-body.open{display:block}
+.card.drag-over{border-color:var(--acc);box-shadow:0 0 0 2px var(--acc)}
+
+/* Form grid */
+.fg{display:grid;grid-template-columns:1fr 1fr;gap:10px 14px;margin-bottom:12px}
+.fg.cols3{grid-template-columns:1fr 1fr 1fr}
+.fg.cols1{grid-template-columns:1fr}
+.fg label{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--fg2)}
+.fg label.full{grid-column:1/-1}
+.fg label span{font-weight:600}
+.fg .hint{font-size:11px;color:var(--fg3)}
+
+/* Toggle switch */
+.toggle{position:relative;display:inline-block;width:38px;height:22px;flex-shrink:0}
+.toggle input{opacity:0;width:0;height:0}
+.toggle .slider{position:absolute;inset:0;background:var(--bg4);border-radius:11px;transition:background .2s;cursor:pointer}
+.toggle .slider:before{content:'';position:absolute;width:16px;height:16px;left:3px;top:3px;background:#fff;border-radius:50%;transition:transform .2s}
+.toggle input:checked+.slider{background:var(--acc)}
+.toggle input:checked+.slider:before{transform:translateX(16px)}
+
+/* Toggle row */
+.trow{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.trow span{font-size:13px}
+
+/* Settings sub-tabs */
+.pills{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--bg4)}
+.pill{padding:6px 14px;border-radius:20px;cursor:pointer;font-size:12px;font-weight:600;color:var(--fg2);background:var(--bg3);transition:all .15s;white-space:nowrap}
+.pill:hover{color:var(--fg);background:var(--bg4)}
+.pill.active{color:#fff;background:var(--acc)}
+.stab{display:none}
+.stab.active{display:block}
+
+/* Section title */
+.sec{font-size:13px;font-weight:700;color:var(--fg2);margin:16px 0 8px;text-transform:uppercase;letter-spacing:.5px}
+.sec:first-child{margin-top:0}
+
+/* Output card within trigger */
+.out-card{background:var(--bg3);border:1px solid var(--bg4);border-radius:var(--radius-sm);padding:10px 12px;margin-bottom:8px;position:relative}
+.out-card .out-header{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.out-card .out-num{font-weight:700;font-size:12px;color:var(--fg3)}
+
+/* Bottom bar */
+.bar{position:fixed;bottom:0;left:0;right:0;height:36px;background:var(--bg2);border-top:1px solid var(--bg4);
+  display:flex;align-items:center;padding:0 16px;font-size:11px;color:var(--fg3);gap:16px;z-index:100}
+.bar .dot{width:7px;height:7px;border-radius:50%;background:var(--green);flex-shrink:0}
+.bar .dot.off{background:var(--red)}
+
+/* Toast */
+.toast-wrap{position:fixed;top:56px;right:16px;z-index:200;display:flex;flex-direction:column;gap:6px}
+.toast{padding:10px 18px;border-radius:var(--radius-sm);font-size:13px;font-weight:600;color:#fff;
+  animation:tIn .25s ease;pointer-events:none;max-width:320px}
+.toast.ok{background:var(--green)}
+.toast.err{background:var(--red)}
+.toast.info{background:var(--acc)}
+@keyframes tIn{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:translateY(0)}}
+
+/* Action row */
+.actions{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;align-items:center}
+.actions .spacer{flex:1}
+
+/* Device card */
+.dev-card{background:var(--bg2);border:1px solid var(--bg4);border-radius:var(--radius);margin-bottom:12px;overflow:hidden}
+.dev-card .card-header{display:flex;align-items:center;gap:8px;padding:10px 14px;cursor:pointer;user-select:none}
+.dev-card .card-header:hover{background:var(--bg3)}
+.dev-card .card-body{padding:14px;border-top:1px solid var(--bg4);display:none}
+.dev-card .card-body.open{display:block}
+
+/* Responsive */
+@media(max-width:600px){
+  .fg{grid-template-columns:1fr}
+  .fg.cols3{grid-template-columns:1fr 1fr}
+  .main{padding:10px}
+  .tab{padding:8px 12px;font-size:12px}
+  .pills{gap:3px}
+  .pill{padding:5px 10px;font-size:11px}
+}
+
+/* Hidden helper */
+.hidden{display:none!important}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>StageMod</h1>
+  <div class="tabs">
+    <div class="tab active" onclick="switchTab('triggers')">Triggers</div>
+    <div class="tab" onclick="switchTab('settings')">Settings</div>
+  </div>
+</div>
+
+<div class="main">
+  <!-- TRIGGERS TAB -->
+  <div id="p-triggers" class="panel active">
+    <div id="trigger-list"></div>
+    <div class="actions" style="margin-top:16px">
+      <button onclick="addTrigger()">+ Add Trigger</button>
+    </div>
+  </div>
+
+  <!-- SETTINGS TAB -->
+  <div id="p-settings" class="panel">
+    <div class="pills" id="settings-pills"></div>
+    <div id="settings-panels"></div>
+  </div>
+</div>
+
+<div class="bar">
+  <div class="dot" id="bar-dot"></div>
+  <span id="bar-ip">--</span>
+  <span id="bar-heap">--</span>
+  <span id="bar-uptime">--</span>
+  <span id="bar-time">--</span>
+  <a href="/logs" style="color:var(--fg3);text-decoration:none;margin-left:auto;font-size:11px">Serial Log</a>
+</div>
+
+<div class="toast-wrap" id="toasts"></div>
+<div id="busy" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:999;align-items:center;justify-content:center;">
+<div style="background:#2a2a2a;padding:20px 32px;border-radius:12px;color:#e2e2e2;font-size:16px;" id="busy-msg">Saving...</div>
+</div>
+
+<script>
+/* ===== GLOBALS ===== */
+let C={}; // full config
+let ST={}; // status data (hostname, netMode, ip, firmware)
+let triggerOrder=[];
+let liveTimer=null;
+let busyCount=0;
+let liveErrors=0;
+function pauseLive(){busyCount++;if(liveTimer){clearInterval(liveTimer);liveTimer=null;}}
+function resumeLive(){busyCount=Math.max(0,busyCount-1);if(busyCount===0&&!liveTimer){liveErrors=0;liveTimer=setInterval(pollLive,2000);}}
+function showBusy(msg){$('#busy-msg').textContent=msg||'Saving...';$('#busy').style.display='flex';}
+function hideBusy(){$('#busy').style.display='none';}
+const SRC={SENSORS:0,TIME:1,OSC:2};
+const TYPES={ANALOG:0,BUTTON:1,TOGGLE:2,DIGITAL:3,ENCODER:4,DBL:5,TRP:6,LONG:7,GPIO:8,HCSR04:9};
+const TARGETS={OSC:0,REBOOT:1,RESET_CD:2,UDP:3,GPIO:4,HTTP:5,MQTT:6,DMX:7,DMX_PRESET:8};
+const srcNames=['Sensors','Time','OSC Input'];
+const typeNames=['Analog (Pot/Slider)','Momentary','Toggle','Digital Input','Encoder','Double Click','Triple Click','Long Press','GPIO Input','Ultrasonic (HC-SR04)'];
+const targetNames=['OSC','Reboot Device','Reset Cooldowns','UDP','GPIO Output','HTTP Request','MQTT','DMX','DMX Preset'];
+const outModeNames=['Integer','Float','String'];
+const gpioModes=['High','Low','Pulse','PWM'];
+const httpMethods=['GET','POST'];
+const dmxProtos=['Art-Net','sACN'];
+const dmxDests=['Auto (Broadcast)','Unicast (Device)'];
+const timeTypes=['Once','Daily','Weekly','Interval'];
+const oscArgTypes=['Any','Integer','Float','String'];
+const oscMatchModes=['Any Value','Equals','Range'];
+const days=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+
+/* ===== UTILS ===== */
+function $(s,p){return(p||document).querySelector(s)}
+function $$(s,p){return[...(p||document).querySelectorAll(s)]}
+function el(tag,cls,html){const e=document.createElement(tag);if(cls)e.className=cls;if(html!==undefined)e.innerHTML=html;return e}
+
+function toast(msg,type='ok'){
+  const t=el('div','toast '+(type||'ok'),msg);
+  $('#toasts').appendChild(t);
+  setTimeout(()=>t.remove(),2400);
+}
+
+async function api(url,opts={}){
+  try{
+    const r=await fetch(url,opts);
+    if(!r.ok)throw new Error(await r.text()||r.statusText);
+    const ct=r.headers.get('content-type')||'';
+    return ct.includes('json')?r.json():r.text();
+  }catch(e){toast(e.message||'Request failed','err');throw e}
+}
+
+function fmtUptime(s){
+  if(s<60)return s+'s';
+  if(s<3600)return Math.floor(s/60)+'m '+s%60+'s';
+  const h=Math.floor(s/3600);return h+'h '+Math.floor((s%3600)/60)+'m';
+}
+
+/* ===== TAB SWITCHING ===== */
+function switchTab(t){
+  $$('.tab').forEach(e=>e.classList.toggle('active',e.textContent.trim().toLowerCase()===t));
+  $$('.panel').forEach(e=>e.classList.toggle('active',e.id==='p-'+t));
+}
+
+/* ===== SETTINGS SUB-TABS ===== */
+const settingsTabs=['Network','Protocols','Devices','Sensors','Time','System'];
+function initSettingsTabs(){
+  const pills=$('#settings-pills');
+  const panels=$('#settings-panels');
+  pills.innerHTML='';panels.innerHTML='';
+  settingsTabs.forEach((name,i)=>{
+    const p=el('div','pill'+(i===0?' active':''),name);
+    p.onclick=()=>{
+      $$('.pill',pills).forEach(x=>x.classList.remove('active'));
+      p.classList.add('active');
+      $$('.stab',panels).forEach(x=>x.classList.remove('active'));
+      $$('.stab',panels)[i].classList.add('active');
+    };
+    pills.appendChild(p);
+    const panel=el('div','stab'+(i===0?' active':''));
+    panel.id='st-'+name.toLowerCase();
+    panels.appendChild(panel);
+  });
+}
+
+/* ===== RENDER SETTINGS ===== */
+function renderSettings(){
+  const c=C.config||{};
+  const nm=ST.netMode||0;
+  // Network
+  const net=$('#st-network');
+  net.innerHTML=`
+    <div class="sec">Network</div>
+    <div class="fg">
+      <label><span>Hostname</span><input type="text" id="s-hostname" value="${esc(ST.hostname||c.hostname||'')}"></label>
+      <label><span>Network Mode</span><select id="s-netMode">
+        <option value="0"${nm===0?' selected':''}>Ethernet (PoE)</option>
+        <option value="1"${nm===1?' selected':''}>WiFi</option>
+      </select></label>
+    </div>
+    <div id="wifi-fields" class="${nm===1?'':'hidden'}">
+      <div class="fg">
+        <label><span>WiFi SSID</span>
+          <div style="display:flex;gap:6px">
+            <input type="text" id="s-wifiSsid" value="" style="flex:1" placeholder="Enter SSID">
+            <button class="btn-sm btn-outline" onclick="scanWifi()">Scan</button>
+          </div>
+          <select id="wifi-scan-list" class="hidden" onchange="$('#s-wifiSsid').value=this.value"></select>
+        </label>
+        <label><span>WiFi Password</span><input type="password" id="s-wifiPass" value="" placeholder="Enter password"></label>
+      </div>
+    </div>
+    <div class="trow" style="margin-top:8px">
+      <label class="toggle"><input type="checkbox" id="s-dhcp" ${!c.useStatic?'checked':''}><span class="slider"></span></label>
+      <span>DHCP (auto IP)</span>
+    </div>
+    <div id="static-fields" class="${c.useStatic?'':'hidden'}">
+      <div class="fg">
+        <label><span>IP Address</span><input type="text" id="s-staticIp" value=""></label>
+        <label><span>Gateway</span><input type="text" id="s-gateway" value=""></label>
+        <label><span>Subnet</span><input type="text" id="s-subnet" value=""></label>
+        <label><span>DNS 1</span><input type="text" id="s-dns1" value=""></label>
+        <label><span>DNS 2</span><input type="text" id="s-dns2" value=""></label>
+      </div>
+    </div>
+    <div class="fg" style="margin-top:8px"><label><span>Current IP</span><input type="text" value="${esc(ST.ip||'--')}" disabled></label></div>
+    <div class="actions"><button onclick="saveAllSettings()">Save Network</button></div>`;
+  $('#s-netMode').onchange=function(){$('#wifi-fields').classList.toggle('hidden',this.value!=='1')};
+  $('#s-dhcp').onchange=function(){$('#static-fields').classList.toggle('hidden',this.checked)};
+
+  // Protocols
+  const pro=$('#st-protocols');
+  pro.innerHTML=`
+    <div class="sec">OSC Input</div>
+    <div class="trow"><label class="toggle"><input type="checkbox" id="s-oscInEnabled" ${c.oscInEnabled?'checked':''}><span class="slider"></span></label><span>Enable OSC Input</span></div>
+    <div class="fg"><label><span>Listen Port</span><input type="number" id="s-oscInPort" value="${c.oscInPort||9001}"></label></div>
+    <div class="sec">DMX Output</div>
+    <div class="trow"><label class="toggle"><input type="checkbox" id="s-artnetEnabled" ${c.artnetEnabled?'checked':''}><span class="slider"></span></label><span>Art-Net Output</span></div>
+    <div class="trow"><label class="toggle"><input type="checkbox" id="s-sacnEnabled" ${c.sacnEnabled?'checked':''}><span class="slider"></span></label><span>sACN (E1.31) Output</span></div>
+    <div class="sec">DMX Input</div>
+    <div class="trow"><label class="toggle"><input type="checkbox" id="s-dmxInArtNetEnabled" ${c.dmxInArtNetEnabled?'checked':''}><span class="slider"></span></label><span>Art-Net Input</span></div>
+    <div class="trow"><label class="toggle"><input type="checkbox" id="s-dmxInSacnEnabled" ${c.dmxInSacnEnabled?'checked':''}><span class="slider"></span></label><span>sACN Input</span></div>
+    <div class="fg"><label><span>Source Priority</span><select id="s-dmxInSourceMode">
+      <option value="0"${c.dmxInSourceMode===0?' selected':''}>Most Recent</option>
+      <option value="1"${c.dmxInSourceMode===1?' selected':''}>Prefer Art-Net</option>
+      <option value="2"${c.dmxInSourceMode===2?' selected':''}>Prefer sACN</option>
+    </select></label></div>
+    <div class="sec">MQTT</div>
+    <div class="trow"><label class="toggle"><input type="checkbox" id="s-mqttEnabled" ${c.mqttEnabled?'checked':''}><span class="slider"></span></label><span>Enable MQTT</span></div>
+    <div id="mqtt-fields" class="${c.mqttEnabled?'':'hidden'}">
+      <div class="fg">
+        <label><span>Broker Host</span><input type="text" id="s-mqttHost" value="${esc(c.mqttHost||'')}"></label>
+        <label><span>Broker Port</span><input type="number" id="s-mqttPort" value="${c.mqttPort||1883}"></label>
+        <label><span>Username</span><input type="text" id="s-mqttUser" value="${esc(c.mqttUser||'')}"></label>
+        <label><span>Password</span><input type="password" id="s-mqttPass" value="${esc(c.mqttPass||'')}"></label>
+        <label><span>Client ID</span><input type="text" id="s-mqttClientId" value="${esc(c.mqttClientId||'')}"></label>
+        <label><span>Base Topic</span><input type="text" id="s-mqttBaseTopic" value="${esc(c.mqttBaseTopic||'stagemod')}"></label>
+        <label><span>Default Device</span><select id="s-mqttDevice">${deviceOpts(c.mqttDevice)}</select></label>
+      </div>
+    </div>
+    <div class="actions"><button onclick="saveAllSettings()">Save Protocols</button></div>`;
+  $('#s-mqttEnabled').onchange=function(){$('#mqtt-fields').classList.toggle('hidden',!this.checked)};
+
+  // Devices
+  const dev=$('#st-devices');
+  renderDevices(dev);
+
+  // Sensors
+  const sen=$('#st-sensors');
+  sen.innerHTML=`
+    <div class="sec">Button Settings</div>
+    <div class="fg">
+      <label><span>Debounce (ms)</span><input type="number" id="s-clickDebounceMs" value="${c.clickDebounceMs||30}"></label>
+      <label><span>Multi-Click Gap (ms)</span><input type="number" id="s-multiClickGapMs" value="${c.multiClickGapMs||350}"></label>
+      <label><span>Long Press (ms)</span><input type="number" id="s-longPressMs" value="${c.longPressMs||2000}"></label>
+    </div>
+    <div class="sec">Encoder</div>
+    <div class="fg"><label><span>Steps Per Output</span><input type="number" value="2" disabled><div class="hint">Fixed at 2 steps per output event</div></label></div>
+    <div class="sec">Analog / Ultrasonic</div>
+    <div class="trow"><label class="toggle"><input type="checkbox" id="s-analogSmoothing" ${c.analogSmoothing?'checked':''}><span class="slider"></span></label><span>Enable Smoothing</span></div>
+    <div class="actions"><button onclick="saveAllSettings()">Save Sensors</button></div>`;
+
+  // Time
+  const tim=$('#st-time');
+  tim.innerHTML=`
+    <div class="sec">Current Time</div>
+    <div class="fg"><label><span>Device Time</span><input type="text" id="s-currentTime" value="--" disabled></label></div>
+    <div class="sec">Configuration</div>
+    <div class="fg">
+      <label><span>Mode</span><select id="s-timeMode">
+        <option value="0"${c.timeMode===0?' selected':''}>NTP (Network)</option>
+        <option value="1"${c.timeMode===1?' selected':''}>Manual</option>
+      </select></label>
+      <label><span>NTP Server</span><input type="text" id="s-ntpServer" value="${esc(c.ntpServer||'pool.ntp.org')}"></label>
+      <label class="full"><span>Timezone</span><select id="s-timeZone">
+        <option value="EST5EDT,M3.2.0/2,M11.1.0/2"${c.timeZone&&c.timeZone.startsWith('EST')?' selected':''}>Eastern (EST/EDT)</option>
+        <option value="CST6CDT,M3.2.0/2,M11.1.0/2"${c.timeZone&&c.timeZone.startsWith('CST')?' selected':''}>Central (CST/CDT)</option>
+        <option value="MST7MDT,M3.2.0/2,M11.1.0/2"${c.timeZone&&c.timeZone.startsWith('MST7M')?' selected':''}>Mountain (MST/MDT)</option>
+        <option value="MST7"${c.timeZone==='MST7'?' selected':''}>Arizona (MST, no DST)</option>
+        <option value="PST8PDT,M3.2.0/2,M11.1.0/2"${c.timeZone&&c.timeZone.startsWith('PST')?' selected':''}>Pacific (PST/PDT)</option>
+        <option value="AKST9AKDT,M3.2.0/2,M11.1.0/2"${c.timeZone&&c.timeZone.startsWith('AKST')?' selected':''}>Alaska (AKST/AKDT)</option>
+        <option value="HST10"${c.timeZone&&c.timeZone.startsWith('HST')?' selected':''}>Hawaii (HST, no DST)</option>
+        <option value="GMT0BST,M3.5.0/1,M10.5.0/2"${c.timeZone&&c.timeZone.startsWith('GMT0')?' selected':''}>UK (GMT/BST)</option>
+        <option value="CET-1CEST,M3.5.0/2,M10.5.0/3"${c.timeZone&&c.timeZone.startsWith('CET')?' selected':''}>Central Europe (CET/CEST)</option>
+        <option value="EET-2EEST,M3.5.0/3,M10.5.0/4"${c.timeZone&&c.timeZone.startsWith('EET')?' selected':''}>Eastern Europe (EET/EEST)</option>
+        <option value="JST-9"${c.timeZone==='JST-9'?' selected':''}>Japan (JST)</option>
+        <option value="CST-8"${c.timeZone==='CST-8'?' selected':''}>China (CST)</option>
+        <option value="AEST-10AEDT,M10.1.0/2,M4.1.0/3"${c.timeZone&&c.timeZone.startsWith('AEST')?' selected':''}>Australia Eastern (AEST/AEDT)</option>
+        <option value="NZST-12NZDT,M9.5.0/2,M4.1.0/3"${c.timeZone&&c.timeZone.startsWith('NZST')?' selected':''}>New Zealand (NZST/NZDT)</option>
+        <option value="UTC0"${c.timeZone==='UTC0'||!c.timeZone?' selected':''}>UTC (no offset)</option>
+      </select></label>
+    </div>
+    <div class="trow"><label class="toggle"><input type="checkbox" id="s-timeDisplay24h" ${c.timeDisplay24h?'checked':''}><span class="slider"></span></label><span>24-Hour Display</span></div>
+    <div class="actions"><button onclick="saveAllSettings()">Save Time</button></div>`;
+
+  // System
+  const sys=$('#st-system');
+  sys.innerHTML=`
+    <div class="sec">Security</div>
+    <div class="fg">
+      <label><span>Username</span><input type="text" id="s-username" value="${esc(c.username||'admin')}"></label>
+    </div>
+    <div class="trow"><label class="toggle"><input type="checkbox" id="s-passwordEnabled" ${c.passwordEnabled?'checked':''}><span class="slider"></span></label><span>Require Password</span></div>
+    <div id="pw-fields" class="${c.passwordEnabled?'':'hidden'}">
+      <div class="fg"><label><span>Set Password</span><input type="password" id="s-password" placeholder="Enter new password"></label></div>
+    </div>
+    <div class="actions"><button onclick="saveAllSettings()">Save Security</button></div>
+
+    <div class="sec">Configuration</div>
+    <div class="actions">
+      <button class="btn-outline" onclick="exportConfig()">Export Config</button>
+      <label class="btn btn-outline" style="cursor:pointer">Import Config<input type="file" accept=".json" style="display:none" onchange="importConfig(this)"></label>
+    </div>
+
+    <div class="sec">Firmware</div>
+    <div class="fg"><label><span>Version</span><input type="text" id="s-firmware" value="--" disabled></label></div>
+    <div class="actions" style="margin-top:8px"><a href="/update" class="btn-outline" style="text-decoration:none;text-align:center;display:inline-block">Open Firmware Updater</a></div>
+
+    <div class="sec" style="margin-top:24px">Resources</div>
+    <div class="actions">
+      <a href="https://github.com/OLIMEX/ESP32-POE/blob/master/DOCUMENTS/ESP32-POE-PINOUT.png" target="_blank" class="btn-outline" style="text-decoration:none;text-align:center">Board Pin Help</a>
+    </div>
+
+    <div class="sec" style="margin-top:24px">Danger Zone</div>
+    <div class="actions">
+      <button class="btn-outline" onclick="doReboot()">Reboot</button>
+      <button class="btn-danger" onclick="doFactoryReset()">Factory Reset</button>
+    </div>`;
+  $('#s-passwordEnabled').onchange=function(){$('#pw-fields').classList.toggle('hidden',!this.checked)};
+
+  // Populate from status data
+  const tf=$('#s-currentTime');if(tf)tf.value=(ST.time||'')+' '+(ST.date||'');
+  const fw=$('#s-firmware');if(fw)fw.value=ST.firmware||'--';
+}
+
+function renderDevices(container){
+  const c=C.config||{};
+  const devs=c.oscDevices||[];
+  const devOrder=c.oscDeviceOrder||devs.map((_,i)=>i);
+  const devCount=c.oscDeviceCount||devs.length;
+  let html=`<div class="sec">Network Client Devices</div>`;
+  for(let di=0;di<devCount;di++){
+    const i=devOrder[di];
+    const d=devs[i]||devs[di]||{};
+    const idx=d.index!=null?d.index:i;
+    html+=`<div class="dev-card" data-devi="${idx}">
+      <div class="card-header" onclick="this.nextElementSibling.classList.toggle('open');this.querySelector('.arrow').classList.toggle('open')">
+        <span class="arrow${di===0?' open':''}">&#9654;</span>
+        <label class="toggle" onclick="event.stopPropagation()"><input type="checkbox" data-dk="enabled" ${d.enabled?'checked':''}><span class="slider"></span></label>
+        <span class="tname">${esc(d.name||'Device '+(idx+1))} (${esc(d.ip||'0.0.0.0')}:${d.port||8000})</span>
+        ${idx>0?'<button class="btn-icon btn-danger" onclick="event.stopPropagation();removeDevice('+idx+')" title="Remove">&times;</button>':''}
+      </div>
+      <div class="card-body${di===0?' open':''}">
+        <div class="fg">
+          <label><span>Name</span><input type="text" data-dk="name" value="${esc(d.name||'')}"></label>
+          <label><span>IP Address</span><input type="text" data-dk="ip" value="${esc(d.ip||'')}"></label>
+          <label><span>Port</span><input type="number" data-dk="port" value="${d.port||8000}"></label>
+        </div>
+        <div class="trow"><label class="toggle"><input type="checkbox" data-dk="hbEnabled" ${d.hbEnabled?'checked':''}><span class="slider"></span></label><span>Heartbeat</span></div>
+        <div class="${d.hbEnabled?'':'hidden'}" data-hb-fields>
+          <div class="fg">
+            <label><span>Heartbeat Address</span><input type="text" data-dk="hbAddress" value="${esc(d.hbAddress||'/heartbeat')}"></label>
+            <label><span>Interval (ms)</span><input type="number" data-dk="hbMs" value="${d.hbMs||5000}"></label>
+          </div>
+        </div>
+      </div>
+    </div>`;
+  }
+  html+=`<div class="actions">
+    <button class="btn-sm btn-outline" onclick="addDevice()" ${devCount>=8?'disabled':''}>+ Add Device</button>
+    <div class="spacer"></div>
+    <button onclick="saveAllSettings()">Save Devices</button>
+  </div>`;
+
+  // Test section
+  html+=`<div class="sec" style="margin-top:20px">Test Output</div>
+  <div class="fg">
+    <label><span>Device</span><select id="test-dev">${deviceOpts(c.testDevice||0)}</select></label>
+    <label><span>Protocol</span><select id="test-proto" onchange="updateTestFields()">
+      <option value="osc">OSC</option><option value="udp">UDP</option><option value="mqtt">MQTT</option>
+      <option value="gpio">GPIO</option><option value="dmx">DMX</option>
+    </select></label>
+  </div>
+  <div id="test-fields"></div>
+  <div class="actions"><button onclick="sendTest()">Send Test</button></div>`;
+
+  container.innerHTML=html;
+
+  // Bind heartbeat toggles
+  $$('.dev-card',container).forEach(card=>{
+    const hbCb=$('[data-dk="hbEnabled"]',card);
+    const hbFields=$('[data-hb-fields]',card);
+    if(hbCb&&hbFields) hbCb.onchange=()=>hbFields.classList.toggle('hidden',!hbCb.checked);
+  });
+
+  updateTestFields();
+}
+
+function updateTestFields(){
+  const proto=$('#test-proto').value;
+  const f=$('#test-fields');
+  if(proto==='osc'){
+    f.innerHTML=`<div class="fg">
+      <label><span>Address</span><input type="text" id="t-addr" value="/test"></label>
+      <label><span>Type</span><select id="t-type"><option value="int">Int</option><option value="float">Float</option><option value="string">String</option></select></label>
+      <label><span>Value</span><input type="text" id="t-val" value="1"></label></div>`;
+  }else if(proto==='udp'){
+    f.innerHTML=`<div class="fg"><label class="full"><span>Payload</span><input type="text" id="t-payload" value="hello"></label></div>`;
+  }else if(proto==='mqtt'){
+    f.innerHTML=`<div class="fg">
+      <label><span>Topic</span><input type="text" id="t-topic" value="test/topic"></label>
+      <label><span>Payload</span><input type="text" id="t-mpayload" value="hello"></label></div>
+      <div class="trow"><label class="toggle"><input type="checkbox" id="t-retain"><span class="slider"></span></label><span>Retain</span></div>`;
+  }else if(proto==='gpio'){
+    f.innerHTML=`<div class="fg">
+      <label><span>Pin</span><input type="number" id="t-gpin" value="2"></label>
+      <label><span>Mode</span><select id="t-gmode"><option value="0">High</option><option value="1">Low</option><option value="2">Pulse</option><option value="3">PWM</option></select></label>
+      <label><span>Pulse (ms)</span><input type="number" id="t-gpms" value="500"></label></div>`;
+  }else if(proto==='dmx'){
+    f.innerHTML=`<div class="fg">
+      <label><span>Protocol</span><select id="t-dmxp"><option value="0">Art-Net</option><option value="1">sACN</option></select></label>
+      <label><span>Universe</span><input type="number" id="t-dmxu" value="1"></label>
+      <label><span>Channels</span><input type="text" id="t-dmxc" value="1"></label>
+      <label><span>Value (0-255)</span><input type="number" id="t-dmxv" value="255" min="0" max="255"></label></div>`;
+  }
+}
+
+async function sendTest(){
+  pauseLive();showBusy('Sending...');
+  const proto=$('#test-proto').value;
+  const dev=$('#test-dev').value;
+  const hdr={'Content-Type':'application/x-www-form-urlencoded'};
+  try{
+    let fd;
+    if(proto==='osc'){
+      fd=new URLSearchParams({test_dev:dev,test_addr:$('#t-addr').value,test_type:$('#t-type').value,test_value:$('#t-val').value});
+      await api('/send_test',{method:'POST',headers:hdr,body:fd.toString()});
+    }else if(proto==='udp'){
+      fd=new URLSearchParams({test_dev:dev,payload:$('#t-payload').value});
+      await api('/send_udp_test',{method:'POST',headers:hdr,body:fd.toString()});
+    }else if(proto==='mqtt'){
+      fd=new URLSearchParams({topic:$('#t-topic').value,payload:$('#t-mpayload').value});
+      if($('#t-retain').checked)fd.set('retain','1');
+      await api('/send_mqtt_test',{method:'POST',headers:hdr,body:fd.toString()});
+    }else if(proto==='gpio'){
+      fd=new URLSearchParams({gpin:$('#t-gpin').value,gmode:$('#t-gmode').value,gpms:$('#t-gpms').value});
+      await api('/send_gpio_test',{method:'POST',headers:hdr,body:fd.toString()});
+    }else if(proto==='dmx'){
+      fd=new URLSearchParams({dmxp:$('#t-dmxp').value,dmxu:$('#t-dmxu').value,dmxc:$('#t-dmxc').value,omin:'0',omax:$('#t-dmxv').value,kind:'max'});
+      await api('/send_dmx_test',{method:'POST',headers:hdr,body:fd.toString()});
+    }
+    toast('Sent!');
+  }catch(e){}
+  finally{hideBusy();resumeLive();}
+}
+
+/* ===== SAVE SETTINGS ===== */
+async function saveAllSettings(){
+  pauseLive();showBusy('Saving settings...');
+  // Use form-encoded POST to /settings which handles ALL fields including network/security
+  const fd=new URLSearchParams();
+  fd.set('action','save');
+
+  // Network
+  fd.set('hostname',v('s-hostname'));
+  const cfg={
+    hostname:v('s-hostname')||undefined,
+    netMode:parseInt(v('s-netMode')),
+    wifiSsid:v('s-wifiSsid')||undefined,
+    wifiPass:v('s-wifiPass')||undefined,
+    useStatic:!cv('s-dhcp'),
+    staticIp:v('s-staticIp'),gateway:v('s-gateway'),subnet:v('s-subnet'),
+    dns1:v('s-dns1'),dns2:v('s-dns2'),
+    oscInEnabled:cv('s-oscInEnabled'),
+    oscInPort:iv('s-oscInPort'),
+    artnetEnabled:cv('s-artnetEnabled'),
+    sacnEnabled:cv('s-sacnEnabled'),
+    dmxInArtNetEnabled:cv('s-dmxInArtNetEnabled'),
+    dmxInSacnEnabled:cv('s-dmxInSacnEnabled'),
+    dmxInSourceMode:iv('s-dmxInSourceMode'),
+    mqttEnabled:cv('s-mqttEnabled'),
+    mqttDevice:iv('s-mqttDevice'),
+    mqttHost:v('s-mqttHost'),mqttPort:iv('s-mqttPort'),
+    mqttUser:v('s-mqttUser'),mqttClientId:v('s-mqttClientId'),
+    mqttBaseTopic:v('s-mqttBaseTopic'),
+    clickDebounceMs:iv('s-clickDebounceMs'),
+    multiClickGapMs:iv('s-multiClickGapMs'),
+    longPressMs:iv('s-longPressMs'),
+    analogSmoothing:cv('s-analogSmoothing'),
+    timeMode:iv('s-timeMode'),
+    ntpServer:v('s-ntpServer'),
+    timeZone:v('s-timeZone'),
+    timeDisplay24h:cv('s-timeDisplay24h'),
+    username:v('s-username'),
+    passwordEnabled:cv('s-passwordEnabled'),
+    testDevice:iv('test-dev'),
+  };
+  const pw=v('s-mqttPass');if(pw)cfg.mqttPass=pw;
+  const upw=v('s-password');if(upw)cfg.password=upw;
+  // Clean undefined values
+  Object.keys(cfg).forEach(k=>{if(cfg[k]===undefined)delete cfg[k]});
+
+  try{
+    await api('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});
+    toast('Settings saved!');
+    C=await api('/api/config');
+  }catch(e){
+    toast('Save failed','err');
+  }finally{hideBusy();resumeLive();}
+}
+
+function v(id){const e=$('#'+id);return e?e.value:''}
+function iv(id){return parseInt(v(id))||0}
+function cv(id){const e=$('#'+id);return e?e.checked:false}
+
+/* ===== DEVICES ===== */
+async function addDevice(){
+  pauseLive();showBusy('Adding device...');
+  try{
+    await api('/api/devices/add',{method:'POST'});
+    C=await api('/api/config');
+    renderDevices($('#st-devices'));
+    toast('Device added!');
+  }catch(e){toast('Failed','err')}
+  finally{hideBusy();resumeLive();}
+}
+async function removeDevice(i){
+  if(!confirm('Remove this device?'))return;
+  pauseLive();showBusy('Removing device...');
+  try{
+    await api('/api/devices/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:i})});
+    C=await api('/api/config');
+    renderDevices($('#st-devices'));
+    toast('Device removed.');
+  }catch(e){toast('Failed','err')}
+  finally{hideBusy();resumeLive();}
+}
+function appendCurrentDevicesToForm(fd){
+  $$('.dev-card').forEach(card=>{
+    const i=parseInt(card.dataset.devi);
+    const g=k=>{const el=$(`[data-dk="${k}"]`,card);return el?(el.type==='checkbox'?el.checked:el.value):''};
+    fd.set('d'+i+'_present','1');
+    if(g('enabled'))fd.set('dev'+i+'_en','on');
+    fd.set('dev'+i+'_name',g('name'));
+    fd.set('dev'+i+'_ip',g('ip'));
+    fd.set('dev'+i+'_port',g('port'));
+    if(g('hbEnabled'))fd.set('dev'+i+'_hb_en','on');
+    fd.set('dev'+i+'_hb_addr',g('hbAddress'));
+    fd.set('dev'+i+'_hb_ms',g('hbMs'));
+  });
+}
+
+function deviceOpts(sel){
+  const c=C.config||{};
+  const devs=c.oscDevices||[];
+  const order=c.oscDeviceOrder||devs.map((_,i)=>i);
+  const count=c.oscDeviceCount||devs.length;
+  let h='';
+  for(let di=0;di<count;di++){
+    const i=order[di];
+    const d=devs[i]||{};
+    const idx=d.index!=null?d.index:i;
+    const label=esc(d.name||'Device '+(idx+1))+' ('+esc(d.ip||'0.0.0.0')+':'+esc(d.port||8000)+')';
+    h+=`<option value="${idx}"${idx===sel?' selected':''}>${label}</option>`;
+  }
+  return h;
+}
+
+/* ===== WIFI SCAN ===== */
+async function scanWifi(){
+  try{
+    toast('Scanning...','info');
+    // First call starts async scan, poll until results arrive
+    let nets=[];
+    for(let attempt=0;attempt<8;attempt++){
+      const r=await api('/scan_wifi');
+      nets=Array.isArray(r)?r:[];
+      if(nets.length>0)break;
+      await new Promise(ok=>setTimeout(ok,1500));
+    }
+    const list=$('#wifi-scan-list');
+    list.innerHTML='<option value="">-- Select --</option>';
+    nets.sort((a,b)=>b.rssi-a.rssi).forEach(n=>{
+      list.innerHTML+=`<option value="${esc(n.ssid)}">${esc(n.ssid)} (${n.rssi} dBm)</option>`;
+    });
+    list.classList.remove('hidden');
+    if(nets.length===0)toast('No networks found','err');
+    else toast(nets.length+' networks found');
+  }catch(e){}
+}
+
+/* ===== SYSTEM ACTIONS ===== */
+function exportConfig(){window.location='/export_config'}
+
+async function importConfig(input){
+  if(!input.files.length)return;
+  const fd=new FormData();
+  fd.append('file',input.files[0]);
+  try{
+    await api('/import_config',{method:'POST',body:fd});
+    toast('Config imported! Reloading...');
+    setTimeout(()=>location.reload(),1500);
+  }catch(e){}
+}
+
+function doOtaUpdate(){
+  const file=$('#ota-file').files[0];
+  if(!file){toast('Select a .bin file','err');return}
+  if(!confirm('Upload firmware update? The device will reboot.'))return;
+  pauseLive();showBusy('Uploading firmware 0%...');
+  const fd=new FormData();
+  fd.append('update',file,file.name);
+  const xhr=new XMLHttpRequest();
+  xhr.open('POST','/update');
+  xhr.timeout=120000;
+  xhr.upload.onprogress=function(e){
+    if(e.lengthComputable){
+      const pct=Math.round(e.loaded/e.total*100);
+      $('#busy-msg').textContent='Uploading firmware '+pct+'%...';
+    }
+  };
+  xhr.onload=function(){
+    if(xhr.status===200){
+      $('#busy-msg').textContent='Update complete! Rebooting...';
+      toast('Firmware updated! Rebooting...');
+      setTimeout(()=>location.reload(),10000);
+    }else{
+      hideBusy();resumeLive();
+      toast('Update failed: '+xhr.responseText,'err');
+    }
+  };
+  xhr.onerror=function(){hideBusy();resumeLive();toast('Upload failed — try again','err')};
+  xhr.ontimeout=function(){hideBusy();resumeLive();toast('Upload timed out','err')};
+  xhr.send(fd);
+}
+
+function doReboot(){
+  if(!confirm('Reboot the device?'))return;
+  api('/reboot',{method:'POST'}).then(()=>toast('Rebooting...')).catch(()=>{});
+}
+
+function doFactoryReset(){
+  if(!confirm('FACTORY RESET: All settings will be erased. Continue?'))return;
+  if(!confirm('Are you sure? This cannot be undone.'))return;
+  api('/reset',{method:'POST'}).then(()=>toast('Factory reset. Rebooting...')).catch(()=>{});
+}
+
+/* ===== TRIGGERS ===== */
+function renderTriggers(){
+  const list=$('#trigger-list');
+  list.innerHTML='';
+  const order=(C.config||{}).triggerOrder||[];
+  const sensors=(C.config||{}).sensors||[];
+  triggerOrder=[...order];
+
+  if(order.length===0){
+    list.innerHTML='<div style="text-align:center;color:var(--fg3);padding:40px">No triggers configured. Click "Add Trigger" to get started.</div>';
+    return;
+  }
+
+  order.forEach((idx,pos)=>{
+    const s=sensors[idx];if(!s)return;
+    const card=el('div','card');
+    card.id='tc-'+idx;
+    card.draggable=true;
+    card.setAttribute('ondragstart',`onDragStart(event,${idx})`);
+    card.setAttribute('ondragend','onDragEnd(event)');
+    card.setAttribute('ondragover',`onDragOver(event,${idx})`);
+    card.setAttribute('ondrop',`onDrop(event,${idx})`);
+    card.innerHTML=buildTriggerCard(idx,pos,s);
+    list.appendChild(card);
+    bindTriggerEvents(card,idx);
+  });
+}
+
+function buildTriggerCard(idx,pos,s){
+  const order=(C.config||{}).triggerOrder||[];
+  const isFirst=pos===0, isLast=pos===order.length-1;
+  return `
+  <div class="card-header" onclick="toggleCard(${idx})">
+    <span class="arrow" id="arr-${idx}">&#9654;</span>
+    <label class="toggle" onclick="event.stopPropagation()"><input type="checkbox" id="ten-${idx}" ${s.enabled?'checked':''} onchange="quickSaveTrigger(${idx},'enabled',this.checked)"><span class="slider"></span></label>
+    <span class="tname" id="tname-${idx}">${esc(s.name||'Trigger '+(idx+1))}</span>
+    <span id="tbadge-${idx}" style="font-size:11px;color:var(--fg3)">${triggerBadge(s)}</span>
+    <button class="btn-icon" onclick="event.stopPropagation();moveTrigger(${idx},-1)" ${isFirst?'disabled':''}title="Move up">&#9650;</button>
+    <button class="btn-icon" onclick="event.stopPropagation();moveTrigger(${idx},1)" ${isLast?'disabled':''}title="Move down">&#9660;</button>
+    <button class="btn-icon" onclick="event.stopPropagation();removeTrigger(${idx})" title="Delete" style="color:var(--red)">&times;</button>
+  </div>
+  <div class="card-body" id="tbody-${idx}">
+    ${buildTriggerBody(idx,s)}
+  </div>`;
+}
+
+function buildTriggerBody(idx,s){
+  let h=`
+  <div class="fg">
+    <label><span>Name</span><input type="text" data-tf="name" value="${esc(s.name||'')}" onchange="$('#tname-${idx}').textContent=this.value"></label>
+    <label><span>Source</span><select data-tf="source" onchange="onSourceChange(${idx},this)">
+      ${srcNames.map((n,i)=>`<option value="${i}"${i===s.source?' selected':''}>${n}</option>`).join('')}
+    </select></label>
+  </div>`;
+
+  // Source-specific fields
+  if(s.source===SRC.SENSORS){
+    h+=`<div class="fg">
+      <label><span>Type</span><select data-tf="type" onchange="onTypeChange(${idx},this)">
+        <option value="0"${s.type===0?' selected':''}>Analog (Pot/Slider)</option>
+        <optgroup label="Buttons">
+          <option value="1"${s.type===1?' selected':''}>Momentary</option>
+          <option value="2"${s.type===2?' selected':''}>Toggle</option>
+          <option value="5"${s.type===5?' selected':''}>Double Click</option>
+          <option value="6"${s.type===6?' selected':''}>Triple Click</option>
+          <option value="7"${s.type===7?' selected':''}>Long Press</option>
+        </optgroup>
+        <optgroup label="Other">
+          <option value="4"${s.type===4?' selected':''}>Encoder</option>
+          <option value="3"${s.type===3?' selected':''}>Digital Input</option>
+          <option value="8"${s.type===8?' selected':''}>GPIO Input</option>
+          <option value="9"${s.type===9?' selected':''}>Ultrasonic (HC-SR04)</option>
+        </optgroup>
+      </select></label>`;
+    // Pin fields depend on type
+    if(s.type===TYPES.ENCODER){
+      h+=`<label><span>CLK Pin</span><input type="number" data-tf="encClkPin" value="${s.encClkPin}"></label>
+        <label><span>DT Pin</span><input type="number" data-tf="encDtPin" value="${s.encDtPin}"></label>
+        <label><span>Switch Pin</span><input type="number" data-tf="encSwPin" value="${s.encSwPin}"></label>`;
+      h+=`</div>`;
+      h+=`<div class="trow"><label class="toggle"><input type="checkbox" data-tf="encInvert" ${s.encInvert?'checked':''}><span class="slider"></span></label><span>Invert Direction</span></div>`;
+      h+=`<div class="trow"><label class="toggle"><input type="checkbox" data-tf="encAppendSign" ${s.encAppendSign?'checked':''}><span class="slider"></span></label><span>Append +/- Sign</span></div>`;
+      h+=`<div class="trow"><label class="toggle"><input type="checkbox" data-tf="encSignArg" ${s.encSignArg?'checked':''}><span class="slider"></span></label><span>Sign as Separate Arg</span></div>`;
+    }else if(s.type===TYPES.HCSR04){
+      h+=`<label><span>Trigger Pin</span><input type="number" data-tf="hcTrigPin" value="${s.hcTrigPin}"></label>
+        <label><span>Echo Pin</span><input type="number" data-tf="hcEchoPin" value="${s.hcEchoPin}"></label>
+        <label><span>Min (cm)</span><input type="number" data-tf="hcMinCm" value="${s.hcMinCm}" step="0.1"></label>
+        <label><span>Max (cm)</span><input type="number" data-tf="hcMaxCm" value="${s.hcMaxCm}" step="0.1"></label>`;
+      h+=`</div>`;
+    }else{
+      h+=`<label><span>Pin</span><input type="number" data-tf="pin" value="${s.pin}"></label>`;
+      h+=`</div>`;
+      if([TYPES.BUTTON,TYPES.TOGGLE,TYPES.DIGITAL,TYPES.DBL,TYPES.TRP,TYPES.LONG,TYPES.GPIO].includes(s.type)){
+        h+=`<div class="trow"><label class="toggle"><input type="checkbox" data-tf="activeHigh" ${s.activeHigh?'checked':''}><span class="slider"></span></label><span>Active High</span></div>`;
+        h+=`<div class="trow"><label class="toggle"><input type="checkbox" data-tf="pullup" ${s.pullup?'checked':''}><span class="slider"></span></label><span>Internal Pull-Up</span></div>`;
+      }
+      if(s.type===TYPES.ANALOG){
+        h+=`<div class="trow"><label class="toggle"><input type="checkbox" data-tf="invert" ${s.invert?'checked':''}><span class="slider"></span></label><span>Invert Range</span></div>`;
+      }
+    }
+  }else if(s.source===SRC.OSC){
+    h+=`<div class="fg">
+      <label class="full"><span>OSC Address Pattern</span><input type="text" data-tf="oscInAddress" value="${esc(s.oscInAddress||'/trigger/*')}"><div class="hint">Use * as wildcard</div></label>
+      <label><span>Argument Type</span><select data-tf="oscInArgType">
+        ${oscArgTypes.map((n,i)=>`<option value="${i}"${i===s.oscInArgType?' selected':''}>${n}</option>`).join('')}
+      </select></label>
+      <label><span>Match Mode</span><select data-tf="oscInMatchMode" onchange="onOscMatchChange(${idx},this)">
+        ${oscMatchModes.map((n,i)=>`<option value="${i}"${i===s.oscInMatchMode?' selected':''}>${n}</option>`).join('')}
+      </select></label>`;
+    if(s.oscInMatchMode===1){
+      h+=`<label><span>Match Value</span><input type="text" data-tf="oscInValue" value="${s.oscInValue}"></label>`;
+      h+=`<label><span>Match String</span><input type="text" data-tf="oscInString" value="${esc(s.oscInString||'')}"></label>`;
+    }else if(s.oscInMatchMode===2){
+      h+=`<label><span>Range Min</span><input type="number" data-tf="oscInMin" value="${s.oscInMin}" step="any"></label>`;
+      h+=`<label><span>Range Max</span><input type="number" data-tf="oscInMax" value="${s.oscInMax}" step="any"></label>`;
+    }
+    h+=`</div>`;
+  }else if(s.source===SRC.TIME){
+    h+=`<div class="fg">
+      <label><span>Schedule Type</span><select data-tf="timeType" onchange="onTimeTypeChange(${idx},this)">
+        ${timeTypes.map((n,i)=>`<option value="${i}"${i===s.timeType?' selected':''}>${n}</option>`).join('')}
+      </select></label>`;
+    if(s.timeType===0){
+      h+=`<label><span>Year</span><input type="number" data-tf="timeYear" value="${s.timeYear}"></label>
+        <label><span>Month</span><input type="number" data-tf="timeMonth" value="${s.timeMonth}" min="1" max="12"></label>
+        <label><span>Day</span><input type="number" data-tf="timeDay" value="${s.timeDay}" min="1" max="31"></label>`;
+    }
+    if(s.timeType<=1){
+      h+=`<label><span>Hour</span><input type="number" data-tf="timeHour" value="${s.timeHour}" min="0" max="23"></label>
+        <label><span>Minute</span><input type="number" data-tf="timeMinute" value="${s.timeMinute}" min="0" max="59"></label>
+        <label><span>Second</span><input type="number" data-tf="timeSecond" value="${s.timeSecond}" min="0" max="59"></label>`;
+    }
+    if(s.timeType===2){
+      h+=`</div><div class="fg cols3"><label class="full"><span>Days</span><div style="display:flex;gap:6px;flex-wrap:wrap">`;
+      days.forEach((d,i)=>{
+        const checked=((s.weeklyMask||0)>>i)&1;
+        h+=`<label style="display:flex;align-items:center;gap:3px;font-weight:400;cursor:pointer">
+          <input type="checkbox" data-weekly="${i}" ${checked?'checked':''}> ${d}</label>`;
+      });
+      h+=`</div></label>`;
+      h+=`<label><span>Hour</span><input type="number" data-tf="timeHour" value="${s.timeHour}" min="0" max="23"></label>
+        <label><span>Minute</span><input type="number" data-tf="timeMinute" value="${s.timeMinute}" min="0" max="59"></label>
+        <label><span>Second</span><input type="number" data-tf="timeSecond" value="${s.timeSecond}" min="0" max="59"></label>`;
+    }
+    if(s.timeType===3){
+      h+=`<label><span>Interval (seconds)</span><input type="number" data-tf="intervalSeconds" value="${s.intervalSeconds||60}" min="1"></label>`;
+    }
+    h+=`</div>`;
+  }
+
+  // Cooldown
+  h+=`<div class="trow" style="margin-top:8px"><label class="toggle"><input type="checkbox" data-tf="cooldownEnabled" ${s.cooldownEnabled?'checked':''}><span class="slider"></span></label><span>Cooldown</span></div>`;
+  if(s.cooldownEnabled){
+    h+=`<div class="fg"><label><span>Cooldown (ms)</span><input type="number" data-tf="cooldownMs" value="${s.cooldownMs||5000}"></label></div>`;
+  }
+
+  // Outputs
+  h+=`<div class="sec" style="margin-top:12px">Outputs (${(s.outputs||[]).length}/${5})</div>`;
+  (s.outputs||[]).forEach((o,oi)=>{
+    h+=buildOutputCard(idx,oi,o,s);
+  });
+  if((s.outputs||[]).length<5){
+    h+=`<button class="btn-sm btn-outline" style="margin-bottom:10px" onclick="addOutput(${idx})">+ Add Output</button>`;
+  }
+
+  h+=`<div class="actions"><button onclick="saveTrigger(${idx})">Save Trigger</button></div>`;
+  return h;
+}
+
+function buildOutputCard(idx,oi,o,s){
+  const isButton=[TYPES.BUTTON,TYPES.TOGGLE,TYPES.DBL,TYPES.TRP,TYPES.LONG].includes(s.type);
+  const isAnalog=[TYPES.ANALOG,TYPES.ENCODER,TYPES.HCSR04].includes(s.type);
+  let h=`<div class="out-card" data-oi="${oi}">
+    <div class="out-header">
+      <span class="out-num">OUT ${oi+1}</span>
+      <div style="flex:1"></div>
+      ${(s.outputs||[]).length>1?`<button class="btn-icon" onclick="removeOutput(${idx},${oi})" title="Remove" style="color:var(--red)">&times;</button>`:''}
+    </div>
+    <div class="fg">
+      <label><span>Target</span><select data-of="target" onchange="onTargetChange(${idx},this)">
+        ${targetNames.map((n,i)=>`<option value="${i}"${i===o.target?' selected':''}>${n}</option>`).join('')}
+      </select></label>`;
+
+  if(o.target===TARGETS.OSC){
+    h+=`<label><span>Device</span><select data-of="device">${deviceOpts(o.device)}</select></label>`;
+    if(isAnalog){
+      h+=`<label class="full"><span>OSC Address</span><input type="text" data-of="oscAddress" value="${esc(o.oscAddress||'')}"></label>
+        <label><span>Output Mode</span><select data-of="outMode">${outModeNames.map((n,i)=>`<option value="${i}"${i===o.outMode?' selected':''}>${n}</option>`).join('')}</select></label>
+        <label><span>Min</span><input type="number" data-of="outMin" value="${o.outMin}" step="any"></label>
+        <label><span>Max</span><input type="number" data-of="outMax" value="${o.outMax}" step="any"></label>`;
+      if(o.outMode===2){
+        h+=`<label><span>On String</span><input type="text" data-of="onString" value="${esc(o.onString||'')}"></label>
+          <label><span>Off String</span><input type="text" data-of="offString" value="${esc(o.offString||'')}"></label>`;
+      }
+    }
+    if(isButton||s.source===SRC.TIME||s.source===SRC.OSC){
+      h+=`<label class="full"><span>OSC Address</span><input type="text" data-of="oscAddress" value="${esc(o.oscAddress||'')}"></label>
+        <label><span>Output Mode</span><select data-of="outMode">${outModeNames.map((n,i)=>`<option value="${i}"${i===o.outMode?' selected':''}>${n}</option>`).join('')}</select></label>
+        <label><span>On Value</span><input type="number" data-of="outMax" value="${o.outMax}" step="any"></label>
+        <label><span>Off Value</span><input type="number" data-of="outMin" value="${o.outMin}" step="any"></label>`;
+      h+=`</div><div class="trow"><label class="toggle"><input type="checkbox" data-of="sendMinOnRelease" ${o.sendMinOnRelease?'checked':''}><span class="slider"></span></label><span>Send Off on release</span></div><div class="fg">`;
+      if(o.outMode===2){
+        h+=`<label><span>On String</span><input type="text" data-of="onString" value="${esc(o.onString||'')}"></label>
+          <label><span>Off String</span><input type="text" data-of="offString" value="${esc(o.offString||'')}"></label>`;
+      }
+    }
+  }else if(o.target===TARGETS.UDP){
+    h+=`<label><span>Device</span><select data-of="device">${deviceOpts(o.device)}</select></label>
+      <label class="full"><span>Payload</span><input type="text" data-of="udpPayload" value="${esc(o.udpPayload||'')}"></label>`;
+  }else if(o.target===TARGETS.GPIO){
+    h+=`<label><span>GPIO Pin</span><input type="number" data-of="gpioPin" value="${o.gpioPin}"></label>
+      <label><span>Mode</span><select data-of="gpioMode">${gpioModes.map((n,i)=>`<option value="${i}"${i===o.gpioMode?' selected':''}>${n}</option>`).join('')}</select></label>
+      <label><span>Pulse (ms)</span><input type="number" data-of="gpioPulseMs" value="${o.gpioPulseMs||500}"></label>`;
+    h+=`</div><div class="trow"><label class="toggle"><input type="checkbox" data-of="gpioInvert" ${o.gpioInvert?'checked':''}><span class="slider"></span></label><span>Invert</span></div><div class="fg">`;
+  }else if(o.target===TARGETS.HTTP){
+    h+=`<label><span>Method</span><select data-of="httpMethod">${httpMethods.map((n,i)=>`<option value="${i}"${i===o.httpMethod?' selected':''}>${n}</option>`).join('')}</select></label>
+      <label class="full"><span>URL</span><input type="text" data-of="httpUrl" value="${esc(o.httpUrl||'')}" placeholder="http://192.168.0.100/api"></label>
+      <label><span>IP (or leave empty for URL)</span><input type="text" data-of="httpIp" value="${esc(o.httpIp||'')}"></label>
+      <label><span>Port</span><input type="number" data-of="httpPort" value="${o.httpPort||80}"></label>
+      <label><span>Device</span><select data-of="httpDevice"><option value="255"${o.httpDevice===255?' selected':''}>None (use IP/URL)</option>${deviceOpts(o.httpDevice===255?-1:o.httpDevice)}</select></label>
+      <label class="full"><span>Body</span><textarea data-of="httpBody">${esc(o.httpBody||'')}</textarea></label>`;
+  }else if(o.target===TARGETS.MQTT){
+    h+=`<label class="full"><span>Topic</span><input type="text" data-of="mqttTopic" value="${esc(o.mqttTopic||'')}"></label>
+      <label class="full"><span>Payload</span><input type="text" data-of="mqttPayload" value="${esc(o.mqttPayload||'{value}')}" placeholder="{value}"></label>`;
+    h+=`</div><div class="trow"><label class="toggle"><input type="checkbox" data-of="mqttRetain" ${o.mqttRetain?'checked':''}><span class="slider"></span></label><span>Retain</span></div><div class="fg">`;
+  }else if(o.target===TARGETS.DMX){
+    h+=`<label><span>Protocol</span><select data-of="dmxProtocol">${dmxProtos.map((n,i)=>`<option value="${i}"${i===o.dmxProtocol?' selected':''}>${n}</option>`).join('')}</select></label>
+      <label><span>Destination</span><select data-of="dmxDest">${dmxDests.map((n,i)=>`<option value="${i}"${i===o.dmxDest?' selected':''}>${n}</option>`).join('')}</select></label>`;
+    if(o.dmxDest===1){
+      h+=`<label><span>Device</span><select data-of="device">${deviceOpts(o.device)}</select></label>`;
+    }
+    if(o.dmxProtocol===0){
+      h+=`<label><span>Art-Net Net</span><input type="number" data-of="dmxArtNet" value="${o.dmxArtNet||0}" min="0" max="127"></label>
+        <label><span>Subnet</span><input type="number" data-of="dmxArtSubnet" value="${o.dmxArtSubnet||0}" min="0" max="15"></label>
+        <label><span>Universe</span><input type="number" data-of="dmxArtUniverse" value="${o.dmxArtUniverse||0}" min="0" max="15"></label>`;
+    }else{
+      h+=`<label><span>Universe</span><input type="number" data-of="dmxUniverse" value="${o.dmxUniverse||1}" min="1"></label>`;
+    }
+    h+=`<label><span>Channels <span style="font-weight:400;color:var(--fg3)">(e.g. 1,5,10-20)</span></span><input type="text" data-of="dmxChannels" value="${esc(o.dmxChannels||'1')}" placeholder="1,5,10-20"></label>
+      <label><span>Min Value</span><input type="number" data-of="outMin" value="${o.outMin}" step="any"></label>
+      <label><span>Max Value</span><input type="number" data-of="outMax" value="${o.outMax}" step="any"></label>
+      <label><span>Fade (ms)</span><input type="number" data-of="dmxFadeMs" value="${o.dmxFadeMs||0}" min="0"></label>`;
+  }else if(o.target===TARGETS.DMX_PRESET){
+    h+=`<label><span>Protocol</span><select data-of="dmxProtocol">${dmxProtos.map((n,i)=>`<option value="${i}"${i===o.dmxProtocol?' selected':''}>${n}</option>`).join('')}</select></label>
+      <label><span>Preset ID</span><input type="number" data-of="dmxPreset" value="${o.dmxPreset||1}" min="1"></label>
+      <label><span>Fade (ms)</span><input type="number" data-of="dmxFadeMs" value="${o.dmxFadeMs||0}" min="0"></label>`;
+  }
+  // Reboot and Reset Cooldowns have no extra fields
+
+  h+=`</div></div>`;
+  return h;
+}
+
+/* ===== TRIGGER EVENTS ===== */
+function toggleCard(idx){
+  const body=$('#tbody-'+idx);
+  const arr=$('#arr-'+idx);
+  if(!body)return;
+  const open=body.classList.toggle('open');
+  arr.classList.toggle('open',open);
+}
+
+function bindTriggerEvents(card,idx){
+  // Nothing extra needed; events are inline
+}
+
+function onSourceChange(idx,sel){
+  const s=getTriggerData(idx);
+  s.source=parseInt(sel.value);
+  if(s.source===SRC.SENSORS)s.type=TYPES.BUTTON;
+  refreshTriggerBody(idx,s);
+}
+function onTypeChange(idx,sel){
+  const s=getTriggerData(idx);
+  s.type=parseInt(sel.value);
+  // Default sendMinOnRelease based on type
+  if(s.type===TYPES.TOGGLE||s.type===TYPES.ANALOG||s.type===TYPES.ENCODER||s.type===TYPES.HCSR04){
+    (s.outputs||[]).forEach(o=>{o.sendMinOnRelease=true;});
+  }
+  refreshTriggerBody(idx,s);
+}
+function onOscMatchChange(idx,sel){
+  const s=getTriggerData(idx);
+  s.oscInMatchMode=parseInt(sel.value);
+  refreshTriggerBody(idx,s);
+}
+function onTimeTypeChange(idx,sel){
+  const s=getTriggerData(idx);
+  s.timeType=parseInt(sel.value);
+  refreshTriggerBody(idx,s);
+}
+function onTargetChange(idx,sel){
+  // Re-collect and refresh
+  const s=getTriggerData(idx);
+  refreshTriggerBody(idx,s);
+}
+
+function refreshTriggerBody(idx,s){
+  const body=$('#tbody-'+idx);
+  if(!body)return;
+  body.innerHTML=buildTriggerBody(idx,s);
+  body.classList.add('open');
+  $('#arr-'+idx).classList.add('open');
+  // Update local config
+  const sensors=C.config.sensors||(C.config.sensors=[]);
+  sensors[idx]=s;
+}
+
+function getTriggerData(idx){
+  const card=$('#tc-'+idx);
+  if(!card)return C.config.sensors[idx]||{};
+  const s=Object.assign({},C.config.sensors[idx]||{});
+
+  // Collect form fields
+  const intTfKeys=['source','type','pin','encClkPin','encDtPin','encSwPin','hcTrigPin','hcEchoPin','cooldownMs',
+    'oscInArgType','oscInMatchMode','timeType','timeYear','timeMonth','timeDay','timeHour','timeMinute','timeSecond',
+    'weeklyMask','intervalSeconds'];
+  const floatTfKeys=['oscInValue','oscInMin','oscInMax','hcMinCm','hcMaxCm'];
+  $$('[data-tf]',card).forEach(el=>{
+    const k=el.dataset.tf;
+    if(el.type==='checkbox')s[k]=el.checked;
+    else if(intTfKeys.includes(k))s[k]=parseInt(el.value)||0;
+    else if(floatTfKeys.includes(k))s[k]=parseFloat(el.value)||0;
+    else if(el.type==='number')s[k]=parseFloat(el.value)||0;
+    else s[k]=el.value;
+  });
+
+  // Weekly mask
+  let mask=0;
+  $$('[data-weekly]',card).forEach(cb=>{if(cb.checked)mask|=(1<<parseInt(cb.dataset.weekly))});
+  if($$('[data-weekly]',card).length)s.weeklyMask=mask;
+
+  // Collect outputs
+  const outCards=$$('.out-card',card);
+  s.outputs=outCards.map((oc,oi)=>{
+    const o=Object.assign({},(s.outputs||[])[oi]||{});
+    o.index=oi;
+    $$('[data-of]',oc).forEach(el=>{
+      const k=el.dataset.of;
+      if(el.type==='checkbox')o[k]=el.checked;
+      else if(el.type==='number'||['outMin','outMax','buttonOutMin','buttonOutMax','httpPort','dmxFadeMs','dmxPreset','dmxUniverse','dmxArtNet','dmxArtSubnet','dmxArtUniverse','gpioPin','gpioPulseMs','device','httpDevice','httpMethod','target','outMode','buttonOutMode','gpioMode','dmxProtocol','dmxDest'].includes(k)){
+        const v=el.tagName==='SELECT'?parseInt(el.value):parseFloat(el.value);
+        o[k]=isNaN(v)?0:v;
+      }else{
+        o[k]=el.value;
+      }
+    });
+    return o;
+  });
+  s.outputCount=s.outputs.length;
+  return s;
+}
+
+function triggerBadge(s){
+  const src=s.source===SRC.SENSORS?(typeNames[s.type]||''):(srcNames[s.source]||'');
+  const tgt=s.outputs&&s.outputs[0]?(' → '+(targetNames[s.outputs[0].target]||'')):'';
+  return src+tgt;
+}
+
+async function saveTrigger(idx){
+  pauseLive();showBusy('Saving trigger...');
+  try{
+    const s=getTriggerData(idx);
+    const resp=await api('/api/trigger/'+idx,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(s)});
+    C.config.sensors[idx]=resp;
+    refreshTriggerBody(idx,resp);
+    const badge=$('#tbadge-'+idx);if(badge)badge.textContent=triggerBadge(resp);
+    const tname=$('#tname-'+idx);if(tname)tname.textContent=resp.name||'Trigger '+(idx+1);
+    toast('Trigger saved!');
+  }catch(e){}
+  finally{hideBusy();resumeLive();}
+}
+
+async function quickSaveTrigger(idx,key,val){
+  const s=C.config.sensors[idx];
+  if(!s)return;
+  s[key]=val;
+  try{
+    await api('/api/trigger/'+idx,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(s)});
+  }catch(e){}
+}
+
+let _addingTrigger=false;
+async function addTrigger(){
+  if(_addingTrigger)return;
+  _addingTrigger=true;
+  pauseLive();showBusy('Adding trigger...');
+  try{
+    const t=await api('/api/triggers/add',{method:'POST'});
+    C=await api('/api/config');
+    renderTriggers();
+    toast('Trigger added!');
+    setTimeout(()=>toggleCard(t.index),100);
+  }catch(e){}
+  finally{_addingTrigger=false;hideBusy();resumeLive();}
+}
+
+async function removeTrigger(idx){
+  if(!confirm('Delete this trigger?'))return;
+  try{
+    await api('/api/trigger/'+idx,{method:'DELETE'});
+    C=await api('/api/config');
+    renderTriggers();
+    toast('Trigger removed.');
+  }catch(e){}
+}
+
+async function moveTrigger(idx,dir){
+  const order=[...(C.config.triggerOrder||[])];
+  const pos=order.indexOf(idx);
+  if(pos<0)return;
+  const np=pos+dir;
+  if(np<0||np>=order.length)return;
+  [order[pos],order[np]]=[order[np],order[pos]];
+  try{
+    await api('/api/triggers/reorder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({order})});
+    C.config.triggerOrder=order;
+    renderTriggers();
+  }catch(e){}
+}
+
+let dragIdx=null;
+function onDragStart(e,idx){
+  dragIdx=idx;
+  e.dataTransfer.effectAllowed='move';
+  e.target.style.opacity='0.5';
+}
+function onDragEnd(e){
+  e.target.style.opacity='1';
+  dragIdx=null;
+  $$('.card.drag-over').forEach(c=>c.classList.remove('drag-over'));
+}
+function onDragOver(e,idx){
+  e.preventDefault();
+  e.dataTransfer.dropEffect='move';
+  const card=e.currentTarget;
+  $$('.card.drag-over').forEach(c=>c.classList.remove('drag-over'));
+  card.classList.add('drag-over');
+}
+function onDrop(e,idx){
+  e.preventDefault();
+  $$('.card.drag-over').forEach(c=>c.classList.remove('drag-over'));
+  if(dragIdx===null||dragIdx===idx)return;
+  const order=[...(C.config||{}).triggerOrder||[]];
+  const fromPos=order.indexOf(dragIdx);
+  const toPos=order.indexOf(idx);
+  if(fromPos<0||toPos<0)return;
+  order.splice(fromPos,1);
+  order.splice(toPos,0,dragIdx);
+  pauseLive();
+  api('/api/triggers/reorder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({order})})
+    .then(()=>{C.config.triggerOrder=order;renderTriggers();toast('Reordered!');})
+    .catch(()=>{})
+    .finally(()=>resumeLive());
+}
+
+function addOutput(idx){
+  const s=C.config.sensors[idx];
+  if(!s||!s.outputs)return;
+  if(s.outputs.length>=5)return;
+  s.outputs.push({index:s.outputs.length,target:0,device:0,oscAddress:'/new',buttonAddress:'/new',
+    outMin:0,outMax:100,outMode:0,buttonOutMin:0,buttonOutMax:1,buttonOutMode:0,
+    sendMinOnRelease:false,onString:'on',offString:'off',buttonOnString:'on',buttonOffString:'off',
+    udpPayload:'',gpioPin:-1,gpioMode:0,gpioPulseMs:500,gpioInvert:false,
+    httpMethod:0,httpUrl:'',httpBody:'',httpIp:'',httpPort:80,httpDevice:255,
+    mqttTopic:'',mqttPayload:'{value}',mqttRetain:false,
+    dmxProtocol:0,dmxDest:0,dmxArtNet:0,dmxArtSubnet:0,dmxArtUniverse:0,
+    dmxUniverse:1,dmxChannels:'1',dmxPreset:1,dmxFadeMs:0});
+  s.outputCount=s.outputs.length;
+  refreshTriggerBody(idx,s);
+}
+
+function removeOutput(idx,oi){
+  const s=getTriggerData(idx);
+  s.outputs.splice(oi,1);
+  s.outputs.forEach((o,i)=>o.index=i);
+  s.outputCount=s.outputs.length;
+  C.config.sensors[idx]=s;
+  refreshTriggerBody(idx,s);
+}
+
+/* ===== LIVE POLLING ===== */
+async function pollLive(){
+  try{
+    const d=await fetch('/api/live').then(r=>r.json());
+    $('#bar-ip').textContent=d.ip||'--';
+    $('#bar-heap').textContent='Heap: '+(d.heap?(d.heap/1024).toFixed(0)+'KB':'--');
+    $('#bar-uptime').textContent='Up: '+fmtUptime(d.uptime||0);
+    $('#bar-time').textContent=d.time||'';
+    $('#bar-dot').classList.toggle('off',false);
+    liveErrors=0;
+  }catch(e){
+    $('#bar-dot').classList.add('off');
+    liveErrors++;
+    if(liveErrors>5&&liveTimer){clearInterval(liveTimer);liveTimer=setInterval(pollLive,10000);}
+    if(liveErrors>15&&liveTimer){clearInterval(liveTimer);liveTimer=null;$('#bar-uptime').textContent='Disconnected';}
+  }
+}
+
+/* ===== ESCAPE HTML ===== */
+function esc(s){
+  if(typeof s!=='string')return String(s==null?'':s);
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+/* ===== INIT ===== */
+async function init(){
+  initSettingsTabs();
+  // Enter key saves — find the closest save button and click it
+  document.addEventListener('keydown',function(e){
+    if(e.key==='Enter'&&e.target.tagName==='INPUT'&&e.target.type!=='checkbox'){
+      e.preventDefault();
+      // Find closest save button
+      var p=e.target.closest('.tab-content,.trigger-body');
+      if(p){var btn=p.querySelector('button[onclick*="save"]');if(btn){btn.click();return;}}
+      // Fallback: if in settings area
+      var st=e.target.closest('#settings-area');
+      if(st){saveAllSettings();return;}
+    }
+  });
+  try{
+    C=await api('/api/config');
+    ST=await api('/api/status');
+    if(!C.config.sensors) C.config.sensors=[];
+    renderSettings();
+    renderTriggers();
+  }catch(e){
+    toast('Failed to load config — retrying...','err');
+    setTimeout(init,2000);
+    return;
+  }
+  pollLive();
+  liveTimer=setInterval(pollLive,2000);
+}
+
+init();
+</script>
+</body>
+</html>
