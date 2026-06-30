@@ -136,7 +136,8 @@ enum OutputTarget {
   OUT_TARGET_HTTP = 5,
   OUT_TARGET_MQTT = 6,
   OUT_TARGET_DMX = 7,
-  OUT_TARGET_DMX_PRESET = 8
+  OUT_TARGET_DMX_PRESET = 8,
+  OUT_TARGET_SET_VAR = 9
 };
 
 enum DmxProtocol {
@@ -245,9 +246,14 @@ struct SensorConfig {
   float hcMaxCm;
   bool cooldownEnabled;
   uint32_t cooldownMs;
+  bool conditionEnabled;
+  String conditionVar;
+  uint8_t conditionOp;  // 0=eq, 1=neq, 2=gt, 3=lt, 4=gte, 5=lte
+  float conditionValue;
   uint8_t outputCount;
   struct OutputConfig {
     OutputTarget target;
+    uint32_t delayMs;
     uint8_t device;
     String oscAddress;
     String buttonAddress;
@@ -285,6 +291,8 @@ struct SensorConfig {
     String offString;
     String buttonOnString;
     String buttonOffString;
+    String setVarName;
+    float setVarValue;
   } outputs[MAX_OUTPUTS_PER_TRIGGER];
   TimeTriggerType timeType;
   uint16_t timeYear;
@@ -375,6 +383,58 @@ uint32_t gpioPulseUntilByPin[40];
 int8_t gpioPwmChannelByPin[40];
 uint8_t nextGpioPwmChannel = 0;
 int8_t gpioPulseEndLevelByPin[40];
+
+struct PendingOutput {
+  bool active;
+  uint32_t fireAtMs;
+  uint8_t sensorIndex;
+  uint8_t outputIndex;
+  float norm;
+};
+const int MAX_PENDING_OUTPUTS = 20;
+PendingOutput pendingOutputs[MAX_PENDING_OUTPUTS];
+
+const int MAX_GLOBAL_VARS = 16;
+struct GlobalVar {
+  String name;
+  float value;
+};
+GlobalVar globalVars[MAX_GLOBAL_VARS];
+int globalVarCount = 0;
+
+static float getGlobalVar(const String& name) {
+  for (int i = 0; i < globalVarCount; i++) {
+    if (globalVars[i].name == name) return globalVars[i].value;
+  }
+  return 0.0f;
+}
+
+static void setGlobalVar(const String& name, float value) {
+  for (int i = 0; i < globalVarCount; i++) {
+    if (globalVars[i].name == name) { globalVars[i].value = value; return; }
+  }
+  if (globalVarCount < MAX_GLOBAL_VARS) {
+    globalVars[globalVarCount].name = name;
+    globalVars[globalVarCount].value = value;
+    globalVarCount++;
+  }
+}
+
+enum ConditionOp { COND_EQ=0, COND_NEQ=1, COND_GT=2, COND_LT=3, COND_GTE=4, COND_LTE=5 };
+
+static bool checkCondition(const SensorConfig& s) {
+  if (!s.conditionEnabled || s.conditionVar.length() == 0) return true;
+  float v = getGlobalVar(s.conditionVar);
+  switch (s.conditionOp) {
+    case COND_EQ:  return v == s.conditionValue;
+    case COND_NEQ: return v != s.conditionValue;
+    case COND_GT:  return v > s.conditionValue;
+    case COND_LT:  return v < s.conditionValue;
+    case COND_GTE: return v >= s.conditionValue;
+    case COND_LTE: return v <= s.conditionValue;
+    default: return true;
+  }
+}
 
 const uint16_t ARTNET_PORT = 6454;
 const uint16_t SACN_PORT = 5568;
@@ -499,6 +559,7 @@ static void pollNtpSync();
 static bool parseDateYMD(const String& dateStr, uint16_t& y, uint8_t& m, uint8_t& d);
 static bool parseTimeHMS(const String& timeStr, uint8_t& h, uint8_t& m, uint8_t& s);
 static void sendOutputNow(const SensorConfig& sensor, const SensorConfig::OutputConfig& out, const String& addr, float norm);
+static void queueOrSendOutput(const SensorConfig& sensor, const SensorConfig::OutputConfig& out, const String& addr, float norm);
 static bool handleTimeTrigger(int index, SensorConfig& s);
 static int compareVersion(const String& a, const String& b);
 static String exportConfigJson();
@@ -963,6 +1024,10 @@ static String exportConfigJson() {
     so["hcMaxCm"] = s.hcMaxCm;
     so["cooldownEnabled"] = s.cooldownEnabled;
     so["cooldownMs"] = s.cooldownMs;
+    so["conditionEnabled"] = s.conditionEnabled;
+    so["conditionVar"] = s.conditionVar;
+    so["conditionOp"] = s.conditionOp;
+    so["conditionValue"] = s.conditionValue;
     so["outputCount"] = s.outputCount;
     JsonArray outs = so.createNestedArray("outputs");
     for (int o = 0; o < s.outputCount && o < MAX_OUTPUTS_PER_TRIGGER; o++) {
@@ -970,6 +1035,7 @@ static String exportConfigJson() {
       JsonObject oo = outs.createNestedObject();
       oo["index"] = o;
       oo["target"] = static_cast<int>(out.target);
+      oo["delayMs"] = out.delayMs;
       oo["device"] = out.device;
       oo["oscAddress"] = out.oscAddress;
       oo["buttonAddress"] = out.buttonAddress;
@@ -1007,6 +1073,8 @@ static String exportConfigJson() {
       oo["offString"] = out.offString;
       oo["buttonOnString"] = out.buttonOnString;
       oo["buttonOffString"] = out.buttonOffString;
+      oo["setVarName"] = out.setVarName;
+      oo["setVarValue"] = out.setVarValue;
     }
     so["timeType"] = static_cast<int>(s.timeType);
     so["timeYear"] = s.timeYear;
@@ -1181,6 +1249,10 @@ static bool applyConfigFromJson(const JsonObject& cfg, String& err) {
       if (so.containsKey("hcMaxCm")) s.hcMaxCm = so["hcMaxCm"];
       if (so.containsKey("cooldownEnabled")) s.cooldownEnabled = so["cooldownEnabled"];
       if (so.containsKey("cooldownMs")) s.cooldownMs = so["cooldownMs"];
+      if (so.containsKey("conditionEnabled")) s.conditionEnabled = so["conditionEnabled"];
+      if (so.containsKey("conditionVar")) s.conditionVar = String(so["conditionVar"].as<const char*>());
+      if (so.containsKey("conditionOp")) s.conditionOp = so["conditionOp"];
+      if (so.containsKey("conditionValue")) s.conditionValue = so["conditionValue"];
       if (so.containsKey("outputCount")) {
         int oc = so["outputCount"];
         if (oc < 1) oc = 1;
@@ -1196,6 +1268,7 @@ static bool applyConfigFromJson(const JsonObject& cfg, String& err) {
           if (oidx < 0 || oidx >= MAX_OUTPUTS_PER_TRIGGER) continue;
           SensorConfig::OutputConfig out = s.outputs[oidx];
           if (oo.containsKey("target")) out.target = sanitizeOutputTarget(oo["target"].as<int>());
+          if (oo.containsKey("delayMs")) out.delayMs = oo["delayMs"];
           if (oo.containsKey("device")) out.device = oo["device"];
           if (oo.containsKey("oscAddress")) out.oscAddress = String(oo["oscAddress"].as<const char*>());
           if (oo.containsKey("buttonAddress")) out.buttonAddress = String(oo["buttonAddress"].as<const char*>());
@@ -1237,6 +1310,8 @@ static bool applyConfigFromJson(const JsonObject& cfg, String& err) {
           if (oo.containsKey("offString")) out.offString = String(oo["offString"].as<const char*>());
           if (oo.containsKey("buttonOnString")) out.buttonOnString = String(oo["buttonOnString"].as<const char*>());
           if (oo.containsKey("buttonOffString")) out.buttonOffString = String(oo["buttonOffString"].as<const char*>());
+          if (oo.containsKey("setVarName")) out.setVarName = String(oo["setVarName"].as<const char*>());
+          if (oo.containsKey("setVarValue")) out.setVarValue = oo["setVarValue"];
           if ((out.target == OUT_TARGET_DMX || out.target == OUT_TARGET_DMX_PRESET) && out.outMode == OUT_STRING) out.outMode = OUT_INT;
           s.outputs[oidx] = out;
         }
@@ -1363,7 +1438,7 @@ static OutputMode sanitizeOutputMode(int value) {
 }
 
 static OutputTarget sanitizeOutputTarget(int value) {
-  if (value < OUT_TARGET_OSC || value > OUT_TARGET_DMX_PRESET) return OUT_TARGET_OSC;
+  if (value < OUT_TARGET_OSC || value > OUT_TARGET_SET_VAR) return OUT_TARGET_OSC;
   return static_cast<OutputTarget>(value);
 }
 
@@ -1516,10 +1591,15 @@ static SensorConfig defaultSensorConfig(int index) {
   s.pullup = DEFAULT_DIGITAL_PULLUP;
   s.cooldownEnabled = false;
   s.cooldownMs = 5000;
+  s.conditionEnabled = false;
+  s.conditionVar = "";
+  s.conditionOp = COND_EQ;
+  s.conditionValue = 0.0f;
   s.outputCount = 1;
   bool defaultSendMin = (s.type == SENSOR_ANALOG || s.type == SENSOR_ENCODER);
   for (int o = 0; o < MAX_OUTPUTS_PER_TRIGGER; o++) {
     s.outputs[o].target = OUT_TARGET_OSC;
+    s.outputs[o].delayMs = 0;
     s.outputs[o].device = 0;
     s.outputs[o].oscAddress = defaultOscAddress(index);
     s.outputs[o].buttonAddress = "/button";
@@ -1557,6 +1637,8 @@ static SensorConfig defaultSensorConfig(int index) {
     s.outputs[o].offString = DEFAULT_OFF_STRING;
     s.outputs[o].buttonOnString = DEFAULT_ON_STRING;
     s.outputs[o].buttonOffString = DEFAULT_OFF_STRING;
+    s.outputs[o].setVarName = "";
+    s.outputs[o].setVarValue = 0.0f;
   }
   s.timeType = TIME_DAILY;
   s.timeYear = 2025;
@@ -1682,9 +1764,11 @@ static bool handleTimeTrigger(int index, SensorConfig& s) {
                                             (tmLocal.tm_mon + 1) * 100 +
                                             tmLocal.tm_mday);
   auto fire = [&]() {
+    if (!checkCondition(s)) return;
+    addLog(String("Time trigger: ") + s.name);
     for (int o = 0; o < s.outputCount; o++) {
       const SensorConfig::OutputConfig& out = s.outputs[o];
-      sendOutputNow(s, out, out.oscAddress, 1.0f);
+      queueOrSendOutput(s, out, out.oscAddress, 1.0f);
     }
   };
   if (s.timeType == TIME_ONCE) {
@@ -2238,6 +2322,10 @@ static void loadConfig() {
     s.pullup = prefs.getBool(sensorKey(i, "pu").c_str(), s.pullup);
     s.cooldownEnabled = prefs.getBool(sensorKey(i, "cd_en").c_str(), s.cooldownEnabled);
     s.cooldownMs = prefs.getUInt(sensorKey(i, "cd_ms").c_str(), s.cooldownMs);
+    s.conditionEnabled = prefs.getBool(sensorKey(i, "cden").c_str(), s.conditionEnabled);
+    s.conditionVar = prefs.getString(sensorKey(i, "cdvar").c_str(), s.conditionVar);
+    s.conditionOp = prefs.getUInt(sensorKey(i, "cdop").c_str(), s.conditionOp);
+    s.conditionValue = prefs.getFloat(sensorKey(i, "cdval").c_str(), s.conditionValue);
     bool hasOutputCount = prefs.isKey(sensorKey(i, "oc").c_str());
     if (hasOutputCount) {
       s.outputCount = prefs.getUInt(sensorKey(i, "oc").c_str(), s.outputCount);
@@ -2271,6 +2359,7 @@ static void loadConfig() {
         s.outputs[o].buttonOutMax = prefs.getFloat(baseBmax.c_str(), s.outputs[o].buttonOutMax);
         s.outputs[o].buttonOutMode = sanitizeOutputMode(prefs.getInt(baseBmode.c_str(), s.outputs[o].buttonOutMode));
         s.outputs[o].target = sanitizeOutputTarget(prefs.getInt(baseOt.c_str(), s.outputs[o].target));
+        s.outputs[o].delayMs = prefs.getUInt(outputKey(i, o, "dly").c_str(), 0);
         s.outputs[o].device = prefs.getInt(baseOd.c_str(), s.outputs[o].device);
         if (s.outputs[o].device >= MAX_OSC_DEVICES) s.outputs[o].device = 0;
         String baseSmin = hasOutputCount ? outputKey(i, o, "smin") : String();
@@ -2385,6 +2474,10 @@ static void loadConfig() {
         s.outputs[o].offString = prefs.getString(baseOff.c_str(), s.outputs[o].offString);
         s.outputs[o].buttonOnString = prefs.getString(baseBon.c_str(), s.outputs[o].buttonOnString);
         s.outputs[o].buttonOffString = prefs.getString(baseBoff.c_str(), s.outputs[o].buttonOffString);
+        if (hasOutputCount) {
+          s.outputs[o].setVarName = prefs.getString(outputKey(i, o, "svn").c_str(), s.outputs[o].setVarName);
+          s.outputs[o].setVarValue = prefs.getFloat(outputKey(i, o, "svv").c_str(), s.outputs[o].setVarValue);
+        }
       }
       if (s.outputs[o].oscAddress.length() == 0) s.outputs[o].oscAddress = defaultOscAddress(i);
       if (s.outputs[o].buttonAddress.length() == 0) s.outputs[o].buttonAddress = "/button";
@@ -2603,10 +2696,17 @@ static void saveConfig() {
         prefs.putFloat(sensorKey(i, "hcmax").c_str(), s.hcMaxCm);
       }
     }
+    if (s.conditionEnabled) {
+      prefs.putBool(sensorKey(i, "cden").c_str(), s.conditionEnabled);
+      prefs.putString(sensorKey(i, "cdvar").c_str(), s.conditionVar);
+      prefs.putUInt(sensorKey(i, "cdop").c_str(), s.conditionOp);
+      prefs.putFloat(sensorKey(i, "cdval").c_str(), s.conditionValue);
+    }
 
     for (int o = 0; o < s.outputCount; o++) {
       const SensorConfig::OutputConfig& out = s.outputs[o];
       prefs.putInt(outputKey(i, o, "tgt").c_str(), out.target);
+      if (out.delayMs > 0) prefs.putUInt(outputKey(i, o, "dly").c_str(), out.delayMs);
       // Common output fields
       prefs.putInt(outputKey(i, o, "omode").c_str(), out.outMode);
       prefs.putFloat(outputKey(i, o, "omin").c_str(), out.outMin);
@@ -2675,6 +2775,10 @@ static void saveConfig() {
         prefs.putUInt(outputKey(i, o, "dmxpr").c_str(), out.dmxPreset);
         prefs.putUInt(outputKey(i, o, "dmxfd").c_str(), out.dmxFadeMs);
         if (out.dmxDest == DMX_DEST_UNICAST) prefs.putInt(outputKey(i, o, "dev").c_str(), out.device);
+      }
+      if (out.target == OUT_TARGET_SET_VAR) {
+        prefs.putString(outputKey(i, o, "svn").c_str(), out.setVarName);
+        prefs.putFloat(outputKey(i, o, "svv").c_str(), out.setVarValue);
       }
     }
   }
@@ -3952,7 +4056,11 @@ static String buildOrderList(const uint8_t* order, uint8_t count) {
 
 static int findUnusedTrigger() {
   for (int i = 0; i < MAX_TRIGGERS; i++) {
-    if (!config.sensors[i].enabled) return i;
+    bool inOrder = false;
+    for (int j = 0; j < config.triggerCount; j++) {
+      if (config.triggerOrder[j] == static_cast<uint8_t>(i)) { inOrder = true; break; }
+    }
+    if (!inOrder) return i;
   }
   return -1;
 }
@@ -3972,6 +4080,13 @@ static int findUnusedOscDevice() {
 }
 
 static void sendOutputNow(const SensorConfig& sensor, const SensorConfig::OutputConfig& out, const String& addr, float norm) {
+  if (out.target == OUT_TARGET_SET_VAR) {
+    if (out.setVarName.length() > 0) {
+      setGlobalVar(out.setVarName, out.setVarValue);
+      addLog(String("Set var ") + out.setVarName + " = " + String(out.setVarValue));
+    }
+    return;
+  }
   if (out.target == OUT_TARGET_REBOOT) {
     if (sensor.type == SENSOR_ANALOG || sensor.type == SENSOR_ENCODER) return;
     addLog("Reboot triggered by output action.");
@@ -3985,6 +4100,7 @@ static void sendOutputNow(const SensorConfig& sensor, const SensorConfig::Output
     return;
   }
   if (out.target == OUT_TARGET_GPIO) {
+    addLog(String("GPIO out ") + String(out.gpioPin) + (norm >= 0.5f ? " HIGH" : " LOW"));
     applyGpioOutput(out, norm, false);
     return;
   }
@@ -4034,6 +4150,48 @@ static void sendOutputNow(const SensorConfig& sensor, const SensorConfig::Output
     outputValue = snapOutput(out, outputValue);
     int intValue = lroundf(outputValue);
     sendOscIntTo(ip, port, addr.c_str(), intValue);
+  }
+}
+
+static void queueOrSendOutput(const SensorConfig& sensor, const SensorConfig::OutputConfig& out, const String& addr, float norm) {
+  if (out.delayMs == 0) {
+    sendOutputNow(sensor, out, addr, norm);
+    return;
+  }
+  // Find sensor and output indices
+  int sIdx = -1, oIdx = -1;
+  for (int i = 0; i < MAX_TRIGGERS; i++) {
+    if (&config.sensors[i] == &sensor) { sIdx = i; break; }
+  }
+  oIdx = static_cast<int>(&out - &sensor.outputs[0]);
+  if (sIdx < 0 || oIdx < 0 || oIdx >= MAX_OUTPUTS_PER_TRIGGER) {
+    sendOutputNow(sensor, out, addr, norm);
+    return;
+  }
+  for (int i = 0; i < MAX_PENDING_OUTPUTS; i++) {
+    if (!pendingOutputs[i].active) {
+      pendingOutputs[i].active = true;
+      pendingOutputs[i].fireAtMs = millis() + out.delayMs;
+      pendingOutputs[i].sensorIndex = static_cast<uint8_t>(sIdx);
+      pendingOutputs[i].outputIndex = static_cast<uint8_t>(oIdx);
+      pendingOutputs[i].norm = norm;
+      addLog(String("Delayed ") + String(out.delayMs) + "ms: " + addr);
+      return;
+    }
+  }
+  // Queue full, fire immediately
+  sendOutputNow(sensor, out, addr, norm);
+}
+
+static void tickPendingOutputs() {
+  uint32_t now = millis();
+  for (int i = 0; i < MAX_PENDING_OUTPUTS; i++) {
+    if (pendingOutputs[i].active && static_cast<int32_t>(now - pendingOutputs[i].fireAtMs) >= 0) {
+      pendingOutputs[i].active = false;
+      const SensorConfig& s = config.sensors[pendingOutputs[i].sensorIndex];
+      const SensorConfig::OutputConfig& out = s.outputs[pendingOutputs[i].outputIndex];
+      sendOutputNow(s, out, out.oscAddress, pendingOutputs[i].norm);
+    }
   }
 }
 
@@ -4396,6 +4554,8 @@ static void processOscInput() {
           if (!matchOscInTrigger(s, msg, norm, value)) continue;
           anyMatched = true;
 
+          if (!checkCondition(s)) continue;
+
           oscInputTokenOverrideActive = true;
           oscInputTokenValue = value;
           oscInputTokenNorm = clampFloat(norm, 0.0f, 1.0f);
@@ -4403,7 +4563,7 @@ static void processOscInput() {
           for (int o = 0; o < s.outputCount; o++) {
             const SensorConfig::OutputConfig& out = s.outputs[o];
             float sendNorm = out.sendMinOnRelease ? oscInputTokenNorm : 1.0f;
-            sendOutputNow(s, out, out.oscAddress, sendNorm);
+            queueOrSendOutput(s, out, out.oscAddress, sendNorm);
           }
           oscInputTokenOverrideActive = false;
           addLog(String("OSC In matched trigger: ") + s.name);
@@ -4485,9 +4645,12 @@ static void processClickPattern(int index, const SensorConfig& sensor, bool pres
   }
 
   if (longPress && pressed && !multiLongFired[index] && (now - multiPressStartMs[index] >= config.longPressMs)) {
-    for (int o = 0; o < sensor.outputCount; o++) {
-      const SensorConfig::OutputConfig& out = sensor.outputs[o];
-      sendOutputNow(sensor, out, out.oscAddress, 1.0f);
+    if (checkCondition(sensor)) {
+      addLog(String("Long press: ") + sensor.name);
+      for (int o = 0; o < sensor.outputCount; o++) {
+        const SensorConfig::OutputConfig& out = sensor.outputs[o];
+        queueOrSendOutput(sensor, out, out.oscAddress, 1.0f);
+      }
     }
     multiLongFired[index] = true;
     clickCount[index] = 0;
@@ -4495,9 +4658,14 @@ static void processClickPattern(int index, const SensorConfig& sensor, bool pres
 
   if (!pressed && clickCount[index] > 0 && (now - multiLastReleaseMs[index] >= config.multiClickGapMs)) {
     if (targetClicks > 0 && clickCount[index] == targetClicks) {
-      for (int o = 0; o < sensor.outputCount; o++) {
-        const SensorConfig::OutputConfig& out = sensor.outputs[o];
-        sendOutputNow(sensor, out, out.oscAddress, 1.0f);
+      if (checkCondition(sensor)) {
+        if (targetClicks == 2) addLog(String("Double click: ") + sensor.name);
+        else if (targetClicks == 3) addLog(String("Triple click: ") + sensor.name);
+        else addLog(String("Click x") + String(targetClicks) + ": " + sensor.name);
+        for (int o = 0; o < sensor.outputCount; o++) {
+          const SensorConfig::OutputConfig& out = sensor.outputs[o];
+          queueOrSendOutput(sensor, out, out.oscAddress, 1.0f);
+        }
       }
     }
     clickCount[index] = 0;
@@ -4630,6 +4798,7 @@ static void handleSaveTriggers() {
       if (server.hasArg("s" + idx + "_o" + oidx + "_tgt")) {
         out.target = sanitizeOutputTarget(server.arg("s" + idx + "_o" + oidx + "_tgt").toInt());
       }
+      if (server.hasArg("s" + idx + "_o" + oidx + "_dly")) out.delayMs = static_cast<uint32_t>(server.arg("s" + idx + "_o" + oidx + "_dly").toInt());
       if (server.hasArg("s" + idx + "_o" + oidx + "_dev")) {
         int dev = server.arg("s" + idx + "_o" + oidx + "_dev").toInt();
         if (dev >= 0 && dev < MAX_OSC_DEVICES) out.device = static_cast<uint8_t>(dev);
@@ -4800,6 +4969,8 @@ static void handleSaveTriggers() {
         if (out.buttonOffString.length() == 0) out.buttonOffString = DEFAULT_OFF_STRING;
       }
       if (s.type == SENSOR_ANALOG) out.sendMinOnRelease = true;
+      if (server.hasArg("s" + idx + "_o" + oidx + "_svn")) out.setVarName = server.arg("s" + idx + "_o" + oidx + "_svn");
+      if (server.hasArg("s" + idx + "_o" + oidx + "_svv")) out.setVarValue = server.arg("s" + idx + "_o" + oidx + "_svv").toFloat();
       s.outputs[outCount++] = out;
     }
     if (outCount == 0) {
@@ -4815,6 +4986,10 @@ static void handleSaveTriggers() {
       uint32_t ms = static_cast<uint32_t>(server.arg("s" + idx + "_cd_ms").toInt());
       if (ms > 0) s.cooldownMs = ms;
     }
+    s.conditionEnabled = server.hasArg("s" + idx + "_cden");
+    if (server.hasArg("s" + idx + "_cdvar")) s.conditionVar = server.arg("s" + idx + "_cdvar");
+    if (server.hasArg("s" + idx + "_cdop")) s.conditionOp = static_cast<uint8_t>(server.arg("s" + idx + "_cdop").toInt());
+    if (server.hasArg("s" + idx + "_cdval")) s.conditionValue = server.arg("s" + idx + "_cdval").toFloat();
 
     if (s.source == SRC_SENSORS) {
       if (server.hasArg("s" + idx + "_pin")) {
@@ -6025,6 +6200,10 @@ static void serializeTriggerTo(int i, JsonObject so) {
   so["hcMaxCm"] = s.hcMaxCm;
   so["cooldownEnabled"] = s.cooldownEnabled;
   so["cooldownMs"] = s.cooldownMs;
+  so["conditionEnabled"] = s.conditionEnabled;
+  so["conditionVar"] = s.conditionVar;
+  so["conditionOp"] = s.conditionOp;
+  so["conditionValue"] = s.conditionValue;
   so["outputCount"] = s.outputCount;
   JsonArray outs = so.createNestedArray("outputs");
   for (int o = 0; o < s.outputCount && o < MAX_OUTPUTS_PER_TRIGGER; o++) {
@@ -6032,6 +6211,7 @@ static void serializeTriggerTo(int i, JsonObject so) {
     JsonObject oo = outs.createNestedObject();
     oo["index"] = o;
     oo["target"] = static_cast<int>(out.target);
+    oo["delayMs"] = out.delayMs;
     oo["device"] = out.device;
     oo["oscAddress"] = out.oscAddress;
     oo["buttonAddress"] = out.buttonAddress;
@@ -6069,6 +6249,8 @@ static void serializeTriggerTo(int i, JsonObject so) {
     oo["offString"] = out.offString;
     oo["buttonOnString"] = out.buttonOnString;
     oo["buttonOffString"] = out.buttonOffString;
+    oo["setVarName"] = out.setVarName;
+    oo["setVarValue"] = out.setVarValue;
   }
   so["timeType"] = static_cast<int>(s.timeType);
   so["timeYear"] = s.timeYear;
@@ -6112,6 +6294,10 @@ static void applySensorFromJson(int idx, JsonObject so) {
   if (so.containsKey("hcMaxCm")) s.hcMaxCm = so["hcMaxCm"];
   if (so.containsKey("cooldownEnabled")) s.cooldownEnabled = so["cooldownEnabled"];
   if (so.containsKey("cooldownMs")) s.cooldownMs = so["cooldownMs"];
+  if (so.containsKey("conditionEnabled")) s.conditionEnabled = so["conditionEnabled"];
+  if (so.containsKey("conditionVar")) s.conditionVar = String(so["conditionVar"].as<const char*>());
+  if (so.containsKey("conditionOp")) s.conditionOp = so["conditionOp"];
+  if (so.containsKey("conditionValue")) s.conditionValue = so["conditionValue"];
   if (so.containsKey("outputCount")) {
     int oc = so["outputCount"];
     s.outputCount = static_cast<uint8_t>(constrain(oc, 1, MAX_OUTPUTS_PER_TRIGGER));
@@ -6124,6 +6310,7 @@ static void applySensorFromJson(int idx, JsonObject so) {
       if (oidx < 0 || oidx >= MAX_OUTPUTS_PER_TRIGGER) continue;
       SensorConfig::OutputConfig& out = s.outputs[oidx];
       if (oo.containsKey("target")) out.target = sanitizeOutputTarget(oo["target"].as<int>());
+      if (oo.containsKey("delayMs")) out.delayMs = oo["delayMs"];
       if (oo.containsKey("device")) out.device = oo["device"];
       if (oo.containsKey("oscAddress")) out.oscAddress = String(oo["oscAddress"].as<const char*>());
       if (oo.containsKey("buttonAddress")) out.buttonAddress = String(oo["buttonAddress"].as<const char*>());
@@ -6162,6 +6349,8 @@ static void applySensorFromJson(int idx, JsonObject so) {
       if (oo.containsKey("offString")) out.offString = String(oo["offString"].as<const char*>());
       if (oo.containsKey("buttonOnString")) out.buttonOnString = String(oo["buttonOnString"].as<const char*>());
       if (oo.containsKey("buttonOffString")) out.buttonOffString = String(oo["buttonOffString"].as<const char*>());
+      if (oo.containsKey("setVarName")) out.setVarName = String(oo["setVarName"].as<const char*>());
+      if (oo.containsKey("setVarValue")) out.setVarValue = oo["setVarValue"];
       if ((out.target == OUT_TARGET_DMX || out.target == OUT_TARGET_DMX_PRESET) && out.outMode == OUT_STRING) out.outMode = OUT_INT;
     }
   }
@@ -6518,6 +6707,7 @@ void setup() {
   }
   pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
   resetButtonArmed = false;
+  for (int i = 0; i < MAX_PENDING_OUTPUTS; i++) pendingOutputs[i].active = false;
 
   Serial.println("Starting network...");
   // If WiFi mode with no SSID saved, skip straight to AP mode
@@ -6588,6 +6778,16 @@ void setup() {
   server.on("/api/triggers/reorder", HTTP_POST,    handleApiReorderTriggers);
   server.on("/api/devices/add",      HTTP_POST,    handleApiAddDevice);
   server.on("/api/devices/remove",   HTTP_POST,    handleApiRemoveDevice);
+  server.on("/api/vars",             HTTP_GET,     []() {
+    apiCors();
+    String json = "[";
+    for (int i = 0; i < globalVarCount; i++) {
+      if (i > 0) json += ",";
+      json += "{\"name\":\"" + jsonEscape(globalVars[i].name) + "\",\"value\":" + String(globalVars[i].value, 3) + "}";
+    }
+    json += "]";
+    apiJson(200, json);
+  });
 
   // Captive portal detection — serve setup form directly
   server.on("/generate_204", HTTP_GET, []() { serveSetupPage(); });
@@ -6699,6 +6899,7 @@ void loop() {
       if (encSteps < 1) encSteps = 1;
       if (encSteps > 4) encSteps = 4;
       while (encAccum[i] >= encSteps) {
+        addLog(String("Encoder ") + s.name + " step +");
         for (int o = 0; o < s.outputCount; o++) {
           const SensorConfig::OutputConfig& out = s.outputs[o];
           if (out.target != OUT_TARGET_OSC) continue;
@@ -6736,6 +6937,7 @@ void loop() {
         encAccum[i] -= encSteps;
       }
       while (encAccum[i] <= -encSteps) {
+        addLog(String("Encoder ") + s.name + " step -");
         for (int o = 0; o < s.outputCount; o++) {
           const SensorConfig::OutputConfig& out = s.outputs[o];
           if (out.target != OUT_TARGET_OSC) continue;
@@ -6849,6 +7051,7 @@ void loop() {
         if (lastLevel[i] == -1) lastLevel[i] = active ? 1 : 0;
         if (active && lastLevel[i] == 0) {
           toggleState[i] = !toggleState[i];
+          addLog(String("Toggle ") + s.name + (toggleState[i] ? " ON" : " OFF"));
         }
         lastLevel[i] = active ? 1 : 0;
         norm = toggleState[i] ? 1.0f : 0.0f;
@@ -6889,6 +7092,20 @@ void loop() {
       risingEdge = active && (prevLevel <= 0);
     }
 
+    if (risingEdge && !isEncoder) {
+      if (s.type == SENSOR_BUTTON) {
+        addLog(String("Button press: ") + s.name);
+      } else if (s.type == SENSOR_GPIO) {
+        addLog(String("GPIO input: ") + s.name);
+      }
+    }
+
+    if (!isEncoder && s.type == SENSOR_BUTTON && prevLevel > 0 && !active) {
+      addLog(String("Button release: ") + s.name);
+    }
+
+    if (!checkCondition(s)) continue;
+
     for (int o = 0; o < s.outputCount; o++) {
       const SensorConfig::OutputConfig& out = s.outputs[o];
       const bool useButtonOsc = isEncoder && out.target == OUT_TARGET_OSC;
@@ -6927,6 +7144,7 @@ void loop() {
         if (out.gpioMode == GPIO_OUT_PULSE) {
           bool rising = pressed && (prevLevel <= 0);
           if (rising) {
+            addLog(String("GPIO ") + String(out.gpioPin) + " pulse");
             scheduleGpioPulse(out.gpioPin, out.gpioPulseMs, out.gpioInvert);
           }
         } else if (out.gpioMode == GPIO_OUT_PWM) {
@@ -6960,6 +7178,7 @@ void loop() {
             desired = desired ? 0 : 1;
           }
           if (lastBool[i][o] == -1 || desired != lastBool[i][o]) {
+            addLog(String("GPIO ") + String(out.gpioPin) + (desired ? " HIGH" : " LOW"));
             setGpioLevel(out.gpioPin, desired == 1);
             lastBool[i][o] = desired;
           }
@@ -7192,6 +7411,7 @@ void loop() {
   }
 
   tickDmxPresetFade();
+  tickPendingOutputs();
 
   delay(LOOP_DELAY_MS);
 
