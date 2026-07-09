@@ -6046,8 +6046,10 @@ static void handleDmxPresetEditor() {
   appendHtml(stateFields(true, true));
   appendHtmlRaw("<button type='submit' name='action' value='snapshot_live' class='primary'>Snapshot Into This Preset</button>");
   appendHtmlRaw("</form>");
-  appendHtml(String("<div class='meta' style='margin-top:8px;'>Live input on U") + String(universe) + ": Art-Net " + String(hasArtLive ? ("seen " + String(millis() - artSeenMs) + "ms ago") : "not seen") +
-             " &middot; sACN " + String(hasSacLive ? ("seen " + String(millis() - sacSeenMs) + "ms ago") : "not seen") + "</div>");
+  appendHtml(String("<div class='meta' style='margin-top:8px;'>Live input on U") + String(universe) + ": Art-Net " +
+             String(!artnetListenActive ? "<b>input disabled in Settings</b>" : (hasArtLive ? ("seen " + String(millis() - artSeenMs) + "ms ago") : "listening, no data yet")) +
+             " &middot; sACN " +
+             String(!sacnListenActive ? "<b>input disabled in Settings</b>" : (hasSacLive ? ("seen " + String(millis() - sacSeenMs) + "ms ago") : "listening, no data yet")) + "</div>");
   if (hasLivePreview) {
     appendHtml(String("<div class='meta'>Preview source <b>") + String(livePreviewSource == DMX_PROTO_ARTNET ? "Art-Net" : "sACN") +
                "</b> (" + String(livePreviewAgeMs) + "ms ago) &middot; " + String(livePreviewActiveChannels) + " channels above zero</div>");
@@ -6763,6 +6765,12 @@ static void handleApiPostConfig() {
   String err;
   if (!applyConfigFromJson(doc.as<JsonObject>(), err)) { apiError(400, err); return; }
   saveConfig();
+  // Apply runtime side effects so toggles take effect without a reboot —
+  // previously only the legacy /settings form did this, so e.g. enabling
+  // Art-Net input from the SPA never actually opened the listener port.
+  applyTimeConfig();
+  configureUdpListener();
+  mqttReconnectRequested = true;
   apiJson(200, "{\"ok\":true}");
 }
 
