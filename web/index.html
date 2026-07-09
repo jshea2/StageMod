@@ -999,7 +999,7 @@ function buildTriggerBody(idx,s){
         <label><span>Range Max (0-255)</span><input type="number" data-tf="dmxInRangeMax" value="${s.dmxInRangeMax!=null?s.dmxInRangeMax:255}" min="0" max="255"></label>`;
     }
     h+=`</div>`;
-    h+=`<div style="font-size:11px;color:var(--fg3);margin:4px 0 8px">Requires Art-Net or sACN Input enabled in Settings &gt; Protocols.</div>`;
+    h+=`<div style="font-size:11px;color:var(--fg3);margin:4px 0 8px">Universe ${s.dmxInUniverse||1} = Art-Net wire universe ${(s.dmxInUniverse||1)-1} (sACN uses the same number). Requires Art-Net or sACN Input enabled in Settings &gt; Protocols.</div>`;
   }
 
   // Cooldown

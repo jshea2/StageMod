@@ -44,7 +44,7 @@ const IPAddress DEFAULT_DNS2(8, 8, 8, 8);
 const char* DEFAULT_WIFI_SSID = "";
 const char* DEFAULT_WIFI_PASS = "";
 const char* DEFAULT_USERNAME = "admin";
-const char* FIRMWARE_VERSION = "0.14.0";
+const char* FIRMWARE_VERSION = "0.15.0";
 const char* DEFAULT_NTP_SERVER = "pool.ntp.org";
 const uint8_t DEFAULT_TIME_MODE = 0; // 0 = NTP, 1 = Manual
 const char* DEFAULT_TIMEZONE = "PST8PDT,M3.2.0/2,M11.1.0/2";
@@ -3788,6 +3788,21 @@ static void tickDmxKeepAlive() {
   }
 }
 
+// Blackout: zero every active output universe, send one final all-zero frame,
+// then stop streaming them (keep-alive skips unused slots).
+static void releaseDmxOutputs() {
+  dmxFadeState.active = false;
+  for (int i = 0; i < MAX_DMX_STREAMS; i++) {
+    DmxStreamState& st = dmxStreams[i];
+    if (!st.used) continue;
+    memset(st.data, 0, sizeof(st.data));
+    uint8_t dest = (st.device == 255) ? DMX_DEST_AUTO : DMX_DEST_UNICAST;
+    sendDmxStreamFrame(st.protocol, dest, st.device, st.universe, &st);
+    st.used = false;
+  }
+  addLog("DMX output released (all universes zeroed).");
+}
+
 // Fade support for plain DMX outputs, sharing the preset fade engine. If a
 // fade with an incompatible protocol/destination is already running the
 // caller falls back to snapping the value, so a running preset look is never
@@ -5888,6 +5903,27 @@ static void handleDmxPresetEditor() {
           notice = String("Preset ") + String(preset) + ": saved universe " + String(universe) + " grid.";
         }
       }
+    } else if (action == "preview") {
+      uint8_t proto = server.hasArg("pproto") ? sanitizeDmxProtocol(server.arg("pproto").toInt()) : DMX_PROTO_ARTNET;
+      SensorConfig defaults = defaultSensorConfig(0);
+      SensorConfig::OutputConfig out = defaults.outputs[0];
+      out.target = OUT_TARGET_DMX_PRESET;
+      out.dmxProtocol = proto;
+      out.dmxDest = DMX_DEST_AUTO;
+      out.dmxPreset = static_cast<uint8_t>(preset);
+      out.dmxFadeMs = 0;
+      if (triggerDmxPreset(out)) {
+        notice = String("Previewing preset ") + String(preset) + " over " +
+                 String(proto == DMX_PROTO_ARTNET ? "Art-Net" : "sACN") +
+                 " — streaming until you Release.";
+      } else {
+        error = String("Preview failed — check that ") +
+                String(proto == DMX_PROTO_ARTNET ? "Art-Net" : "sACN") +
+                " Output is enabled in Settings and the preset has saved data.";
+      }
+    } else if (action == "release") {
+      releaseDmxOutputs();
+      notice = "DMX output released — all universes zeroed and streaming stopped.";
     } else {
       String raw = server.hasArg("preset_text") ? server.arg("preset_text") : "";
       String normalized;
@@ -5997,9 +6033,13 @@ static void handleDmxPresetEditor() {
   appendHtmlRaw("}");
   appendHtmlRaw("</style></head><body><div class='page'>");
 
-  // Hidden fields so each small form round-trips the full editor state
-  auto stateFields = [&](bool withU, bool withLive) -> String {
-    String f = String("<input type='hidden' name='preset' value='") + String(preset) + "'>";
+  // Hidden fields so each small form round-trips the full editor state.
+  // A form must NOT include a hidden copy of the field its own visible
+  // control submits, or the query string carries duplicates and the server
+  // reads the stale first value.
+  auto stateFields = [&](bool withPreset, bool withU, bool withLive) -> String {
+    String f = "";
+    if (withPreset) f += String("<input type='hidden' name='preset' value='") + String(preset) + "'>";
     if (withU) f += String("<input type='hidden' name='u' value='") + String(universe) + "'>";
     if (withLive) {
       f += String("<input type='hidden' name='live_src' value='") + String(liveSourceMode) + "'>";
@@ -6014,7 +6054,7 @@ static void handleDmxPresetEditor() {
 
   appendHtmlRaw("<div class='card'><div class='top'>");
   appendHtmlRaw("<form method='GET' action='/dmx_presets' class='inline'>");
-  appendHtml(stateFields(true, true));
+  appendHtml(stateFields(false, true, true));
   appendHtmlRaw("<label class='lbl'>Preset</label><select name='preset' onchange='this.form.submit()' style='min-width:180px;'>");
   for (int i = 1; i <= MAX_DMX_PRESETS; i++) {
     String pText = dmxPresetText[i - 1];
@@ -6032,7 +6072,7 @@ static void handleDmxPresetEditor() {
   appendHtmlRaw("<div class='card'><b>Live DMX Snapshot</b><br>");
   appendHtmlRaw("<small>Capture what your console is outputting right now into this preset. Set the universe range, then snapshot.</small>");
   appendHtmlRaw("<form method='GET' action='/dmx_presets' class='inline' style='margin-top:8px;'>");
-  appendHtml(stateFields(true, false));
+  appendHtml(stateFields(true, true, false));
   appendHtmlRaw("<label class='lbl'>Source</label><select name='live_src' onchange='this.form.submit()'>");
   appendHtml(String("<option value='0' ") + String(liveSourceMode == DMX_IN_SOURCE_RECENT ? "selected" : "") + ">Auto</option>");
   appendHtml(String("<option value='1' ") + String(liveSourceMode == DMX_IN_SOURCE_PREFER_ARTNET ? "selected" : "") + ">Art-Net</option>");
@@ -6043,10 +6083,11 @@ static void handleDmxPresetEditor() {
   appendHtml(String("<label class='lbl' style='display:inline-flex;align-items:center;gap:6px;'><input name='live_nonzero' type='checkbox' value='1' style='width:auto;margin:0;' ") + String(liveNonZeroOnly ? "checked" : "") + " onchange='this.form.submit()'>Non-zero only</label>");
   appendHtmlRaw("</form>");
   appendHtmlRaw("<form method='POST' action='/dmx_presets' style='margin-top:8px;'>");
-  appendHtml(stateFields(true, true));
+  appendHtml(stateFields(true, true, true));
   appendHtmlRaw("<button type='submit' name='action' value='snapshot_live' class='primary'>Snapshot Into This Preset</button>");
   appendHtmlRaw("</form>");
-  appendHtml(String("<div class='meta' style='margin-top:8px;'>Live input on U") + String(universe) + ": Art-Net " +
+  appendHtml(String("<div class='meta' style='margin-top:4px;'>Universe numbers here match sACN; Art-Net wire numbering is one less (QLab/console Art-Net universe 0 = Universe 1).</div>"));
+  appendHtml(String("<div class='meta' style='margin-top:8px;'>Live input on U") + String(universe) + " (Art-Net " + String(universe - 1) + "): Art-Net " +
              String(!artnetListenActive ? "<b>input disabled in Settings</b>" : (hasArtLive ? ("seen " + String(millis() - artSeenMs) + "ms ago") : "listening, no data yet")) +
              " &middot; sACN " +
              String(!sacnListenActive ? "<b>input disabled in Settings</b>" : (hasSacLive ? ("seen " + String(millis() - sacSeenMs) + "ms ago") : "listening, no data yet")) + "</div>");
@@ -6058,7 +6099,7 @@ static void handleDmxPresetEditor() {
 
   appendHtmlRaw("<div class='card'><div class='top'>");
   appendHtmlRaw("<form method='GET' action='/dmx_presets' class='inline'>");
-  appendHtml(stateFields(false, true));
+  appendHtml(stateFields(true, false, true));
   appendHtmlRaw("<b>Universe Grid</b><label class='lbl' style='margin-left:10px;'>Universe</label><select name='u' onchange='this.form.submit()' style='min-width:140px;'>");
   // Mark universes that have stored data (rows start with "<universe>,")
   bool uniHasData[MAX_DMX_PRESET_UNIVERSE + 1] = {false};
@@ -6076,14 +6117,14 @@ static void handleDmxPresetEditor() {
     }
   }
   for (int i = 1; i <= MAX_DMX_PRESET_UNIVERSE; i++) {
-    appendHtml(String("<option value='") + String(i) + "' " + String(i == universe ? "selected" : "") + ">Universe " + String(i) + String(uniHasData[i] ? " *" : "") + "</option>");
+    appendHtml(String("<option value='") + String(i) + "' " + String(i == universe ? "selected" : "") + ">Universe " + String(i) + " &middot; Art-Net " + String(i - 1) + String(uniHasData[i] ? " *" : "") + "</option>");
   }
   appendHtmlRaw("</select></form>");
   appendHtml(String("<div class='meta'><b>") + String(activeChannels) + "</b> channels stored in this universe</div>");
   appendHtmlRaw("</div>");
   appendHtmlRaw("<small>Each cell is one DMX channel (number above, value 0-255 below). Blank = not stored in this preset.</small>");
   appendHtmlRaw("<form method='POST' action='/dmx_presets'>");
-  appendHtml(stateFields(true, true));
+  appendHtml(stateFields(true, true, true));
   appendHtmlRaw("<div class='grid-wrap'><table class='grid'>");
   for (int row = 0; row < 32; row++) {
     int rowStart = row * 16 + 1;
@@ -6100,6 +6141,17 @@ static void handleDmxPresetEditor() {
   appendHtmlRaw("<button type='submit' name='action' value='save_grid' class='primary'>Save Universe</button> ");
   appendHtmlRaw("<button type='submit' name='action' value='clear_universe'>Clear Universe</button>");
   appendHtmlRaw("</form>");
+  appendHtmlRaw("<hr style='border:none;border-top:1px solid #38383833;margin:12px 0;'>");
+  appendHtmlRaw("<form method='POST' action='/dmx_presets' class='inline'>");
+  appendHtml(stateFields(true, true, true));
+  appendHtmlRaw("<label class='lbl'>Preview on rig</label><select name='pproto'>");
+  appendHtml(String("<option value='0'") + String(config.artnetEnabled ? "" : " disabled") + ">Art-Net</option>");
+  appendHtml(String("<option value='1'") + String(config.sacnEnabled ? "" : " disabled") + ">sACN</option>");
+  appendHtmlRaw("</select>");
+  appendHtmlRaw("<button type='submit' name='action' value='preview' class='primary'>Preview Preset</button>");
+  appendHtmlRaw("<button type='submit' name='action' value='release'>Release Output</button>");
+  appendHtmlRaw("</form>");
+  appendHtmlRaw("<div class='meta' style='margin-top:6px;'>Preview broadcasts the <b>saved</b> preset to your fixtures and keeps streaming it (save grid edits first). Release zeroes and stops all StageMod DMX output. If a console is outputting the same universes, the two sources will fight &mdash; pause the console's output while building looks.</div>");
   appendHtmlRaw("</div>");
 
   appendHtmlRaw("<details class='card'><summary><b>Advanced Text Editor</b></summary>");
