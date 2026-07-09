@@ -44,7 +44,7 @@ const IPAddress DEFAULT_DNS2(8, 8, 8, 8);
 const char* DEFAULT_WIFI_SSID = "";
 const char* DEFAULT_WIFI_PASS = "";
 const char* DEFAULT_USERNAME = "admin";
-const char* FIRMWARE_VERSION = "0.13.0";
+const char* FIRMWARE_VERSION = "0.14.0";
 const char* DEFAULT_NTP_SERVER = "pool.ntp.org";
 const uint8_t DEFAULT_TIME_MODE = 0; // 0 = NTP, 1 = Manual
 const char* DEFAULT_TIMEZONE = "PST8PDT,M3.2.0/2,M11.1.0/2";
@@ -93,7 +93,14 @@ enum SensorType {
 enum SensorSource {
   SRC_SENSORS = 0,
   SRC_TIME = 1,
-  SRC_OSC = 2
+  SRC_OSC = 2,
+  SRC_DMX = 3
+};
+
+enum DmxInTriggerMode {
+  DMX_IN_TRIG_LEVEL = 0,      // channel value drives outputs continuously (fader-style)
+  DMX_IN_TRIG_THRESHOLD = 1,  // fires on threshold crossing (button-style)
+  DMX_IN_TRIG_RANGE = 2       // maps a sub-range of 0-255 to the output range
 };
 
 enum OscInArgType {
@@ -228,6 +235,12 @@ struct SensorConfig {
   float oscInMin;
   float oscInMax;
   String oscInString;
+  uint16_t dmxInUniverse;
+  uint16_t dmxInChannel;
+  uint8_t dmxInMode;       // DmxInTriggerMode
+  uint8_t dmxInThreshold;
+  uint8_t dmxInRangeMin;
+  uint8_t dmxInRangeMax;
   SensorType type;
   int pin;
   int encClkPin;
@@ -361,6 +374,8 @@ float ema[MAX_TRIGGERS];     // smoothed ADC per sensor
 int lastInt[MAX_TRIGGERS][MAX_OUTPUTS_PER_TRIGGER];   // last sent int value per output
 float lastFloat[MAX_TRIGGERS][MAX_OUTPUTS_PER_TRIGGER]; // last sent float value per output
 int8_t lastBool[MAX_TRIGGERS][MAX_OUTPUTS_PER_TRIGGER]; // last sent on/off state per output
+int16_t dmxInLastValue[MAX_TRIGGERS];  // DMX-In: last raw value acted on, -1 = none yet
+int8_t dmxInGateState[MAX_TRIGGERS];   // DMX-In threshold: -1 unknown, 0 below, 1 above
 int8_t lastLevel[MAX_TRIGGERS]; // last raw level per sensor
 bool toggleState[MAX_TRIGGERS]; // toggle state per sensor
 int8_t lastEncA[MAX_TRIGGERS];
@@ -1007,6 +1022,12 @@ static String exportConfigJson() {
     so["oscInMin"] = s.oscInMin;
     so["oscInMax"] = s.oscInMax;
     so["oscInString"] = s.oscInString;
+  so["dmxInUniverse"] = s.dmxInUniverse;
+  so["dmxInChannel"] = s.dmxInChannel;
+  so["dmxInMode"] = s.dmxInMode;
+  so["dmxInThreshold"] = s.dmxInThreshold;
+  so["dmxInRangeMin"] = s.dmxInRangeMin;
+  so["dmxInRangeMax"] = s.dmxInRangeMax;
     so["type"] = static_cast<int>(s.type);
     so["pin"] = s.pin;
     so["encClkPin"] = s.encClkPin;
@@ -1118,6 +1139,7 @@ static bool applyConfigFromJson(const JsonObject& cfg, String& err) {
   if (cfg.containsKey("dns2")) { IPAddress p; if (parseIpString(String(cfg["dns2"].as<const char*>()), p)) config.dns2 = p; }
   if (cfg.containsKey("passwordEnabled")) config.passwordEnabled = cfg["passwordEnabled"];
   if (cfg.containsKey("username")) config.username = String(cfg["username"].as<const char*>());
+  if (cfg.containsKey("password")) { String p = String(cfg["password"].as<const char*>()); if (p.length() > 0) config.password = p; }
   if (cfg.containsKey("testDevice")) {
     int v = cfg["testDevice"];
     if (v >= 0 && v < MAX_OSC_DEVICES) config.testDevice = static_cast<uint8_t>(v);
@@ -1157,6 +1179,7 @@ static bool applyConfigFromJson(const JsonObject& cfg, String& err) {
     if (p > 0) config.mqttPort = p;
   }
   if (cfg.containsKey("mqttUser")) config.mqttUser = String(cfg["mqttUser"].as<const char*>());
+  if (cfg.containsKey("mqttPass")) { String p = String(cfg["mqttPass"].as<const char*>()); if (p.length() > 0) config.mqttPass = p; }
   if (cfg.containsKey("mqttClientId")) config.mqttClientId = String(cfg["mqttClientId"].as<const char*>());
   if (cfg.containsKey("mqttBaseTopic")) config.mqttBaseTopic = String(cfg["mqttBaseTopic"].as<const char*>());
 
@@ -1232,6 +1255,12 @@ static bool applyConfigFromJson(const JsonObject& cfg, String& err) {
       if (so.containsKey("oscInMin")) s.oscInMin = so["oscInMin"];
       if (so.containsKey("oscInMax")) s.oscInMax = so["oscInMax"];
       if (so.containsKey("oscInString")) s.oscInString = String(so["oscInString"].as<const char*>());
+  if (so.containsKey("dmxInUniverse")) { int v = so["dmxInUniverse"]; if (v >= 1 && v <= MAX_DMX_PRESET_UNIVERSE) s.dmxInUniverse = static_cast<uint16_t>(v); }
+  if (so.containsKey("dmxInChannel")) { int v = so["dmxInChannel"]; if (v >= 1 && v <= 512) s.dmxInChannel = static_cast<uint16_t>(v); }
+  if (so.containsKey("dmxInMode")) { int v = so["dmxInMode"]; if (v >= DMX_IN_TRIG_LEVEL && v <= DMX_IN_TRIG_RANGE) s.dmxInMode = static_cast<uint8_t>(v); }
+  if (so.containsKey("dmxInThreshold")) { int v = so["dmxInThreshold"]; if (v >= 0 && v <= 255) s.dmxInThreshold = static_cast<uint8_t>(v); }
+  if (so.containsKey("dmxInRangeMin")) { int v = so["dmxInRangeMin"]; if (v >= 0 && v <= 255) s.dmxInRangeMin = static_cast<uint8_t>(v); }
+  if (so.containsKey("dmxInRangeMax")) { int v = so["dmxInRangeMax"]; if (v >= 0 && v <= 255) s.dmxInRangeMax = static_cast<uint8_t>(v); }
       if (so.containsKey("type")) s.type = static_cast<SensorType>(so["type"].as<int>());
       if (so.containsKey("pin")) s.pin = so["pin"];
       if (so.containsKey("encClkPin")) s.encClkPin = so["encClkPin"];
@@ -1333,7 +1362,7 @@ static bool applyConfigFromJson(const JsonObject& cfg, String& err) {
       if (!isAllowedDigitalPin(s.encSwPin)) s.encSwPin = 33;
       if (!isAllowedDigitalPin(s.hcTrigPin)) s.hcTrigPin = 13;
       if (!isAllowedDigitalPin(s.hcEchoPin)) s.hcEchoPin = 16;
-      if (s.source != SRC_TIME && s.source != SRC_OSC) s.source = SRC_SENSORS;
+      if (s.source != SRC_TIME && s.source != SRC_OSC && s.source != SRC_DMX) s.source = SRC_SENSORS;
       if (s.oscInAddress.length() == 0) s.oscInAddress = "/trigger/*";
       if (s.oscInArgType > OSC_IN_ARG_STRING) s.oscInArgType = OSC_IN_ARG_ANY;
       if (s.oscInMatchMode > OSC_IN_MATCH_RANGE) s.oscInMatchMode = OSC_IN_MATCH_ANY;
@@ -1518,7 +1547,7 @@ static bool isInputPinInUse(int pin, int triggerIndex, const SensorConfig& curre
   for (int i = 0; i < MAX_TRIGGERS; i++) {
     const SensorConfig& s = (i == triggerIndex) ? current : config.sensors[i];
     if (!s.enabled) continue;
-    if (s.source == SRC_TIME || s.source == SRC_OSC) continue;
+    if (s.source != SRC_SENSORS) continue;
     if (s.type == SENSOR_ENCODER) {
       if (s.encClkPin == pin || s.encDtPin == pin || s.encSwPin == pin) return true;
     } else if (s.type == SENSOR_HCSR04) {
@@ -1554,7 +1583,32 @@ static bool isPasswordRequired() {
   return config.passwordEnabled && config.password.length() > 0;
 }
 
+// CSRF defense: browsers attach Origin/Referer to cross-site POSTs but pages
+// can't forge them. Requests without either header (curl, native apps) pass.
+static bool checkSameOrigin() {
+  auto hostOf = [](const String& url) -> String {
+    int p = url.indexOf("://");
+    if (p < 0) return String();
+    int s = p + 3;
+    int e = url.indexOf('/', s);
+    return (e < 0) ? url.substring(s) : url.substring(s, e);
+  };
+  String host = server.hostHeader();
+  if (host.length() == 0) return true;
+  String origin = server.header("Origin");
+  if (origin.length() > 0 && origin != "null") return hostOf(origin) == host;
+  String referer = server.header("Referer");
+  if (referer.length() > 0) return hostOf(referer) == host;
+  return true;
+}
+
 static bool ensureAuthenticated() {
+  bool mutating = (server.method() == HTTP_POST || server.method() == HTTP_DELETE);
+  if (mutating && !checkSameOrigin()) {
+    addLog("Rejected cross-origin request: " + server.uri());
+    server.send(403, "text/plain", "Cross-origin request rejected");
+    return false;
+  }
   if (!isPasswordRequired()) return true;
   if (server.authenticate(config.username.c_str(), config.password.c_str())) return true;
   server.requestAuthentication();
@@ -1573,6 +1627,12 @@ static SensorConfig defaultSensorConfig(int index) {
   s.oscInMin = 0.0f;
   s.oscInMax = 1.0f;
   s.oscInString = "go";
+  s.dmxInUniverse = 1;
+  s.dmxInChannel = 1;
+  s.dmxInMode = DMX_IN_TRIG_LEVEL;
+  s.dmxInThreshold = 128;
+  s.dmxInRangeMin = 0;
+  s.dmxInRangeMax = 255;
   s.type = SENSOR_BUTTON;
   s.pin = defaultSensorPin(index);
   s.encClkPin = 13;
@@ -1824,6 +1884,8 @@ static void resetRuntimeState(bool keepOutputState = false) {
       }
     }
     lastLevel[i] = -1;
+    dmxInLastValue[i] = -1;
+    dmxInGateState[i] = -1;
     toggleState[i] = false;
     lastEncA[i] = -1;
     lastEncB[i] = -1;
@@ -1902,6 +1964,12 @@ static void clearSensorKeys(int index) {
   removeIfExists(sensorKey(index, "osmn"));
   removeIfExists(sensorKey(index, "osmx"));
   removeIfExists(sensorKey(index, "osis"));
+  removeIfExists(sensorKey(index, "diu"));
+  removeIfExists(sensorKey(index, "dic"));
+  removeIfExists(sensorKey(index, "dim"));
+  removeIfExists(sensorKey(index, "dit"));
+  removeIfExists(sensorKey(index, "din"));
+  removeIfExists(sensorKey(index, "dix"));
   removeIfExists(sensorKey(index, "type"));
   removeIfExists(sensorKey(index, "pin"));
   removeIfExists(sensorKey(index, "clk"));
@@ -1919,6 +1987,10 @@ static void clearSensorKeys(int index) {
   removeIfExists(sensorKey(index, "pu"));
   removeIfExists(sensorKey(index, "cd_en"));
   removeIfExists(sensorKey(index, "cd_ms"));
+  removeIfExists(sensorKey(index, "cden"));
+  removeIfExists(sensorKey(index, "cdvar"));
+  removeIfExists(sensorKey(index, "cdop"));
+  removeIfExists(sensorKey(index, "cdval"));
   removeIfExists(sensorKey(index, "oc"));
   removeIfExists(sensorKey(index, "addr"));
   removeIfExists(sensorKey(index, "baddr"));
@@ -1936,6 +2008,9 @@ static void clearSensorKeys(int index) {
   removeIfExists(sensorKey(index, "off"));
   for (int o = 0; o < MAX_OUTPUTS_PER_TRIGGER; o++) {
     removeIfExists(outputKey(index, o, "tgt"));
+    removeIfExists(outputKey(index, o, "dly"));
+    removeIfExists(outputKey(index, o, "svn"));
+    removeIfExists(outputKey(index, o, "svv"));
     removeIfExists(outputKey(index, o, "dev"));
     removeIfExists(outputKey(index, o, "addr"));
     removeIfExists(outputKey(index, o, "baddr"));
@@ -2006,7 +2081,7 @@ static void applySensorPinModes() {
   for (int i = 0; i < MAX_TRIGGERS; i++) {
     const SensorConfig& sensor = config.sensors[i];
     if (!sensor.enabled) continue;
-    if (sensor.source == SRC_TIME || sensor.source == SRC_OSC) continue;
+    if (sensor.source != SRC_SENSORS) continue;
     if (sensor.type == SENSOR_ENCODER) {
       pinMode(sensor.encClkPin, INPUT_PULLUP);
       pinMode(sensor.encDtPin, INPUT_PULLUP);
@@ -2027,7 +2102,7 @@ static void setupEncoderCounters() {
   int unitsUsed = 0;
   for (int i = 0; i < MAX_TRIGGERS; i++) {
     const SensorConfig& s = config.sensors[i];
-    if (!s.enabled || s.source == SRC_TIME || s.source == SRC_OSC || s.type != SENSOR_ENCODER) continue;
+    if (!s.enabled || s.source != SRC_SENSORS || s.type != SENSOR_ENCODER) continue;
     if (unitsUsed >= 2) {
       addLog("Encoder PCNT limit reached. Extra encoder uses fallback polling.");
       continue;
@@ -2076,7 +2151,7 @@ static bool hasPinConflict(int index) {
     int pinsB[3];
     int countB = 0;
     const SensorConfig& b = config.sensors[i];
-    if (b.source == SRC_TIME || b.source == SRC_OSC) continue;
+    if (b.source != SRC_SENSORS) continue;
     if (b.type == SENSOR_ENCODER) {
       pinsB[countB++] = b.encClkPin;
       pinsB[countB++] = b.encDtPin;
@@ -2106,12 +2181,12 @@ static bool hasPinConflict(int index) {
 
 static bool hasSharedClickPattern(int index) {
   const SensorConfig& a = config.sensors[index];
-  if (!a.enabled || a.source == SRC_TIME || a.source == SRC_OSC) return false;
+  if (!a.enabled || a.source != SRC_SENSORS) return false;
   if (a.type != SENSOR_BUTTON) return false;
   for (int i = 0; i < MAX_TRIGGERS; i++) {
     if (i == index) continue;
     const SensorConfig& b = config.sensors[i];
-    if (!b.enabled || b.source == SRC_TIME || b.source == SRC_OSC) continue;
+    if (!b.enabled || b.source != SRC_SENSORS) continue;
     if (!isClickPatternType(b.type)) continue;
     if (b.pin == a.pin && b.activeHigh == a.activeHigh && b.pullup == a.pullup) {
       return true;
@@ -2279,7 +2354,7 @@ static void loadConfig() {
     s.enabled = prefs.getBool(sensorKey(i, "en").c_str(), s.enabled);
     s.name = prefs.getString(sensorKey(i, "name").c_str(), s.name);
     s.source = static_cast<SensorSource>(prefs.getInt(sensorKey(i, "src").c_str(), s.source));
-    if (s.source != SRC_TIME && s.source != SRC_OSC) s.source = SRC_SENSORS;
+    if (s.source != SRC_TIME && s.source != SRC_OSC && s.source != SRC_DMX) s.source = SRC_SENSORS;
     s.oscInAddress = prefs.getString(sensorKey(i, "osia").c_str(), s.oscInAddress);
     s.oscInArgType = static_cast<uint8_t>(prefs.getUInt(sensorKey(i, "osit").c_str(), s.oscInArgType));
     if (s.oscInArgType > OSC_IN_ARG_STRING) s.oscInArgType = OSC_IN_ARG_ANY;
@@ -2291,6 +2366,15 @@ static void loadConfig() {
     s.oscInString = prefs.getString(sensorKey(i, "osis").c_str(), s.oscInString);
     if (s.oscInAddress.length() == 0) s.oscInAddress = "/trigger/*";
     if (s.oscInString.length() == 0) s.oscInString = "go";
+    s.dmxInUniverse = prefs.getUShort(sensorKey(i, "diu").c_str(), s.dmxInUniverse);
+    s.dmxInChannel = prefs.getUShort(sensorKey(i, "dic").c_str(), s.dmxInChannel);
+    s.dmxInMode = prefs.getUChar(sensorKey(i, "dim").c_str(), s.dmxInMode);
+    if (s.dmxInMode > DMX_IN_TRIG_RANGE) s.dmxInMode = DMX_IN_TRIG_LEVEL;
+    s.dmxInThreshold = prefs.getUChar(sensorKey(i, "dit").c_str(), s.dmxInThreshold);
+    s.dmxInRangeMin = prefs.getUChar(sensorKey(i, "din").c_str(), s.dmxInRangeMin);
+    s.dmxInRangeMax = prefs.getUChar(sensorKey(i, "dix").c_str(), s.dmxInRangeMax);
+    if (s.dmxInUniverse < 1 || s.dmxInUniverse > MAX_DMX_PRESET_UNIVERSE) s.dmxInUniverse = 1;
+    if (s.dmxInChannel < 1 || s.dmxInChannel > 512) s.dmxInChannel = 1;
     s.type = sanitizeSensorType(prefs.getInt(sensorKey(i, "type").c_str(), s.type));
     s.pin = prefs.getInt(sensorKey(i, "pin").c_str(), s.pin);
     s.encClkPin = prefs.getInt(sensorKey(i, "clk").c_str(), s.encClkPin);
@@ -2655,6 +2739,14 @@ static void saveConfig() {
       prefs.putFloat(sensorKey(i, "osmx").c_str(), s.oscInMax);
       prefs.putString(sensorKey(i, "osis").c_str(), s.oscInString);
     }
+    if (s.source == SRC_DMX) {
+      prefs.putUShort(sensorKey(i, "diu").c_str(), s.dmxInUniverse);
+      prefs.putUShort(sensorKey(i, "dic").c_str(), s.dmxInChannel);
+      prefs.putUChar(sensorKey(i, "dim").c_str(), s.dmxInMode);
+      prefs.putUChar(sensorKey(i, "dit").c_str(), s.dmxInThreshold);
+      prefs.putUChar(sensorKey(i, "din").c_str(), s.dmxInRangeMin);
+      prefs.putUChar(sensorKey(i, "dix").c_str(), s.dmxInRangeMax);
+    }
     if (s.source == SRC_TIME) {
       prefs.putInt(sensorKey(i, "tt").c_str(), s.timeType);
       prefs.putInt(sensorKey(i, "ty").c_str(), s.timeYear);
@@ -2701,12 +2793,19 @@ static void saveConfig() {
       prefs.putString(sensorKey(i, "cdvar").c_str(), s.conditionVar);
       prefs.putUInt(sensorKey(i, "cdop").c_str(), s.conditionOp);
       prefs.putFloat(sensorKey(i, "cdval").c_str(), s.conditionValue);
+    } else {
+      // Remove stale keys, else a disabled condition resurrects on reboot
+      removeIfExists(sensorKey(i, "cden"));
+      removeIfExists(sensorKey(i, "cdvar"));
+      removeIfExists(sensorKey(i, "cdop"));
+      removeIfExists(sensorKey(i, "cdval"));
     }
 
     for (int o = 0; o < s.outputCount; o++) {
       const SensorConfig::OutputConfig& out = s.outputs[o];
       prefs.putInt(outputKey(i, o, "tgt").c_str(), out.target);
       if (out.delayMs > 0) prefs.putUInt(outputKey(i, o, "dly").c_str(), out.delayMs);
+      else removeIfExists(outputKey(i, o, "dly"));
       // Common output fields
       prefs.putInt(outputKey(i, o, "omode").c_str(), out.outMode);
       prefs.putFloat(outputKey(i, o, "omin").c_str(), out.outMin);
@@ -3669,6 +3768,107 @@ static void tickDmxPresetFade() {
   }
 }
 
+// Keep-alive: sACN receivers drop output after ~2.5s without data and many
+// Art-Net nodes behave the same, so a single frame per trigger event is not
+// enough — re-emit every active universe once a second. An active fade
+// already streams at ~30fps, so the keep-alive stays quiet during fades.
+static uint32_t dmxKeepAliveLastMs = 0;
+static void tickDmxKeepAlive() {
+  uint32_t now = millis();
+  if (dmxFadeState.active) { dmxKeepAliveLastMs = now; return; }
+  if (now - dmxKeepAliveLastMs < 1000) return;
+  dmxKeepAliveLastMs = now;
+  for (int i = 0; i < MAX_DMX_STREAMS; i++) {
+    DmxStreamState& st = dmxStreams[i];
+    if (!st.used) continue;
+    if (st.protocol == DMX_PROTO_ARTNET && !config.artnetEnabled) continue;
+    if (st.protocol == DMX_PROTO_SACN && !config.sacnEnabled) continue;
+    uint8_t dest = (st.device == 255) ? DMX_DEST_AUTO : DMX_DEST_UNICAST;
+    sendDmxStreamFrame(st.protocol, dest, st.device, st.universe, &st);
+  }
+}
+
+// Fade support for plain DMX outputs, sharing the preset fade engine. If a
+// fade with an incompatible protocol/destination is already running the
+// caller falls back to snapping the value, so a running preset look is never
+// corrupted. New channels merge into a compatible in-flight fade; its points
+// are re-anchored at their current level first so nothing jumps.
+static bool startDmxOutputFade(const SensorConfig::OutputConfig& out, uint8_t proto, uint16_t universe, uint8_t value) {
+  uint32_t fadeMs = sanitizeDmxFadeMs(out.dmxFadeMs);
+  if (fadeMs == 0) return false;
+  uint8_t dmxDest = sanitizeDmxDest(out.dmxDest);
+  uint8_t streamDevice = (dmxDest == DMX_DEST_UNICAST) ? out.device : 255;
+  if (dmxFadeState.active) {
+    uint8_t fadeDevice = (dmxFadeState.dest == DMX_DEST_UNICAST) ? dmxFadeState.device : 255;
+    if (dmxFadeState.protocol != proto || fadeDevice != streamDevice) return false;
+  }
+  uint16_t channels[512];
+  int channelCount = parseDmxChannels(out.dmxChannels, channels, 512);
+  if (channelCount <= 0) return false;
+  DmxStreamState* stream = getDmxStream(proto, streamDevice, universe);
+  if (stream == nullptr) return false;
+
+  uint32_t now = millis();
+  uint32_t durationMs = fadeMs;
+  if (dmxFadeState.active) {
+    float progress = 1.0f;
+    uint32_t elapsed = now - dmxFadeState.startMs;
+    if (dmxFadeState.durationMs > 0) {
+      progress = static_cast<float>(elapsed) / static_cast<float>(dmxFadeState.durationMs);
+      if (progress > 1.0f) progress = 1.0f;
+      if (progress < 0.0f) progress = 0.0f;
+    }
+    for (int i = 0; i < dmxFadeState.pointCount; i++) {
+      DmxFadePoint& p = dmxFadeState.points[i];
+      float delta = static_cast<float>(static_cast<int>(p.toValue) - static_cast<int>(p.fromValue));
+      int cur = static_cast<int>(lroundf(static_cast<float>(p.fromValue) + delta * progress));
+      if (cur < 0) cur = 0;
+      if (cur > 255) cur = 255;
+      p.fromValue = static_cast<uint8_t>(cur);
+    }
+    uint32_t remaining = (dmxFadeState.durationMs > elapsed) ? (dmxFadeState.durationMs - elapsed) : 0;
+    if (remaining > durationMs) durationMs = remaining;
+  } else {
+    dmxFadeState.pointCount = 0;
+    dmxFadeState.usedUniverseCount = 0;
+    dmxFadeState.protocol = proto;
+    dmxFadeState.dest = dmxDest;
+    dmxFadeState.device = out.device;
+  }
+
+  for (int i = 0; i < channelCount; i++) {
+    uint16_t ch = channels[i];
+    if (ch < 1 || ch > 512) continue;
+    bool found = false;
+    for (int pIdx = 0; pIdx < dmxFadeState.pointCount; pIdx++) {
+      DmxFadePoint& p = dmxFadeState.points[pIdx];
+      if (p.universe == universe && p.channel == ch) { p.toValue = value; found = true; break; }
+    }
+    if (found) continue;
+    if (dmxFadeState.pointCount >= MAX_DMX_PRESET_POINTS) {
+      stream->data[ch - 1] = value;  // cap hit: snap the overflow channels
+      continue;
+    }
+    DmxFadePoint& p = dmxFadeState.points[dmxFadeState.pointCount++];
+    p.universe = universe;
+    p.channel = ch;
+    p.fromValue = stream->data[ch - 1];
+    p.toValue = value;
+  }
+  bool haveUniverse = false;
+  for (int i = 0; i < dmxFadeState.usedUniverseCount; i++) {
+    if (dmxFadeState.usedUniverses[i] == universe) { haveUniverse = true; break; }
+  }
+  if (!haveUniverse && dmxFadeState.usedUniverseCount < MAX_DMX_PRESET_UNIVERSE) {
+    dmxFadeState.usedUniverses[dmxFadeState.usedUniverseCount++] = universe;
+  }
+  dmxFadeState.startMs = now;
+  dmxFadeState.durationMs = durationMs;
+  dmxFadeState.lastFrameMs = 0;
+  dmxFadeState.active = true;
+  return true;
+}
+
 static bool sendDmxOutput(const SensorConfig::OutputConfig& out, float norm) {
   uint8_t proto = sanitizeDmxProtocol(out.dmxProtocol);
   if (proto == DMX_PROTO_ARTNET && !config.artnetEnabled) return false;
@@ -3683,6 +3883,12 @@ static bool sendDmxOutput(const SensorConfig::OutputConfig& out, float norm) {
   if (channelCount <= 0) return false;
 
   uint8_t value = toDmxValue(out, norm);
+  if (startDmxOutputFade(out, proto, universe, value)) {
+    addLog(String(proto == DMX_PROTO_ARTNET ? "Art-Net" : "sACN") + " u" + String(universe) +
+           " ch " + out.dmxChannels + " fade to " + String(value) + " over " + String(sanitizeDmxFadeMs(out.dmxFadeMs)) + "ms");
+    tickDmxPresetFade();
+    return true;
+  }
   uint8_t streamDevice = (sanitizeDmxDest(out.dmxDest) == DMX_DEST_UNICAST) ? out.device : 255;
   DmxStreamState* stream = getDmxStream(proto, streamDevice, universe);
   uint8_t tempData[512];
@@ -3946,7 +4152,7 @@ static void applyGpioOutputsNow() {
   for (int i = 0; i < MAX_TRIGGERS; i++) {
     const SensorConfig& s = config.sensors[i];
     if (!s.enabled) continue;
-    if (s.source == SRC_TIME || s.source == SRC_OSC) continue;
+    if (s.source != SRC_SENSORS) continue;
     if (hasPinConflict(i)) continue;
     float norm = 0.0f;
     if (s.type == SENSOR_ANALOG) {
@@ -4619,6 +4825,80 @@ static void processDmxInput() {
   }
 }
 
+// Current value of one received DMX channel, honoring the configured source
+// priority. Returns -1 when there is no (matching) data for that universe.
+static int getDmxInChannelValue(uint16_t universeOneBased, uint16_t channel) {
+  if (channel < 1 || channel > 512) return -1;
+  if (universeOneBased < 1 || universeOneBased > MAX_DMX_PRESET_UNIVERSE) return -1;
+  int idx = static_cast<int>(universeOneBased - 1);
+  if (dmxInSeenMs[idx] == 0) return -1;
+  uint8_t* uni = getDmxInputUniverseBuffer(idx);
+  if (uni == nullptr) return -1;
+  uint8_t mode = sanitizeDmxInputSourceMode(config.dmxInSourceMode);
+  uint8_t src = dmxInSource[idx];
+  if (mode == DMX_IN_SOURCE_PREFER_ARTNET && src != DMX_PROTO_ARTNET) return -1;
+  if (mode == DMX_IN_SOURCE_PREFER_SACN && src != DMX_PROTO_SACN) return -1;
+  return uni[channel - 1];
+}
+
+// DMX-In trigger sources: fire outputs from received DMX channel values.
+// Level/range modes act like a fader (outputs follow the channel), threshold
+// mode acts like a button (fires on crossings, honoring Send-Off-on-release).
+static void tickDmxInTriggers() {
+  if (!config.dmxInArtNetEnabled && !config.dmxInSacnEnabled) return;
+  for (int i = 0; i < MAX_TRIGGERS; i++) {
+    const SensorConfig& s = config.sensors[i];
+    if (!s.enabled || s.source != SRC_DMX) continue;
+    int v = getDmxInChannelValue(s.dmxInUniverse, s.dmxInChannel);
+    if (v < 0) continue;
+
+    if (s.dmxInMode == DMX_IN_TRIG_THRESHOLD) {
+      int8_t above = (v >= s.dmxInThreshold) ? 1 : 0;
+      if (dmxInGateState[i] < 0) { dmxInGateState[i] = above; continue; }  // arm without firing at boot
+      if (above == dmxInGateState[i]) continue;
+      dmxInGateState[i] = above;
+      dmxInLastValue[i] = static_cast<int16_t>(v);
+      if (!checkCondition(s)) continue;
+      addLog(String("DMX In ") + s.name + " u" + String(s.dmxInUniverse) + " ch" + String(s.dmxInChannel) +
+             (above ? " above " : " below ") + String(s.dmxInThreshold));
+      for (int o = 0; o < s.outputCount; o++) {
+        const SensorConfig::OutputConfig& out = s.outputs[o];
+        if (above) {
+          queueOrSendOutput(s, out, out.oscAddress, 1.0f);
+          lastBool[i][o] = 1;
+        } else if (out.sendMinOnRelease) {
+          queueOrSendOutput(s, out, out.oscAddress, 0.0f);
+          lastBool[i][o] = 0;
+        }
+      }
+      continue;
+    }
+
+    // Level / range modes: act on value changes only
+    if (dmxInLastValue[i] == static_cast<int16_t>(v)) continue;
+    float norm;
+    if (s.dmxInMode == DMX_IN_TRIG_RANGE) {
+      int lo = s.dmxInRangeMin;
+      int hi = s.dmxInRangeMax;
+      bool inverted = false;
+      if (hi < lo) { int t = lo; lo = hi; hi = t; inverted = true; }
+      if (v < lo || v > hi) continue;
+      norm = (hi == lo) ? 1.0f : static_cast<float>(v - lo) / static_cast<float>(hi - lo);
+      if (inverted) norm = 1.0f - norm;
+    } else {
+      norm = static_cast<float>(v) / 255.0f;
+    }
+    dmxInLastValue[i] = static_cast<int16_t>(v);
+    if (!checkCondition(s)) continue;
+    for (int o = 0; o < s.outputCount; o++) {
+      const SensorConfig::OutputConfig& out = s.outputs[o];
+      queueOrSendOutput(s, out, out.oscAddress, norm);
+      lastFloat[i][o] = norm;
+      lastInt[i][o] = v;
+    }
+  }
+}
+
 static void processClickPattern(int index, const SensorConfig& sensor, bool pressed, int targetClicks, bool longPress) {
   unsigned long now = millis();
 
@@ -4700,6 +4980,7 @@ static void handleSaveTriggers() {
       int src = server.arg("s" + idx + "_src").toInt();
       if (src == 1) s.source = SRC_TIME;
       else if (src == 2) s.source = SRC_OSC;
+      else if (src == 3) s.source = SRC_DMX;
       else s.source = SRC_SENSORS;
     }
     if (server.hasArg("s" + idx + "_type")) {
@@ -5691,87 +5972,125 @@ static void handleDmxPresetEditor() {
   appendHtmlRaw(".error{color:#a02a2a;font-weight:600;}");
   appendHtmlRaw(".grid-wrap{overflow:auto;border:1px solid #ddd;border-radius:10px;background:#fbfbfb;max-height:70vh;}");
   appendHtmlRaw("table.grid{border-collapse:collapse;min-width:980px;font-size:12px;}");
-  appendHtmlRaw("table.grid th,table.grid td{border:1px solid #e6e6e6;padding:2px;text-align:center;}");
-  appendHtmlRaw("table.grid th{position:sticky;top:0;background:#f6f6f6;z-index:1;}");
-  appendHtmlRaw("table.grid td.rowh{background:#f8f8f8;font-weight:600;position:sticky;left:0;z-index:2;}");
+  appendHtmlRaw("table.grid td{border:1px solid #e6e6e6;padding:2px;text-align:center;}");
   appendHtmlRaw("table.grid .cell{display:flex;flex-direction:column;align-items:stretch;gap:2px;}");
-  appendHtmlRaw("table.grid .ch{font-size:10px;line-height:1;color:#555;}");
-  appendHtmlRaw("table.grid input{width:52px;max-width:none;margin:0;padding:4px 4px;font-size:12px;text-align:center;}");
+  appendHtmlRaw("table.grid .ch{font-size:10px;line-height:1;color:#888;padding-top:2px;}");
+  appendHtmlRaw("table.grid .ch.on{color:#0b6b6f;font-weight:700;}");
+  appendHtmlRaw("table.grid input{width:52px;max-width:none;margin:0;padding:4px 4px;font-size:12px;text-align:center;border-color:transparent;background:transparent;}");
+  appendHtmlRaw("table.grid input:focus{border-color:#0b6b6f;background:#fff;outline:none;}");
+  appendHtmlRaw("form.inline{display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0;}");
+  appendHtmlRaw("form.inline select,form.inline input{margin:0;width:auto;}");
+  appendHtmlRaw(".lbl{font-size:12px;color:#666;font-weight:600;}");
+  appendHtmlRaw(".meta{font-size:12px;color:#666;}");
   appendHtmlRaw("a{color:#0b6b6f;}");
-  appendHtmlRaw("@media(prefers-color-scheme:dark){body{background:#161616;color:#e2e2e2;}.card,fieldset,select,input,textarea{background:#222;border-color:#383838;color:#e2e2e2;}button{background:#2a2a2a;border-color:#444;color:#e2e2e2;}a{color:#0d9488;}}");
+  appendHtmlRaw("@media(prefers-color-scheme:dark){");
+  appendHtmlRaw("body{background:#161616;color:#e2e2e2;}");
+  appendHtmlRaw(".card,fieldset,select,input,textarea{background:#222;border-color:#383838;color:#e2e2e2;}");
+  appendHtmlRaw("button{background:#2a2a2a;border-color:#444;color:#e2e2e2;}button.primary{background:#0d9488;border-color:#0d9488;color:#fff;}");
+  appendHtmlRaw("a{color:#0d9488;}.notice{color:#0d9488;}");
+  appendHtmlRaw(".grid-wrap{background:#1c1c1c;border-color:#333;}");
+  appendHtmlRaw("table.grid td{border-color:#2e2e2e;}");
+  appendHtmlRaw("table.grid .ch{color:#777;}table.grid .ch.on{color:#0d9488;}");
+  appendHtmlRaw("table.grid input{background:transparent;color:#e2e2e2;}");
+  appendHtmlRaw("table.grid input:focus{border-color:#0d9488;background:#222;}");
+  appendHtmlRaw(".lbl,.meta{color:#999;}");
+  appendHtmlRaw("}");
   appendHtmlRaw("</style></head><body><div class='page'>");
 
-  appendHtmlRaw("<div class='top'><h2 style='margin:0;'>DMX Preset Editor</h2><a href='/settings'>Back to settings</a></div>");
-  appendHtmlRaw("<div class='card'>");
-  appendHtml(String("<div>Point budget: <b>") + String(totalPoints) + "</b> / " + String(MAX_DMX_PRESET_POINTS) + "</div>");
-  appendHtml(String("<div>Universe range: 1-") + String(MAX_DMX_PRESET_UNIVERSE) + "</div>");
+  // Hidden fields so each small form round-trips the full editor state
+  auto stateFields = [&](bool withU, bool withLive) -> String {
+    String f = String("<input type='hidden' name='preset' value='") + String(preset) + "'>";
+    if (withU) f += String("<input type='hidden' name='u' value='") + String(universe) + "'>";
+    if (withLive) {
+      f += String("<input type='hidden' name='live_src' value='") + String(liveSourceMode) + "'>";
+      f += String("<input type='hidden' name='lu_from' value='") + String(liveFrom) + "'>";
+      f += String("<input type='hidden' name='lu_to' value='") + String(liveTo) + "'>";
+      if (liveNonZeroOnly) f += "<input type='hidden' name='live_nonzero' value='1'>";
+    }
+    return f;
+  };
+
+  appendHtmlRaw("<div class='top'><h2 style='margin:0;'>DMX Preset Editor</h2><a href='/'>Back to StageMod</a></div>");
+
+  appendHtmlRaw("<div class='card'><div class='top'>");
+  appendHtmlRaw("<form method='GET' action='/dmx_presets' class='inline'>");
+  appendHtml(stateFields(true, true));
+  appendHtmlRaw("<label class='lbl'>Preset</label><select name='preset' onchange='this.form.submit()' style='min-width:180px;'>");
+  for (int i = 1; i <= MAX_DMX_PRESETS; i++) {
+    String pText = dmxPresetText[i - 1];
+    pText.trim();
+    appendHtml(String("<option value='") + String(i) + "' " + String(i == preset ? "selected" : "") + ">Preset " + String(i) + String(pText.length() > 0 ? " *" : "") + "</option>");
+  }
+  appendHtmlRaw("</select></form>");
+  appendHtml(String("<div class='meta'>Point budget <b>") + String(totalPoints) + "</b>/" + String(MAX_DMX_PRESET_POINTS) +
+             " &middot; this preset <b>" + String(currentPoints) + "</b> points &middot; * = has data</div>");
+  appendHtmlRaw("</div>");
   if (notice.length() > 0) appendHtml(String("<div class='notice'>") + notice + "</div>");
   if (error.length() > 0) appendHtml(String("<div class='error'>") + error + "</div>");
-  appendHtmlRaw("<form method='GET' action='/dmx_presets'>");
-  appendHtmlRaw("Preset: <select name='preset' onchange='this.form.submit()'>");
-  for (int i = 1; i <= MAX_DMX_PRESETS; i++) {
-    appendHtml(String("<option value='") + String(i) + "' " + String(i == preset ? "selected" : "") + ">Preset " + String(i) + "</option>");
-  }
-  appendHtmlRaw("</select>");
-  appendHtmlRaw("Universe: <select name='u' onchange='this.form.submit()'>");
-  for (int i = 1; i <= MAX_DMX_PRESET_UNIVERSE; i++) {
-    appendHtml(String("<option value='") + String(i) + "' " + String(i == universe ? "selected" : "") + ">Universe " + String(i) + "</option>");
-  }
-  appendHtmlRaw("</select>");
-  appendHtmlRaw("Live source: <select name='live_src' onchange='this.form.submit()'>");
+  appendHtmlRaw("</div>");
+
+  appendHtmlRaw("<div class='card'><b>Live DMX Snapshot</b><br>");
+  appendHtmlRaw("<small>Capture what your console is outputting right now into this preset. Set the universe range, then snapshot.</small>");
+  appendHtmlRaw("<form method='GET' action='/dmx_presets' class='inline' style='margin-top:8px;'>");
+  appendHtml(stateFields(true, false));
+  appendHtmlRaw("<label class='lbl'>Source</label><select name='live_src' onchange='this.form.submit()'>");
   appendHtml(String("<option value='0' ") + String(liveSourceMode == DMX_IN_SOURCE_RECENT ? "selected" : "") + ">Auto</option>");
   appendHtml(String("<option value='1' ") + String(liveSourceMode == DMX_IN_SOURCE_PREFER_ARTNET ? "selected" : "") + ">Art-Net</option>");
   appendHtml(String("<option value='2' ") + String(liveSourceMode == DMX_IN_SOURCE_PREFER_SACN ? "selected" : "") + ">sACN</option>");
   appendHtmlRaw("</select>");
-  appendHtml(String("Snapshot range: <input name='lu_from' type='number' min='1' max='") + String(MAX_DMX_PRESET_UNIVERSE) + "' value='" + String(liveFrom) + "' style='max-width:110px;' onchange='this.form.submit()'>");
-  appendHtml(String("<input name='lu_to' type='number' min='1' max='") + String(MAX_DMX_PRESET_UNIVERSE) + "' value='" + String(liveTo) + "' style='max-width:110px;' onchange='this.form.submit()'>");
-  appendHtml(String("<label style='display:inline-flex;align-items:center;gap:6px;max-width:none;'><input name='live_nonzero' type='checkbox' value='1' ") + String(liveNonZeroOnly ? "checked" : "") + " onchange='this.form.submit()'>Store non-zero only</label>");
+  appendHtml(String("<label class='lbl'>Universes</label><input name='lu_from' type='number' min='1' max='") + String(MAX_DMX_PRESET_UNIVERSE) + "' value='" + String(liveFrom) + "' style='max-width:80px;' onchange='this.form.submit()'>");
+  appendHtml(String("<span class='lbl'>to</span><input name='lu_to' type='number' min='1' max='") + String(MAX_DMX_PRESET_UNIVERSE) + "' value='" + String(liveTo) + "' style='max-width:80px;' onchange='this.form.submit()'>");
+  appendHtml(String("<label class='lbl' style='display:inline-flex;align-items:center;gap:6px;'><input name='live_nonzero' type='checkbox' value='1' style='width:auto;margin:0;' ") + String(liveNonZeroOnly ? "checked" : "") + " onchange='this.form.submit()'>Non-zero only</label>");
   appendHtmlRaw("</form>");
-  appendHtml(String("<div>Current preset points: <b>") + String(currentPoints) + "</b></div>");
-  appendHtml(String("<div>Universe ") + String(universe) + " active channels: <b>" + String(activeChannels) + "</b></div>");
-  appendHtml(String("<div>Live input (U") + String(universe) + "): Art-Net " + String(hasArtLive ? ("seen " + String(millis() - artSeenMs) + "ms ago") : "not seen") +
-             ", sACN " + String(hasSacLive ? ("seen " + String(millis() - sacSeenMs) + "ms ago") : "not seen") + "</div>");
+  appendHtmlRaw("<form method='POST' action='/dmx_presets' style='margin-top:8px;'>");
+  appendHtml(stateFields(true, true));
+  appendHtmlRaw("<button type='submit' name='action' value='snapshot_live' class='primary'>Snapshot Into This Preset</button>");
+  appendHtmlRaw("</form>");
+  appendHtml(String("<div class='meta' style='margin-top:8px;'>Live input on U") + String(universe) + ": Art-Net " + String(hasArtLive ? ("seen " + String(millis() - artSeenMs) + "ms ago") : "not seen") +
+             " &middot; sACN " + String(hasSacLive ? ("seen " + String(millis() - sacSeenMs) + "ms ago") : "not seen") + "</div>");
   if (hasLivePreview) {
-    appendHtml(String("<div>Live preview source: <b>") + String(livePreviewSource == DMX_PROTO_ARTNET ? "Art-Net" : "sACN") +
-               "</b> (" + String(livePreviewAgeMs) + "ms ago), active channels: <b>" + String(livePreviewActiveChannels) + "</b></div>");
-  } else {
-    appendHtmlRaw("<div>Live preview source: <b>none</b></div>");
+    appendHtml(String("<div class='meta'>Preview source <b>") + String(livePreviewSource == DMX_PROTO_ARTNET ? "Art-Net" : "sACN") +
+               "</b> (" + String(livePreviewAgeMs) + "ms ago) &middot; " + String(livePreviewActiveChannels) + " channels above zero</div>");
   }
   appendHtmlRaw("</div>");
 
-  appendHtmlRaw("<div class='card'><b>Live DMX Snapshot</b><br>");
-  appendHtmlRaw("<small>Capture current DMX input values into this preset for one universe or a range.</small><br>");
-  appendHtmlRaw("<form method='POST' action='/dmx_presets'>");
-  appendHtml(String("<input type='hidden' name='preset' value='") + String(preset) + "'>");
-  appendHtml(String("<input type='hidden' name='u' value='") + String(universe) + "'>");
-  appendHtml(String("<input type='hidden' name='live_src' value='") + String(liveSourceMode) + "'>");
-  appendHtml(String("<input type='hidden' name='lu_from' value='") + String(liveFrom) + "'>");
-  appendHtml(String("<input type='hidden' name='lu_to' value='") + String(liveTo) + "'>");
-  if (liveNonZeroOnly) appendHtmlRaw("<input type='hidden' name='live_nonzero' value='1'>");
-  appendHtmlRaw("<button type='submit' name='action' value='snapshot_live' class='primary'>Get Current Values Snapshot</button>");
-  appendHtmlRaw("</form>");
+  appendHtmlRaw("<div class='card'><div class='top'>");
+  appendHtmlRaw("<form method='GET' action='/dmx_presets' class='inline'>");
+  appendHtml(stateFields(false, true));
+  appendHtmlRaw("<b>Universe Grid</b><label class='lbl' style='margin-left:10px;'>Universe</label><select name='u' onchange='this.form.submit()' style='min-width:140px;'>");
+  // Mark universes that have stored data (rows start with "<universe>,")
+  bool uniHasData[MAX_DMX_PRESET_UNIVERSE + 1] = {false};
+  {
+    int lineStart = 0;
+    while (lineStart < static_cast<int>(currentText.length())) {
+      int lineEnd = currentText.indexOf('\n', lineStart);
+      if (lineEnd < 0) lineEnd = currentText.length();
+      int comma = currentText.indexOf(',', lineStart);
+      if (comma > lineStart && comma < lineEnd) {
+        int u = currentText.substring(lineStart, comma).toInt();
+        if (u >= 1 && u <= MAX_DMX_PRESET_UNIVERSE) uniHasData[u] = true;
+      }
+      lineStart = lineEnd + 1;
+    }
+  }
+  for (int i = 1; i <= MAX_DMX_PRESET_UNIVERSE; i++) {
+    appendHtml(String("<option value='") + String(i) + "' " + String(i == universe ? "selected" : "") + ">Universe " + String(i) + String(uniHasData[i] ? " *" : "") + "</option>");
+  }
+  appendHtmlRaw("</select></form>");
+  appendHtml(String("<div class='meta'><b>") + String(activeChannels) + "</b> channels stored in this universe</div>");
   appendHtmlRaw("</div>");
-
-  appendHtmlRaw("<div class='card'><b>Universe Grid</b><br>");
-  appendHtmlRaw("<small>Set DMX values per channel. Blank cell means channel is not stored in this preset/universe.</small>");
+  appendHtmlRaw("<small>Each cell is one DMX channel (number above, value 0-255 below). Blank = not stored in this preset.</small>");
   appendHtmlRaw("<form method='POST' action='/dmx_presets'>");
-  appendHtml(String("<input type='hidden' name='preset' value='") + String(preset) + "'>");
-  appendHtml(String("<input type='hidden' name='u' value='") + String(universe) + "'>");
-  appendHtml(String("<input type='hidden' name='live_src' value='") + String(liveSourceMode) + "'>");
-  appendHtml(String("<input type='hidden' name='lu_from' value='") + String(liveFrom) + "'>");
-  appendHtml(String("<input type='hidden' name='lu_to' value='") + String(liveTo) + "'>");
-  if (liveNonZeroOnly) appendHtmlRaw("<input type='hidden' name='live_nonzero' value='1'>");
-  appendHtmlRaw("<div class='grid-wrap'><table class='grid'><tr><th>Channels</th>");
-  for (int c = 1; c <= 16; c++) appendHtml(String("<th>") + String(c) + "</th>");
-  appendHtmlRaw("</tr>");
+  appendHtml(stateFields(true, true));
+  appendHtmlRaw("<div class='grid-wrap'><table class='grid'>");
   for (int row = 0; row < 32; row++) {
     int rowStart = row * 16 + 1;
-    int rowEnd = rowStart + 15;
-    appendHtml(String("<tr><td class='rowh'>") + String(rowStart) + "-" + String(rowEnd) + "</td>");
+    appendHtmlRaw("<tr>");
     for (int col = 0; col < 16; col++) {
       int ch = rowStart + col;
       String v = universeValues[ch - 1] >= 0 ? String(universeValues[ch - 1]) : "";
-      appendHtml(String("<td><div class='cell'><div class='ch'>") + String(ch) + "</div><input type='number' min='0' max='255' name='ch" + String(ch) + "' value='" + v + "' placeholder='-'></div></td>");
+      bool stored = universeValues[ch - 1] >= 0;
+      appendHtml(String("<td><div class='cell'><div class='ch") + String(stored ? " on" : "") + "'>" + String(ch) + "</div><input type='number' min='0' max='255' name='ch" + String(ch) + "' value='" + v + "' placeholder='-'></div></td>");
     }
     appendHtmlRaw("</tr>");
   }
@@ -5790,7 +6109,7 @@ static void handleDmxPresetEditor() {
   appendHtml(String("<input type='hidden' name='lu_from' value='") + String(liveFrom) + "'>");
   appendHtml(String("<input type='hidden' name='lu_to' value='") + String(liveTo) + "'>");
   if (liveNonZeroOnly) appendHtmlRaw("<input type='hidden' name='live_nonzero' value='1'>");
-  appendHtml(String("<textarea name='preset_text' placeholder='1,1-10,255&#10;2,1,128'>") + currentText + "</textarea><br>");
+  appendHtml(String("<textarea name='preset_text' placeholder='1,1-10,255&#10;2,1,128'>") + htmlEscape(currentText) + "</textarea><br>");
   appendHtmlRaw("<button type='submit' name='action' value='save' class='primary'>Save Text</button> ");
   appendHtmlRaw("<button type='submit' name='action' value='clear'>Clear Entire Preset</button>");
   appendHtmlRaw("</form>");
@@ -5944,9 +6263,13 @@ static void handleSendTestDmx() {
   }
   if (server.hasArg("omin")) out.outMin = server.arg("omin").toFloat();
   if (server.hasArg("omax")) out.outMax = server.arg("omax").toFloat();
-  if (out.dmxProtocol == DMX_PROTO_ARTNET) {
+  if (out.dmxProtocol == DMX_PROTO_ARTNET && server.hasArg("dmxn")) {
+    // Explicit net/subnet/universe triple provided
     out.dmxUniverse = encodeArtNetPortAddressOneBased(out.dmxArtNet, out.dmxArtSubnet, out.dmxArtUniverse);
   } else {
+    // Single universe number provided (quick-test panel) — decode it into the
+    // Art-Net triple; previously this branch never ran for Art-Net, so every
+    // Art-Net test went to universe 1 regardless of what the user entered
     decodeArtNetPortAddressOneBased(out.dmxUniverse, out.dmxArtNet, out.dmxArtSubnet, out.dmxArtUniverse);
   }
 
@@ -6104,10 +6427,24 @@ static void handleUpdateFinished() {
   }
 }
 
+// Auth must be checked in the upload callback, not just the finished handler:
+// the callback runs while the body streams in, so without this an
+// unauthenticated POST would write and arm the new boot partition before
+// handleUpdateFinished ever gets to reject it.
+static bool otaAuthorized = false;
+
 static void handleUpdateUpload() {
   HTTPUpload& upload = server.upload();
   if (upload.status == UPLOAD_FILE_START) {
-    Serial.println("OTA: starting, free heap: " + String(ESP.getFreeHeap()));
+    otaAuthorized = checkSameOrigin() &&
+                    (!isPasswordRequired() ||
+                     server.authenticate(config.username.c_str(), config.password.c_str()));
+    if (!otaAuthorized) {
+      addLog("Firmware update rejected: not authenticated.");
+      return;
+    }
+    Serial.println("OTA: starting, free heap: " + String(ESP.getFreeHeap()) +
+                   ", largest block: " + String(ESP.getMaxAllocHeap()));
     // Free resources for OTA — device reboots after anyway
     MDNS.end();
     if (dmxInData) { free(dmxInData); dmxInData = nullptr; }
@@ -6115,7 +6452,8 @@ static void handleUpdateUpload() {
     artnetInUdp.stop();
     sacnInUdp.stop();
     mqttClient.disconnect();
-    Serial.println("OTA: freed resources, heap now: " + String(ESP.getFreeHeap()));
+    Serial.println("OTA: freed resources, heap now: " + String(ESP.getFreeHeap()) +
+                   ", largest block: " + String(ESP.getMaxAllocHeap()));
     if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
       addLog(String("Firmware update begin failed: ") + Update.errorString());
       Serial.println("OTA begin failed: " + String(Update.errorString()));
@@ -6123,10 +6461,13 @@ static void handleUpdateUpload() {
       addLog("Firmware update upload started.");
     }
   } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (!otaAuthorized) return;
     if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-      Serial.println("OTA write failed at " + String(upload.totalSize) + " bytes: " + String(Update.errorString()));
+      Serial.println("OTA write failed at " + String(upload.totalSize) + " bytes: " + String(Update.errorString()) +
+                     ", heap: " + String(ESP.getFreeHeap()) + ", largest block: " + String(ESP.getMaxAllocHeap()));
     }
   } else if (upload.status == UPLOAD_FILE_END) {
+    if (!otaAuthorized) return;
     Serial.println("OTA: upload done, " + String(upload.totalSize) + " bytes, heap: " + String(ESP.getFreeHeap()));
     if (!Update.end(true)) {
       addLog(String("Firmware update end failed: ") + Update.errorString());
@@ -6182,6 +6523,12 @@ static void serializeTriggerTo(int i, JsonObject so) {
   so["oscInMin"] = s.oscInMin;
   so["oscInMax"] = s.oscInMax;
   so["oscInString"] = s.oscInString;
+  so["dmxInUniverse"] = s.dmxInUniverse;
+  so["dmxInChannel"] = s.dmxInChannel;
+  so["dmxInMode"] = s.dmxInMode;
+  so["dmxInThreshold"] = s.dmxInThreshold;
+  so["dmxInRangeMin"] = s.dmxInRangeMin;
+  so["dmxInRangeMax"] = s.dmxInRangeMax;
   so["type"] = static_cast<int>(s.type);
   so["pin"] = s.pin;
   so["encClkPin"] = s.encClkPin;
@@ -6276,6 +6623,12 @@ static void applySensorFromJson(int idx, JsonObject so) {
   if (so.containsKey("oscInMin")) s.oscInMin = so["oscInMin"];
   if (so.containsKey("oscInMax")) s.oscInMax = so["oscInMax"];
   if (so.containsKey("oscInString")) s.oscInString = String(so["oscInString"].as<const char*>());
+  if (so.containsKey("dmxInUniverse")) { int v = so["dmxInUniverse"]; if (v >= 1 && v <= MAX_DMX_PRESET_UNIVERSE) s.dmxInUniverse = static_cast<uint16_t>(v); }
+  if (so.containsKey("dmxInChannel")) { int v = so["dmxInChannel"]; if (v >= 1 && v <= 512) s.dmxInChannel = static_cast<uint16_t>(v); }
+  if (so.containsKey("dmxInMode")) { int v = so["dmxInMode"]; if (v >= DMX_IN_TRIG_LEVEL && v <= DMX_IN_TRIG_RANGE) s.dmxInMode = static_cast<uint8_t>(v); }
+  if (so.containsKey("dmxInThreshold")) { int v = so["dmxInThreshold"]; if (v >= 0 && v <= 255) s.dmxInThreshold = static_cast<uint8_t>(v); }
+  if (so.containsKey("dmxInRangeMin")) { int v = so["dmxInRangeMin"]; if (v >= 0 && v <= 255) s.dmxInRangeMin = static_cast<uint8_t>(v); }
+  if (so.containsKey("dmxInRangeMax")) { int v = so["dmxInRangeMax"]; if (v >= 0 && v <= 255) s.dmxInRangeMax = static_cast<uint8_t>(v); }
   if (so.containsKey("type")) s.type = static_cast<SensorType>(so["type"].as<int>());
   if (so.containsKey("pin")) s.pin = so["pin"];
   if (so.containsKey("encClkPin")) s.encClkPin = so["encClkPin"];
@@ -6371,7 +6724,7 @@ static void applySensorFromJson(int idx, JsonObject so) {
   if (!isAllowedDigitalPin(s.encSwPin)) s.encSwPin = 33;
   if (!isAllowedDigitalPin(s.hcTrigPin)) s.hcTrigPin = 13;
   if (!isAllowedDigitalPin(s.hcEchoPin)) s.hcEchoPin = 16;
-  if (s.source != SRC_TIME && s.source != SRC_OSC) s.source = SRC_SENSORS;
+  if (s.source != SRC_TIME && s.source != SRC_OSC && s.source != SRC_DMX) s.source = SRC_SENSORS;
   if (s.oscInAddress.length() == 0) s.oscInAddress = "/trigger/*";
   if (s.oscInArgType > OSC_IN_ARG_STRING) s.oscInArgType = OSC_IN_ARG_ANY;
   if (s.oscInMatchMode > OSC_IN_MATCH_RANGE) s.oscInMatchMode = OSC_IN_MATCH_ANY;
@@ -6404,7 +6757,8 @@ static void handleApiPostConfig() {
   if (!ensureAuthenticated()) return;
   String body = server.arg("plain");
   if (body.length() == 0) { apiError(400, "Empty body"); return; }
-  DynamicJsonDocument doc(8192);
+  // Full exports run up to ~32KB; must be able to parse what we emit
+  DynamicJsonDocument doc(32768);
   if (deserializeJson(doc, body) != DeserializationError::Ok) { apiError(400, "Invalid JSON"); return; }
   String err;
   if (!applyConfigFromJson(doc.as<JsonObject>(), err)) { apiError(400, err); return; }
@@ -6458,6 +6812,10 @@ static void handleApiGetLive() {
     }
     t["toggleState"] = toggleState[idx];
     t["cooldownActive"] = (s.cooldownEnabled && lastButtonTriggerMs[idx] > 0 && (millis() - lastButtonTriggerMs[idx]) < s.cooldownMs);
+  }
+  JsonObject vars = doc.createNestedObject("vars");
+  for (int i = 0; i < globalVarCount; i++) {
+    vars[globalVars[i].name] = serialized(String(globalVars[i].value, 3));
   }
   String out;
   serializeJson(doc, out);
@@ -6597,9 +6955,34 @@ static void handleApiRemoveDevice() {
   apiJson(200, "{\"ok\":true}");
 }
 
+// POST /api/trigger/N/fire — test-fire a trigger's outputs at full level.
+// Runs the real dispatch path (including Prewait) so a pre-show checkout
+// exercises exactly what the show will. Reboot/reset outputs are skipped.
+static void handleApiFireTrigger(int n) {
+  if (!ensureAuthenticated()) return;
+  if (n < 0 || n >= MAX_TRIGGERS) { apiError(400, "Invalid trigger index"); return; }
+  const SensorConfig& s = config.sensors[n];
+  addLog(String("Test fire: ") + s.name);
+  for (int o = 0; o < s.outputCount; o++) {
+    const SensorConfig::OutputConfig& out = s.outputs[o];
+    if (out.target == OUT_TARGET_REBOOT || out.target == OUT_TARGET_RESET_COOLDOWNS) continue;
+    queueOrSendOutput(s, out, out.oscAddress, 1.0f);
+  }
+  apiJson(200, "{\"ok\":true}");
+}
+
 // Dispatch /api/trigger/N by HTTP method
 static void handleApiTriggerDispatch() {
   if (server.method() == HTTP_OPTIONS) { apiCors(); server.send(204); return; }
+  String uri = server.uri();
+  if (uri.endsWith("/fire")) {
+    if (server.method() != HTTP_POST) { apiError(405, "Method not allowed"); return; }
+    int start = strlen("/api/trigger/");
+    int end = uri.indexOf('/', start);
+    int n = (end > start) ? uri.substring(start, end).toInt() : -1;
+    handleApiFireTrigger(n);
+    return;
+  }
   if (server.method() == HTTP_GET)    { handleApiGetTrigger();    return; }
   if (server.method() == HTTP_POST)   { handleApiPostTrigger();   return; }
   if (server.method() == HTTP_DELETE) { handleApiDeleteTrigger(); return; }
@@ -6608,6 +6991,7 @@ static void handleApiTriggerDispatch() {
 
 // Lightweight handler — only saves network fields, doesn't touch protocols/triggers
 static void handleSetupSave() {
+  if (!ensureAuthenticated()) return;
   if (server.hasArg("net_mode")) config.netMode = sanitizeNetworkMode(server.arg("net_mode").toInt());
   if (server.hasArg("hostname")) config.hostname = sanitizeHostname(server.arg("hostname"));
   if (server.hasArg("wifi_ssid") && server.arg("wifi_ssid").length() > 0) config.wifiSsid = server.arg("wifi_ssid");
@@ -6631,6 +7015,7 @@ static void handleSetupSave() {
 }
 
 static void serveSetupPage() {
+  if (!ensureAuthenticated()) return;
   // Synchronous WiFi scan — default 300ms/channel ≈ 4 seconds total
   int n = WiFi.scanNetworks(false, true);
   String netOptions;
@@ -6801,6 +7186,9 @@ void setup() {
     server.sendHeader("Location", "/", true);
     server.send(302, "text/plain", "");
   });
+  // Needed by checkSameOrigin() — WebServer only stores headers it's told to collect
+  const char* collectHdrs[] = {"Origin", "Referer"};
+  server.collectHeaders(collectHdrs, 2);
   server.begin();
   Serial.println("Web server started.");
 
@@ -6842,6 +7230,7 @@ void loop() {
 
   processOscInput();
   processDmxInput();
+  tickDmxInTriggers();
 
   for (int i = 0; i < MAX_TRIGGERS; i++) {
     SensorConfig& s = config.sensors[i];
@@ -6850,7 +7239,7 @@ void loop() {
       handleTimeTrigger(i, s);
       continue;
     }
-    if (s.source == SRC_OSC) continue;
+    if (s.source == SRC_OSC || s.source == SRC_DMX) continue;
     if (hasPinConflict(i)) continue;
 
     float norm = 0.0f;
@@ -7411,6 +7800,7 @@ void loop() {
   }
 
   tickDmxPresetFade();
+  tickDmxKeepAlive();
   tickPendingOutputs();
 
   delay(LOOP_DELAY_MS);
@@ -7458,17 +7848,30 @@ void loop() {
     }
   }
 
+  // Debounce link-down before falling back to AP mode: a single bad sample
+  // (DHCP renew, cable wiggle, transient WiFi drop) must not flap us into AP.
+  static unsigned long netDownSince = 0;
+  const unsigned long NET_DOWN_GRACE_MS = 5000;
+
 #if USE_ETHERNET
   if (config.netMode == NET_ETHERNET) {
     bool netOk = ETH.linkUp() && isValidIp(ETH.localIP());
     if (!netOk && !wifiApMode) {
-      startWifiAp();
-      configureUdpListener();
-    } else if (netOk && wifiApMode) {
-      WiFi.softAPdisconnect(true);
-      wifiApMode = false;
-      dnsServer.stop();
-      configureUdpListener();
+      if (netDownSince == 0) {
+        netDownSince = millis();
+      } else if (millis() - netDownSince > NET_DOWN_GRACE_MS) {
+        netDownSince = 0;
+        startWifiAp();
+        configureUdpListener();
+      }
+    } else if (netOk) {
+      netDownSince = 0;
+      if (wifiApMode) {
+        WiFi.softAPdisconnect(true);
+        wifiApMode = false;
+        dnsServer.stop();
+        configureUdpListener();
+      }
     }
   }
 #endif
@@ -7476,13 +7879,23 @@ void loop() {
   if (config.netMode == NET_WIFI && wifiReconnectStarted == 0) {
     bool netOk = (WiFi.status() == WL_CONNECTED) && isValidIp(WiFi.localIP());
     if (!netOk && !wifiApMode) {
-      startWifiAp();
-      configureUdpListener();
-    } else if (netOk && wifiApMode) {
-      WiFi.softAPdisconnect(true);
-      wifiApMode = false;
-      dnsServer.stop();
-      configureUdpListener();
+      if (netDownSince == 0) {
+        netDownSince = millis();
+      } else if (millis() - netDownSince > NET_DOWN_GRACE_MS) {
+        netDownSince = 0;
+        // Try rejoining the configured network first; AP fallback happens
+        // via the wifiReconnectStarted timeout if the rejoin fails.
+        WiFi.reconnect();
+        wifiReconnectStarted = millis();
+      }
+    } else if (netOk) {
+      netDownSince = 0;
+      if (wifiApMode) {
+        WiFi.softAPdisconnect(true);
+        wifiApMode = false;
+        dnsServer.stop();
+        configureUdpListener();
+      }
     }
   }
 

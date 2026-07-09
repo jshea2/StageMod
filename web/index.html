@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>StageMod</title>
 <style>
 :root{
@@ -155,6 +155,10 @@ button:disabled{opacity:.4;cursor:default}
   .pill{padding:5px 10px;font-size:11px}
 }
 
+/* Live value on trigger cards */
+.tlive{font-size:11px;color:var(--acc);font-variant-numeric:tabular-nums;min-width:28px;text-align:right}
+.tlive.cd{color:var(--yellow)}
+
 /* Hidden helper */
 .hidden{display:none!important}
 </style>
@@ -167,6 +171,10 @@ button:disabled{opacity:.4;cursor:default}
     <div class="tab active" onclick="switchTab('triggers')">Triggers</div>
     <div class="tab" onclick="switchTab('settings')">Settings</div>
   </div>
+</div>
+
+<div id="ap-banner" class="hidden" style="background:var(--yellow);color:#1a1a1a;text-align:center;padding:8px 12px;font-size:13px;font-weight:600">
+  Setup mode — StageMod is running its own WiFi access point and is not on your network. <a href="/setup" style="color:#1a1a1a">Configure network</a>
 </div>
 
 <div class="main">
@@ -191,6 +199,7 @@ button:disabled{opacity:.4;cursor:default}
   <span id="bar-heap">--</span>
   <span id="bar-uptime">--</span>
   <span id="bar-time">--</span>
+  <span id="bar-vars" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
   <a href="/logs" style="color:var(--fg3);text-decoration:none;margin-left:auto;font-size:11px">Serial Log</a>
 </div>
 
@@ -211,10 +220,11 @@ function pauseLive(){busyCount++;if(liveTimer){clearInterval(liveTimer);liveTime
 function resumeLive(){busyCount=Math.max(0,busyCount-1);if(busyCount===0&&!liveTimer){liveErrors=0;liveTimer=setInterval(pollLive,2000);}}
 function showBusy(msg){$('#busy-msg').textContent=msg||'Saving...';$('#busy').style.display='flex';}
 function hideBusy(){$('#busy').style.display='none';}
-const SRC={SENSORS:0,TIME:1,OSC:2};
+const SRC={SENSORS:0,TIME:1,OSC:2,DMX:3};
 const TYPES={ANALOG:0,BUTTON:1,TOGGLE:2,DIGITAL:3,ENCODER:4,DBL:5,TRP:6,LONG:7,GPIO:8,HCSR04:9};
 const TARGETS={OSC:0,REBOOT:1,RESET_CD:2,UDP:3,GPIO:4,HTTP:5,MQTT:6,DMX:7,DMX_PRESET:8,SET_VAR:9};
-const srcNames=['Sensors','Time','OSC Input'];
+const srcNames=['Sensors','Time','OSC Input','DMX In'];
+const dmxInModes=['Level (follow channel)','Threshold (button)','Range (map sub-range)'];
 const typeNames=['Analog (Pot/Slider)','Momentary','Toggle','Digital Input','Encoder','Double Click','Triple Click','Long Press','GPIO Input','Ultrasonic (HC-SR04)'];
 const targetNames=['OSC','Reboot Device','Reset Cooldowns','UDP','GPIO Output','HTTP Request','MQTT','DMX','DMX Preset','Set Variable'];
 const outModeNames=['Integer','Float','String'];
@@ -299,12 +309,12 @@ function renderSettings(){
       <div class="fg">
         <label><span>WiFi SSID</span>
           <div style="display:flex;gap:6px">
-            <input type="text" id="s-wifiSsid" value="" style="flex:1" placeholder="Enter SSID">
+            <input type="text" id="s-wifiSsid" value="${esc(c.wifiSsid||'')}" style="flex:1" placeholder="Enter SSID">
             <button class="btn-sm btn-outline" onclick="scanWifi()">Scan</button>
           </div>
           <select id="wifi-scan-list" class="hidden" onchange="$('#s-wifiSsid').value=this.value"></select>
         </label>
-        <label><span>WiFi Password</span><input type="password" id="s-wifiPass" value="" placeholder="Enter password"></label>
+        <label><span>WiFi Password</span><input type="password" id="s-wifiPass" value="" placeholder="Leave blank to keep current"></label>
       </div>
     </div>
     <div class="trow" style="margin-top:8px">
@@ -313,11 +323,11 @@ function renderSettings(){
     </div>
     <div id="static-fields" class="${c.useStatic?'':'hidden'}">
       <div class="fg">
-        <label><span>IP Address</span><input type="text" id="s-staticIp" value=""></label>
-        <label><span>Gateway</span><input type="text" id="s-gateway" value=""></label>
-        <label><span>Subnet</span><input type="text" id="s-subnet" value=""></label>
-        <label><span>DNS 1</span><input type="text" id="s-dns1" value=""></label>
-        <label><span>DNS 2</span><input type="text" id="s-dns2" value=""></label>
+        <label><span>IP Address</span><input type="text" id="s-staticIp" value="${esc(c.staticIp||'')}"></label>
+        <label><span>Gateway</span><input type="text" id="s-gateway" value="${esc(c.gateway||'')}"></label>
+        <label><span>Subnet</span><input type="text" id="s-subnet" value="${esc(c.subnet||'')}"></label>
+        <label><span>DNS 1</span><input type="text" id="s-dns1" value="${esc(c.dns1||'')}"></label>
+        <label><span>DNS 2</span><input type="text" id="s-dns2" value="${esc(c.dns2||'')}"></label>
       </div>
     </div>
     <div class="fg" style="margin-top:8px"><label><span>Current IP</span><input type="text" value="${esc(ST.ip||'--')}" disabled></label></div>
@@ -334,6 +344,7 @@ function renderSettings(){
     <div class="sec">DMX Output</div>
     <div class="trow"><label class="toggle"><input type="checkbox" id="s-artnetEnabled" ${c.artnetEnabled?'checked':''}><span class="slider"></span></label><span>Art-Net Output</span></div>
     <div class="trow"><label class="toggle"><input type="checkbox" id="s-sacnEnabled" ${c.sacnEnabled?'checked':''}><span class="slider"></span></label><span>sACN (E1.31) Output</span></div>
+    <div style="margin:4px 0 0"><a href="/dmx_presets" target="_blank" style="color:var(--acc);font-size:12px">Open DMX Preset Editor &#8599;</a></div>
     <div class="sec">DMX Input</div>
     <div class="trow"><label class="toggle"><input type="checkbox" id="s-dmxInArtNetEnabled" ${c.dmxInArtNetEnabled?'checked':''}><span class="slider"></span></label><span>Art-Net Input</span></div>
     <div class="trow"><label class="toggle"><input type="checkbox" id="s-dmxInSacnEnabled" ${c.dmxInSacnEnabled?'checked':''}><span class="slider"></span></label><span>sACN Input</span></div>
@@ -633,13 +644,18 @@ async function saveAllSettings(){
   };
   const pw=v('s-mqttPass');if(pw)cfg.mqttPass=pw;
   const upw=v('s-password');if(upw)cfg.password=upw;
+  // Device cards live in the Devices tab and are rendered alongside the
+  // other panels, so include their current values in every settings save
+  const devs=collectDevices();
+  if(devs.length)cfg.oscDevices=devs;
   // Clean undefined values
   Object.keys(cfg).forEach(k=>{if(cfg[k]===undefined)delete cfg[k]});
 
   try{
     await api('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});
-    toast('Settings saved!');
     C=await api('/api/config');
+    renderSettings();
+    toast('Settings saved!');
   }catch(e){
     toast('Save failed','err');
   }finally{hideBusy();resumeLive();}
@@ -671,19 +687,17 @@ async function removeDevice(i){
   }catch(e){toast('Failed','err')}
   finally{hideBusy();resumeLive();}
 }
-function appendCurrentDevicesToForm(fd){
+function collectDevices(){
+  const out=[];
   $$('.dev-card').forEach(card=>{
     const i=parseInt(card.dataset.devi);
+    if(isNaN(i))return;
     const g=k=>{const el=$(`[data-dk="${k}"]`,card);return el?(el.type==='checkbox'?el.checked:el.value):''};
-    fd.set('d'+i+'_present','1');
-    if(g('enabled'))fd.set('dev'+i+'_en','on');
-    fd.set('dev'+i+'_name',g('name'));
-    fd.set('dev'+i+'_ip',g('ip'));
-    fd.set('dev'+i+'_port',g('port'));
-    if(g('hbEnabled'))fd.set('dev'+i+'_hb_en','on');
-    fd.set('dev'+i+'_hb_addr',g('hbAddress'));
-    fd.set('dev'+i+'_hb_ms',g('hbMs'));
+    out.push({index:i,enabled:!!g('enabled'),name:g('name'),ip:g('ip'),
+      port:parseInt(g('port'))||8000,hbEnabled:!!g('hbEnabled'),
+      hbAddress:g('hbAddress'),hbMs:parseInt(g('hbMs'))||5000});
   });
+  return out;
 }
 
 function deviceOpts(sel){
@@ -728,14 +742,30 @@ async function scanWifi(){
 /* ===== SYSTEM ACTIONS ===== */
 function exportConfig(){window.location='/export_config'}
 
+// Poll until the device answers again, then reload — a fixed delay either
+// reloads too early (page errors out) or wastes time after fast reboots
+function waitForDeviceThenReload(msg,initialDelay){
+  pauseLive();showBusy(msg||'Waiting for device...');
+  const started=Date.now();
+  setTimeout(function check(){
+    fetch('/api/status',{cache:'no-store'}).then(r=>{
+      if(r.ok){location.reload();return;}
+      throw 0;
+    }).catch(()=>{
+      if(Date.now()-started>120000){hideBusy();resumeLive();toast('Device not responding — reload manually','err');return;}
+      setTimeout(check,2000);
+    });
+  },initialDelay||3000);
+}
+
 async function importConfig(input){
   if(!input.files.length)return;
   const fd=new FormData();
   fd.append('file',input.files[0]);
   try{
     await api('/import_config',{method:'POST',body:fd});
-    toast('Config imported! Reloading...');
-    setTimeout(()=>location.reload(),1500);
+    toast('Config imported!');
+    waitForDeviceThenReload('Applying config...',1500);
   }catch(e){}
 }
 
@@ -757,9 +787,8 @@ function doOtaUpdate(){
   };
   xhr.onload=function(){
     if(xhr.status===200){
-      $('#busy-msg').textContent='Update complete! Rebooting...';
       toast('Firmware updated! Rebooting...');
-      setTimeout(()=>location.reload(),10000);
+      waitForDeviceThenReload('Update complete! Rebooting...',5000);
     }else{
       hideBusy();resumeLive();
       toast('Update failed: '+xhr.responseText,'err');
@@ -838,6 +867,9 @@ function buildTriggerCard(idx,pos,s){
     <label class="toggle" onclick="event.stopPropagation()"><input type="checkbox" id="ten-${idx}" ${s.enabled?'checked':''} onchange="quickSaveTrigger(${idx},'enabled',this.checked)"><span class="slider"></span></label>
     <span class="tname" id="tname-${idx}">${esc(s.name||'Trigger '+(idx+1))}</span>
     <span id="tbadge-${idx}" style="font-size:11px;color:var(--fg3)">${triggerBadge(s)}</span>
+    <span class="tlive" id="tlive-${idx}"></span>
+    <button class="btn-icon" onclick="event.stopPropagation();fireTrigger(${idx})" title="Test fire outputs">&#9658;</button>
+    <button class="btn-icon" onclick="event.stopPropagation();duplicateTrigger(${idx})" title="Duplicate">&#10697;</button>
     <button class="btn-icon" onclick="event.stopPropagation();moveTrigger(${idx},-1)" ${isFirst?'disabled':''}title="Move up">&#9650;</button>
     <button class="btn-icon" onclick="event.stopPropagation();moveTrigger(${idx},1)" ${isLast?'disabled':''}title="Move down">&#9660;</button>
     <button class="btn-icon" onclick="event.stopPropagation();removeTrigger(${idx})" title="Delete" style="color:var(--red)">&times;</button>
@@ -880,7 +912,7 @@ function buildTriggerBody(idx,s){
         </optgroup>
       </select></label>`;
     // Pin fields depend on type
-    if(s.type===TYPES.ENCODER){
+    if(s.source===SRC.SENSORS&&s.type===TYPES.ENCODER){
       h+=`<label><span>CLK Pin</span><input type="number" data-tf="encClkPin" value="${s.encClkPin}"></label>
         <label><span>DT Pin</span><input type="number" data-tf="encDtPin" value="${s.encDtPin}"></label>
         <label><span>Switch Pin</span><input type="number" data-tf="encSwPin" value="${s.encSwPin}"></label>`;
@@ -953,6 +985,21 @@ function buildTriggerBody(idx,s){
       h+=`<label><span>Interval (seconds)</span><input type="number" data-tf="intervalSeconds" value="${s.intervalSeconds||60}" min="1"></label>`;
     }
     h+=`</div>`;
+  }else if(s.source===SRC.DMX){
+    h+=`<div class="fg">
+      <label><span>Universe</span><input type="number" data-tf="dmxInUniverse" value="${s.dmxInUniverse||1}" min="1" max="40"></label>
+      <label><span>Channel</span><input type="number" data-tf="dmxInChannel" value="${s.dmxInChannel||1}" min="1" max="512"></label>
+      <label><span>Mode</span><select data-tf="dmxInMode" onchange="onDmxModeChange(${idx},this)">
+        ${dmxInModes.map((n,i)=>`<option value="${i}"${i===(s.dmxInMode||0)?' selected':''}>${n}</option>`).join('')}
+      </select></label>`;
+    if(s.dmxInMode===1){
+      h+=`<label><span>Threshold (0-255)</span><input type="number" data-tf="dmxInThreshold" value="${s.dmxInThreshold!=null?s.dmxInThreshold:128}" min="0" max="255"></label>`;
+    }else if(s.dmxInMode===2){
+      h+=`<label><span>Range Min (0-255)</span><input type="number" data-tf="dmxInRangeMin" value="${s.dmxInRangeMin||0}" min="0" max="255"></label>
+        <label><span>Range Max (0-255)</span><input type="number" data-tf="dmxInRangeMax" value="${s.dmxInRangeMax!=null?s.dmxInRangeMax:255}" min="0" max="255"></label>`;
+    }
+    h+=`</div>`;
+    h+=`<div style="font-size:11px;color:var(--fg3);margin:4px 0 8px">Requires Art-Net or sACN Input enabled in Settings &gt; Protocols.</div>`;
   }
 
   // Cooldown
@@ -1006,8 +1053,10 @@ function buildTriggerBody(idx,s){
 }
 
 function buildOutputCard(idx,oi,o,s){
-  const isButton=[TYPES.BUTTON,TYPES.TOGGLE,TYPES.DBL,TYPES.TRP,TYPES.LONG].includes(s.type);
-  const isAnalog=[TYPES.ANALOG,TYPES.ENCODER,TYPES.HCSR04].includes(s.type);
+  // A DMX-In trigger behaves like a fader in level/range mode and like a
+  // button in threshold mode; sensor types classify by type as before
+  const isButton=s.source===SRC.SENSORS&&[TYPES.BUTTON,TYPES.TOGGLE,TYPES.DBL,TYPES.TRP,TYPES.LONG].includes(s.type);
+  const isAnalog=(s.source===SRC.SENSORS&&[TYPES.ANALOG,TYPES.ENCODER,TYPES.HCSR04].includes(s.type))||(s.source===SRC.DMX&&s.dmxInMode!==1);
   let h=`<div class="out-card" data-oi="${oi}">
     <div class="out-header">
       <span class="out-num">OUT ${oi+1}</span>
@@ -1031,8 +1080,18 @@ function buildOutputCard(idx,oi,o,s){
         h+=`<label><span>On String</span><input type="text" data-of="onString" value="${esc(o.onString||'')}"></label>
           <label><span>Off String</span><input type="text" data-of="offString" value="${esc(o.offString||'')}"></label>`;
       }
+      if(s.type===TYPES.ENCODER){
+        h+=`<label class="full" style="margin-top:6px"><span>Push Switch OSC Address</span><input type="text" data-of="buttonAddress" value="${esc(o.buttonAddress||'/button')}"></label>
+          <label><span>Switch Mode</span><select data-of="buttonOutMode" onchange="onTargetChange(${idx},this)">${outModeNames.map((n,i)=>`<option value="${i}"${i===o.buttonOutMode?' selected':''}>${n}</option>`).join('')}</select></label>
+          <label><span>Switch On Value</span><input type="number" data-of="buttonOutMax" value="${o.buttonOutMax!=null?o.buttonOutMax:1}" step="any"></label>
+          <label><span>Switch Off Value</span><input type="number" data-of="buttonOutMin" value="${o.buttonOutMin!=null?o.buttonOutMin:0}" step="any"></label>`;
+        if(o.buttonOutMode===2){
+          h+=`<label><span>Switch On String</span><input type="text" data-of="buttonOnString" value="${esc(o.buttonOnString||'')}"></label>
+            <label><span>Switch Off String</span><input type="text" data-of="buttonOffString" value="${esc(o.buttonOffString||'')}"></label>`;
+        }
+      }
     }
-    if(isButton||s.source===SRC.TIME||s.source===SRC.OSC){
+    if(isButton||s.source===SRC.TIME||s.source===SRC.OSC||(s.source===SRC.DMX&&s.dmxInMode===1)){
       h+=`<label class="full"><span>OSC Address</span><input type="text" data-of="oscAddress" value="${esc(o.oscAddress||'')}"></label>
         <label><span>Output Mode</span><select data-of="outMode">${outModeNames.map((n,i)=>`<option value="${i}"${i===o.outMode?' selected':''}>${n}</option>`).join('')}</select></label>
         <label><span>On Value</span><input type="number" data-of="outMax" value="${o.outMax}" step="any"></label>
@@ -1081,8 +1140,22 @@ function buildOutputCard(idx,oi,o,s){
       <label><span>Fade (ms)</span><input type="number" data-of="dmxFadeMs" value="${o.dmxFadeMs||0}" min="0"></label>`;
   }else if(o.target===TARGETS.DMX_PRESET){
     h+=`<label><span>Protocol</span><select data-of="dmxProtocol">${dmxProtos.map((n,i)=>`<option value="${i}"${i===o.dmxProtocol?' selected':''}>${n}</option>`).join('')}</select></label>
-      <label><span>Preset ID</span><input type="number" data-of="dmxPreset" value="${o.dmxPreset||1}" min="1"></label>
-      <label><span>Fade (ms)</span><input type="number" data-of="dmxFadeMs" value="${o.dmxFadeMs||0}" min="0"></label>`;
+      <label><span>Destination</span><select data-of="dmxDest" onchange="onTargetChange(${idx},this)">${dmxDests.map((n,i)=>`<option value="${i}"${i===o.dmxDest?' selected':''}>${n}</option>`).join('')}</select></label>`;
+    if(o.dmxDest===1){
+      h+=`<label><span>Device</span><select data-of="device">${deviceOpts(o.device)}</select></label>`;
+    }
+    const presets=(C.config||{}).dmxPresets||[];
+    const selId=o.dmxPreset||1;
+    let pOpts='',selFound=false;
+    presets.forEach(p=>{
+      const id=p.index+1;
+      if(id===selId)selFound=true;
+      pOpts+=`<option value="${id}"${id===selId?' selected':''}>Preset ${id} (${presetPoints(p.text)} ch)</option>`;
+    });
+    if(!selFound)pOpts=`<option value="${selId}" selected>Preset ${selId} (empty)</option>`+pOpts;
+    h+=`<label><span>Preset</span><select data-of="dmxPreset">${pOpts}</select></label>
+      <label><span>Fade (ms)</span><input type="number" data-of="dmxFadeMs" value="${o.dmxFadeMs||0}" min="0"></label>
+      <label class="full" style="align-self:end"><a href="/dmx_presets" target="_blank" style="color:var(--acc);font-size:12px">${presets.length===0?'No presets saved yet — open the DMX Preset Editor':'Open DMX Preset Editor'} &#8599;</a></label>`;
   }else if(o.target===TARGETS.SET_VAR){
     h+=`<label><span>Variable Name</span><input type="text" data-of="setVarName" value="${esc(o.setVarName||'')}" placeholder="e.g. armed"></label>
       <label><span>Value</span><input type="number" data-of="setVarValue" value="${o.setVarValue||0}" step="any"></label>`;
@@ -1127,6 +1200,11 @@ function onOscMatchChange(idx,sel){
   s.oscInMatchMode=parseInt(sel.value);
   refreshTriggerBody(idx,s);
 }
+function onDmxModeChange(idx,sel){
+  const s=getTriggerData(idx);
+  s.dmxInMode=parseInt(sel.value);
+  refreshTriggerBody(idx,s);
+}
 function onTimeTypeChange(idx,sel){
   const s=getTriggerData(idx);
   s.timeType=parseInt(sel.value);
@@ -1162,7 +1240,7 @@ function getTriggerData(idx){
   // Collect form fields
   const intTfKeys=['source','type','pin','encClkPin','encDtPin','encSwPin','hcTrigPin','hcEchoPin','cooldownMs',
     'oscInArgType','oscInMatchMode','timeType','timeYear','timeMonth','timeDay','timeHour','timeMinute','timeSecond',
-    'weeklyMask','intervalSeconds','conditionOp'];
+    'weeklyMask','intervalSeconds','conditionOp','dmxInUniverse','dmxInChannel','dmxInMode','dmxInThreshold','dmxInRangeMin','dmxInRangeMax'];
   const floatTfKeys=['oscInValue','oscInMin','oscInMax','hcMinCm','hcMaxCm','conditionValue'];
   $$('[data-tf]',card).forEach(el=>{
     const k=el.dataset.tf;
@@ -1199,6 +1277,18 @@ function getTriggerData(idx){
   return s;
 }
 
+function presetPoints(text){
+  let n=0;
+  String(text||'').split(/\n+/).forEach(r=>{
+    const parts=r.trim().split(',');
+    if(parts.length<3)return;
+    const m=parts[1].match(/^(\d+)(?:-(\d+))?$/);
+    if(!m)return;
+    n+=m[2]?Math.abs(parseInt(m[2])-parseInt(m[1]))+1:1;
+  });
+  return n;
+}
+
 function triggerBadge(s){
   const src=s.source===SRC.SENSORS?(typeNames[s.type]||''):(srcNames[s.source]||'');
   const tgt=s.outputs&&s.outputs[0]?(' → '+(targetNames[s.outputs[0].target]||'')):'';
@@ -1222,13 +1312,44 @@ async function saveTrigger(idx){
 async function quickSaveTrigger(idx,key,val){
   const s=C.config.sensors[idx];
   if(!s)return;
+  const prev=s[key];
   s[key]=val;
+  pauseLive();
   try{
-    await api('/api/trigger/'+idx,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(s)});
-  }catch(e){}
+    const resp=await api('/api/trigger/'+idx,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(s)});
+    C.config.sensors[idx]=resp;
+  }catch(e){
+    // Revert local state and the checkbox so the UI doesn't lie about firmware state
+    s[key]=prev;
+    if(key==='enabled'){const cb=$('#ten-'+idx);if(cb)cb.checked=!!prev;}
+  }finally{resumeLive();}
 }
 
 let _addingTrigger=false;
+async function fireTrigger(idx){
+  try{
+    await api('/api/trigger/'+idx+'/fire',{method:'POST'});
+    toast('Outputs fired!');
+  }catch(e){}
+}
+
+let _duplicatingTrigger=false;
+async function duplicateTrigger(idx){
+  if(_duplicatingTrigger)return;
+  _duplicatingTrigger=true;
+  pauseLive();showBusy('Duplicating trigger...');
+  try{
+    const src=C.config.sensors[idx];
+    const t=await api('/api/triggers/add',{method:'POST'});
+    const copy=Object.assign({},src,{index:t.index,name:(src.name||'Trigger')+' copy'});
+    await api('/api/trigger/'+t.index,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(copy)});
+    C=await api('/api/config');
+    renderTriggers();
+    toast('Trigger duplicated!');
+  }catch(e){}
+  finally{_duplicatingTrigger=false;hideBusy();resumeLive();}
+}
+
 async function addTrigger(){
   if(_addingTrigger)return;
   _addingTrigger=true;
@@ -1333,6 +1454,15 @@ function removeOutput(idx,oi){
 }
 
 /* ===== LIVE POLLING ===== */
+function fmtLiveVal(t){
+  // Prefer the most meaningful reading per trigger source/type; -1 = never fired
+  if(t.source===SRC.DMX)return(t.lastInt!=null&&t.lastInt>=0)?String(t.lastInt):'';
+  if(t.source===SRC.SENSORS&&t.toggleState!=null&&t.type===TYPES.TOGGLE)return t.toggleState?'ON':'OFF';
+  if(t.source===SRC.SENSORS&&t.lastFloat!=null&&[TYPES.ANALOG,TYPES.ENCODER,TYPES.HCSR04].includes(t.type))return String(t.lastFloat);
+  if(t.lastBool!=null&&t.lastBool>=0)return t.lastBool?'ON':'OFF';
+  if(t.lastInt!=null&&t.lastInt>=0)return String(t.lastInt);
+  return'';
+}
 async function pollLive(){
   try{
     const d=await fetch('/api/live').then(r=>r.json());
@@ -1341,12 +1471,28 @@ async function pollLive(){
     $('#bar-uptime').textContent='Up: '+fmtUptime(d.uptime||0);
     $('#bar-time').textContent=d.time||'';
     $('#bar-dot').classList.toggle('off',false);
-    liveErrors=0;
+    $('#ap-banner').classList.toggle('hidden',!d.apMode);
+    // Per-trigger live readings on the card headers
+    (d.triggers||[]).forEach(t=>{
+      const elv=$('#tlive-'+t.index);
+      if(!elv)return;
+      const val=fmtLiveVal(t);
+      elv.textContent=val;
+      elv.classList.toggle('cd',!!t.cooldownActive);
+    });
+    // Global variables in the status bar
+    const vb=$('#bar-vars');
+    if(vb){
+      const names=Object.keys(d.vars||{});
+      vb.textContent=names.length?('Vars: '+names.map(k=>k+'='+d.vars[k]).join(' ')):'';
+    }
+    if(liveErrors>0){liveErrors=0;if(liveTimer){clearInterval(liveTimer);liveTimer=setInterval(pollLive,2000);}}
   }catch(e){
     $('#bar-dot').classList.add('off');
     liveErrors++;
-    if(liveErrors>5&&liveTimer){clearInterval(liveTimer);liveTimer=setInterval(pollLive,10000);}
-    if(liveErrors>15&&liveTimer){clearInterval(liveTimer);liveTimer=null;$('#bar-uptime').textContent='Disconnected';}
+    // Back off but never stop — the device may be rebooting and coming back
+    if(liveErrors===6&&liveTimer){clearInterval(liveTimer);liveTimer=setInterval(pollLive,10000);}
+    if(liveErrors===16){$('#bar-uptime').textContent='Disconnected';}
   }
 }
 
@@ -1363,11 +1509,11 @@ async function init(){
   document.addEventListener('keydown',function(e){
     if(e.key==='Enter'&&e.target.tagName==='INPUT'&&e.target.type!=='checkbox'){
       e.preventDefault();
-      // Find closest save button
-      var p=e.target.closest('.tab-content,.trigger-body');
-      if(p){var btn=p.querySelector('button[onclick*="save"]');if(btn){btn.click();return;}}
-      // Fallback: if in settings area
-      var st=e.target.closest('#settings-area');
+      // Trigger card: save that trigger
+      var tb=e.target.closest('[id^="tbody-"]');
+      if(tb){saveTrigger(parseInt(tb.id.slice(6)));return;}
+      // Settings panel: save all settings
+      var st=e.target.closest('.stab');
       if(st){saveAllSettings();return;}
     }
   });
