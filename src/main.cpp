@@ -44,7 +44,7 @@ const IPAddress DEFAULT_DNS2(8, 8, 8, 8);
 const char* DEFAULT_WIFI_SSID = "";
 const char* DEFAULT_WIFI_PASS = "";
 const char* DEFAULT_USERNAME = "admin";
-const char* FIRMWARE_VERSION = "0.15.0";
+const char* FIRMWARE_VERSION = "0.15.1";
 const char* DEFAULT_NTP_SERVER = "pool.ntp.org";
 const uint8_t DEFAULT_TIME_MODE = 0; // 0 = NTP, 1 = Manual
 const char* DEFAULT_TIMEZONE = "PST8PDT,M3.2.0/2,M11.1.0/2";
@@ -3817,7 +3817,9 @@ static bool startDmxOutputFade(const SensorConfig::OutputConfig& out, uint8_t pr
     uint8_t fadeDevice = (dmxFadeState.dest == DMX_DEST_UNICAST) ? dmxFadeState.device : 255;
     if (dmxFadeState.protocol != proto || fadeDevice != streamDevice) return false;
   }
-  uint16_t channels[512];
+  // static: 1KB, and this runs on the loopTask stack at the bottom of a deep
+  // trigger-dispatch chain (single-threaded, so a static is safe)
+  static uint16_t channels[512];
   int channelCount = parseDmxChannels(out.dmxChannels, channels, 512);
   if (channelCount <= 0) return false;
   DmxStreamState* stream = getDmxStream(proto, streamDevice, universe);
@@ -3893,7 +3895,9 @@ static bool sendDmxOutput(const SensorConfig::OutputConfig& out, float norm) {
   IPAddress ip;
   if (!resolveDmxDestination(out, proto, universe, ip)) return false;
 
-  uint16_t channels[512];
+  // static: 2.5KB combined, deep on the loopTask stack (single-threaded)
+  static uint16_t channels[512];
+  static uint8_t tempData[512];
   int channelCount = parseDmxChannels(out.dmxChannels, channels, 512);
   if (channelCount <= 0) return false;
 
@@ -3906,7 +3910,6 @@ static bool sendDmxOutput(const SensorConfig::OutputConfig& out, float norm) {
   }
   uint8_t streamDevice = (sanitizeDmxDest(out.dmxDest) == DMX_DEST_UNICAST) ? out.device : 255;
   DmxStreamState* stream = getDmxStream(proto, streamDevice, universe);
-  uint8_t tempData[512];
   uint8_t* frame = tempData;
   uint8_t sequence = 0;
   if (stream != nullptr) {
@@ -6410,7 +6413,9 @@ static void handleLogsPage() {
   html += "a{color:#0b6b6f;}";
   html += "@media(prefers-color-scheme:dark){body{background:#161616;color:#e2e2e2;}.card{background:#222;border-color:#383838;}a{color:#0d9488;}}";
   html += "</style></head><body>";
-  html += "<div class='card'><h2>Serial Log</h2>";
+  html += "<div class='card'><h2>Serial Log <span style='font-size:13px;font-weight:400;color:#888;'>&mdash; firmware v";
+  html += FIRMWARE_VERSION;
+  html += "</span></h2>";
   html += "<p><a href='/'>Back to settings</a></p>";
   html += "<pre id='logbox'>Loading...</pre></div>";
   html += "<script>";
@@ -7138,6 +7143,7 @@ void setup() {
   esp_log_level_set("Preferences", ESP_LOG_NONE);
   Serial.print("StageMod firmware v");
   Serial.println(FIRMWARE_VERSION);
+  addLog(String("Booted StageMod firmware v") + FIRMWARE_VERSION);
   loadConfig();
   configureMqttClient();
   resetRuntimeState(true);
